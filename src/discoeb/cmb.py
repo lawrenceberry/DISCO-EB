@@ -7,8 +7,11 @@ source functions from perturbation evolution output.
 
 import jax
 import jax.numpy as jnp
+from functools import partial
 from .cosmo import get_aprimeoa
 from .perturbations import nu_perturb, nu_perturb_prime
+from .util import spherical_bessel
+from .spline_interpolation import spline_interpolation
 
 
 def extract_perturbations(yout, youtprime, lmaxg, lmaxgp, lmaxr):
@@ -518,3 +521,132 @@ def compute_source_function(perturbations, metric, visibility_functions,
     }
 
 
+@partial(jax.jit, static_argnames=['ellmax', 'nk_fine', 'chunk_size', 'k_chunk_size'])
+def compute_theta_ell(ellmax, kmodes, tau, S, tau0, nk_fine=2048, chunk_size=500, k_chunk_size=1024):
+    """Compute multipole moments Θ_ℓ(k) via line-of-sight integration.
+
+    The line-of-sight integral computes:
+
+        Θ_ℓ(k) = ∫₀^τ₀ S(k,τ) j_ℓ(k(τ₀-τ)) dτ
+
+    where S(k,τ) is the CMB source function, j_ℓ is the spherical Bessel function,
+    and τ₀ is the conformal time today.
+
+    Parameters
+    ----------
+    ellmax : int
+        Maximum multipole moment
+    kmodes : jnp.ndarray
+        Wavenumber array (shape: n_kmodes)
+    tau : jnp.ndarray
+        Conformal time array (shape: n_times)
+    S : jnp.ndarray
+        Source function (shape: n_kmodes × n_times)
+    tau0 : float
+        Conformal time today
+    nk_fine : int, optional
+        Number of k points for fine integration grid (default: 2048)
+    chunk_size : int, optional
+        Chunk size for multipole processing (default: 500)
+    k_chunk_size : int, optional
+        Chunk size for k-mode processing (default: 1024)
+
+    Returns
+    -------
+    jnp.ndarray
+        Multipole moments Θ_ℓ(k) with shape (nk_fine, ellmax+1)
+    """
+    # Create fine k-grid for better integration accuracy
+    kmin = jnp.min(kmodes)
+    kmax = jnp.max(kmodes)
+    kmodes_fine = jnp.geomspace(kmin, kmax, nk_fine)
+    log_kmodes_fine = jnp.log(kmodes_fine)
+
+    # Interpolate S to fine k-grid
+    def interpolate_S_slice(S_slice):
+        spline = spline_interpolation(jnp.log(kmodes), S_slice)
+        return spline.evaluate(log_kmodes_fine)
+
+    S_fine = jax.vmap(interpolate_S_slice, in_axes=1, out_axes=1)(S)
+
+    # Process in chunks to reduce memory usage
+    def process_chunk(ell_start, ell_end, k_start, k_end):
+        kmodes_chunk = kmodes_fine[k_start:k_end]
+        S_chunk = S_fine[k_start:k_end, :]
+
+        # Argument for Bessel functions: k(τ₀ - τ)
+        ktau_chunk = kmodes_chunk[:, None] * (tau0 - tau[None, :])
+
+        # Compute spherical Bessel functions for all needed ℓ
+        sj_chunk = spherical_bessel(ell_end - 1, ktau_chunk.flatten())[:, 0, :]
+        sj_chunk = sj_chunk.reshape(len(kmodes_chunk), len(tau), ell_end)
+        sj_chunk = sj_chunk[:, :, ell_start:ell_end]
+
+        # Line-of-sight integral: ∫ S(k,τ) j_ℓ(k(τ₀-τ)) dτ
+        integrand_chunk = sj_chunk * S_chunk[:, :, None]
+        theta_l_chunk = jnp.trapezoid(integrand_chunk, x=tau, axis=1)
+
+        return theta_l_chunk
+
+    # Process in chunks for both ℓ and k
+    num_ell_chunks = (ellmax + 1 + chunk_size - 1) // chunk_size
+    num_k_chunks = (nk_fine + k_chunk_size - 1) // k_chunk_size
+
+    ell_chunks = []
+    for i in range(num_ell_chunks):
+        ell_start = i * chunk_size
+        ell_end = min((i + 1) * chunk_size, ellmax + 1)
+        if ell_start < ell_end:
+            k_chunks = []
+            for j in range(num_k_chunks):
+                k_start = j * k_chunk_size
+                k_end = min((j + 1) * k_chunk_size, nk_fine)
+                if k_start < k_end:
+                    k_chunk_result = process_chunk(ell_start, ell_end, k_start, k_end)
+                    k_chunks.append(k_chunk_result)
+            # Concatenate k chunks
+            ell_chunk_result = jnp.concatenate(k_chunks, axis=0)
+            ell_chunks.append(ell_chunk_result)
+
+    # Concatenate ℓ chunks
+    theta_ell = jnp.concatenate(ell_chunks, axis=1)
+
+    return theta_ell, kmodes_fine
+
+
+@jax.jit
+def compute_Cell(theta_ell, kmodes_fine, n_s, k_p):
+    """Compute CMB angular power spectrum C_ℓ from multipole moments.
+
+    The angular power spectrum is computed by integrating over k:
+
+        C_ℓ ∝ ∫ k^(n_s-1) |Θ_ℓ(k)|² dk
+
+    where n_s is the primordial spectral index and k_p is the pivot scale.
+
+    Parameters
+    ----------
+    theta_ell : jnp.ndarray
+        Multipole moments Θ_ℓ(k) with shape (nk_fine, ellmax+1)
+    kmodes_fine : jnp.ndarray
+        Fine wavenumber grid (shape: nk_fine)
+    n_s : float
+        Primordial spectral index
+    k_p : float
+        Pivot scale (typically 0.05 Mpc⁻¹)
+
+    Returns
+    -------
+    jnp.ndarray
+        Angular power spectrum C_ℓ (shape: ellmax+1)
+    """
+    log_kmodes_fine = jnp.log(kmodes_fine)
+
+    # Integrate over k: ∫ (k/k_p)^(n_s-1) |Θ_ℓ(k)|² d(log k)
+    Cell = jnp.trapezoid(
+        (kmodes_fine[:, None] / k_p)**(n_s - 1) * theta_ell**2,
+        x=log_kmodes_fine,
+        axis=0
+    )
+
+    return Cell
