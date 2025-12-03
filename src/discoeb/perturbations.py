@@ -1079,6 +1079,71 @@ def evolve_perturbations_batched( *, param, aexp_out, kmin : float, kmax : float
     return y1, kmodes, param
 
 
+def compute_time_derivatives(yout, tau, kmodes, param):
+    """Compute time derivatives by re-evaluating the ODE system.
+
+    This function computes dy/dτ by re-evaluating the synchronous gauge
+    perturbation equations at each output time and k-mode. This is useful
+    for CMB source function calculations that require time derivatives.
+
+    Parameters
+    ----------
+    yout : jnp.ndarray
+        State vector array with shape (n_kmodes, n_times, n_vars)
+    tau : jnp.ndarray
+        Conformal time array with shape (n_times,)
+    kmodes : jnp.ndarray
+        Wavenumber array with shape (n_kmodes,)
+    param : dict
+        Parameter dictionary containing:
+        - lmaxg: Maximum photon temperature multipole
+        - lmaxgp: Maximum photon polarization multipole
+        - lmaxr: Maximum massless neutrino multipole
+        - lmaxnu: Maximum massive neutrino multipole
+        - nqmax: Number of neutrino momentum bins
+
+    Returns
+    -------
+    jnp.ndarray
+        Time derivatives with same shape as yout (n_kmodes, n_times, n_vars)
+
+    Examples
+    --------
+    >>> yout, kmodes, param = evolve_perturbations_batched(...)
+    >>> tau = param['tau_out']
+    >>> yprime = compute_time_derivatives(yout, tau, kmodes, param)
+    """
+    # Extract parameters
+    lmaxg = param['lmaxg']
+    lmaxgp = param['lmaxgp']
+    lmaxr = param['lmaxr']
+    lmaxnu = param['lmaxnu']
+    nqmax = param['nqmax']
+
+    # Create indices for vectorization
+    idxtau = jnp.arange(len(tau))
+    idxk = jnp.arange(len(kmodes))
+
+    # Compute derivatives by re-evaluating the ODE system
+    yprime = jax.vmap(
+        lambda ik: jax.vmap(
+            lambda itau: model_synchronous(
+                tau=tau[itau],
+                y=yout[ik, itau, :],
+                param=param,
+                kmode=kmodes[ik],
+                lmaxg=lmaxg,
+                lmaxgp=lmaxgp,
+                lmaxr=lmaxr,
+                lmaxnu=lmaxnu,
+                nqmax=nqmax
+            )
+        )(idxtau)
+    )(idxk)
+
+    return yprime
+
+
 # @partial(jax.jit, static_argnames=('N'))
 def get_xi_from_P( *, k : jnp.ndarray, Pk : jnp.ndarray, N : int, ell : int = 0 ):
     """ get the correlation function from the power spectrum  using FFTlog, cf.

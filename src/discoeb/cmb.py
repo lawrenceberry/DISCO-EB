@@ -87,6 +87,85 @@ def extract_perturbations(yout, youtprime, lmaxg, lmaxgp, lmaxr):
     return perturbations
 
 
+def compute_visibility_functions(tau, param):
+    """Create splines and evaluate visibility functions at given conformal times.
+
+    This function creates cubic spline interpolations for the visibility function
+    and related quantities from the thermal history computed by evolve_background(),
+    then evaluates them at the requested conformal times. These functions are
+    essential for CMB source function calculations.
+
+    Parameters
+    ----------
+    tau : jnp.ndarray
+        Conformal time values where visibility functions are needed
+    param : dict
+        Parameter dictionary containing thermal history arrays:
+        - tau: Conformal time array from thermal history
+        - opac: Opacity κ = σ_T n_e a^2
+        - gvis: Visibility function g(τ) = κ exp(-τ_c)
+        - gvisprime: First derivative g'(τ)
+        - gvispprime: Second derivative g''(τ)
+        - optical_depth: Optical depth τ_c to conformal time today
+
+    Returns
+    -------
+    dict
+        Dictionary with keys:
+        - 'opac': Opacity κ at requested times
+        - 'opacprime': Opacity derivative dκ/dτ at requested times
+        - 'gvis': Visibility function g(τ) at requested times
+        - 'gvisprime': First derivative g'(τ) at requested times
+        - 'gvispprime': Second derivative g''(τ) at requested times
+        - 'optical_depth': Optical depth τ_c at requested times
+
+    Examples
+    --------
+    >>> param = evolve_background(param=param, ...)
+    >>> tau = jnp.linspace(100, 14000, 100)  # Conformal times in Mpc
+    >>> vis_funcs = compute_visibility_functions(tau, param)
+    >>> gvis = vis_funcs['gvis']  # Visibility function g(τ)
+
+    Notes
+    -----
+    The visibility function g(τ) = κ(τ) exp(-τ_c(τ)) peaks at last scattering
+    and determines when photons last interacted with matter. Its derivatives
+    are used in the Doppler and polarization source terms.
+
+    The opacity is κ = σ_T n_e a^2 where σ_T is the Thomson cross section
+    and n_e is the free electron density.
+    """
+    # Create spline for opacity and evaluate
+    opacspline = spline_interpolation(jnp.log(param['tau']), param['opac'])
+    opac = opacspline.evaluate(jnp.log(tau))
+    opacprime = opacspline.derivative(jnp.log(tau)) / tau
+
+    # Create splines for visibility function and derivatives
+    gvis_spline = spline_interpolation(jnp.log(param['tau']), param['gvis'])
+    gvisprime_spline = spline_interpolation(jnp.log(param['tau']), param['gvisprime'])
+    gvispprime_spline = spline_interpolation(jnp.log(param['tau']), param['gvispprime'])
+
+    gvis = gvis_spline.evaluate(jnp.log(tau))
+    gvisprime = gvisprime_spline.evaluate(jnp.log(tau))
+    gvispprime = gvispprime_spline.evaluate(jnp.log(tau))
+
+    # Create spline for optical depth (log-space with floor for numerical stability)
+    optical_depth_spline = spline_interpolation(
+        jnp.log(param['tau']),
+        jnp.log(jnp.maximum(param['optical_depth'], 1e-10))
+    )
+    optical_depth = jnp.exp(optical_depth_spline.evaluate(jnp.log(tau)))
+
+    return {
+        'opac': opac,
+        'opacprime': opacprime,
+        'gvis': gvis,
+        'gvisprime': gvisprime,
+        'gvispprime': gvispprime,
+        'optical_depth': optical_depth,
+    }
+
+
 def compute_neutrino_perturbations(yout, yprime, aexp_out, param, nqmax, iq0):
     """Compute massive neutrino perturbations by integrating over momentum bins.
 

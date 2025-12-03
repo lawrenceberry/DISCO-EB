@@ -337,7 +337,66 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
         param['xeprime_recf'] = xeprime_recfast
 
     param['xeprime'] = xeprime
-    
-    return param 
-        
+
+    return param
+
+
+def compute_background_quantities(aexp, param):
+    """Compute background density and equation of state at given scale factors.
+
+    This function evaluates background cosmological quantities including neutrino
+    density, dark energy density, and dark energy equation of state at specified
+    scale factors. It uses pre-computed splines from evolve_background().
+
+    Parameters
+    ----------
+    aexp : jnp.ndarray
+        Scale factor values where background quantities are needed
+    param : dict
+        Parameter dictionary containing:
+        - logrhonu_of_loga_spline: Spline for log neutrino density
+        - w_DE_0: Dark energy equation of state today
+        - w_DE_a: Dark energy equation of state time derivative
+        - OmegaDE: Dark energy density parameter
+
+    Returns
+    -------
+    dict
+        Dictionary with keys:
+        - 'rhonu': Neutrino density ratio ρ_ν/ρ_ν0 at given scale factors
+        - 'rho_Q': Normalized dark energy density ρ_Q(a)/ρ_Q(a=1)
+        - 'w_Q': Dark energy equation of state w(a) at given scale factors
+
+    Examples
+    --------
+    >>> param = evolve_background(param=param, ...)
+    >>> aexp_out = jnp.array([0.01, 0.1, 1.0])
+    >>> bg_quantities = compute_background_quantities(aexp_out, param)
+    >>> rhonu = bg_quantities['rhonu']
+    >>> w_Q = bg_quantities['w_Q']
+
+    Notes
+    -----
+    The dark energy density assumes a parametrization of the form:
+        ρ_Q(a) = ρ_Q(1) * a^{-3(1 + w_0 + w_a)} * exp[3(a-1)*w_a]
+
+    The equation of state is:
+        w_Q(a) = w_0 + w_a * (1 - a)
+    """
+    a = jnp.atleast_1d(aexp)
+
+    # Neutrino density ratio from spline
+    rhonu = jnp.exp(param['logrhonu_of_loga_spline'].evaluate(jnp.log(a)))
+
+    # Dark energy density (normalized to value at a=1)
+    rho_Q = a**(-3 * (1 + param['w_DE_0'] + param['w_DE_a'])) * jnp.exp(3 * (a - 1) * param['w_DE_a'])
+
+    # Dark energy equation of state
+    w_Q = param['w_DE_0'] + param['w_DE_a'] * (1.0 - a)
+
+    return {
+        'rhonu': rhonu,
+        'rho_Q': rho_Q,
+        'w_Q': w_Q,
+    }
 
