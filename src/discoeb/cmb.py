@@ -1,15 +1,15 @@
 """
-CMB source function computation for DISCO-EB
-
 This module provides functions to compute the CMB temperature anisotropy
-source functions from perturbation evolution output.
+source functions from background and perturbation evolution output.
 """
 
 import jax
 import jax.numpy as jnp
 from functools import partial
+
+from .background import compute_background_quantities, evolve_background
 from .cosmo import get_aprimeoa
-from .perturbations import nu_perturb, nu_perturb_prime
+from .perturbations import compute_time_derivatives, evolve_perturbations_batched, nu_perturb, nu_perturb_prime
 from .util import spherical_bessel
 from .spline_interpolation import spline_interpolation
 
@@ -729,3 +729,174 @@ def compute_Cell(theta_ell, kmodes_fine, n_s, k_p):
     )
 
     return Cell
+
+
+@partial(jax.jit, static_argnames=['ellmax'])
+def compute_Dell(Cell, A_s, Tcmb, ellmax=None):
+    """Convert C_ℓ angular power spectrum to D_ℓ = ℓ(ℓ+1)C_ℓ/(2π) in μK².
+
+    This function converts the dimensionless C_ℓ spectrum to the commonly-used
+    D_ℓ representation that includes the primordial amplitude and temperature
+    normalization.
+
+    Parameters
+    ----------
+    Cell : jnp.ndarray
+        Angular power spectrum C_ℓ (dimensionless, shape: ellmax+1)
+    A_s : float
+        Primordial amplitude (typically ~2.1e-9)
+    Tcmb : float
+        CMB temperature in Kelvin (typically 2.7255 K)
+    ellmax : int, optional
+        Maximum multipole. If None, inferred from Cell.shape[0] - 1
+
+    Returns
+    -------
+    ell : jnp.ndarray
+        Multipole moments starting from ell=2
+    D_ell : jnp.ndarray
+        Temperature power spectrum D_ℓ = ℓ(ℓ+1)C_ℓ/(2π) in μK²
+
+    Examples
+    --------
+    >>> Cell = compute_Cell(theta_ell, kmodes_fine, n_s=0.96, k_p=0.05)
+    >>> ell, D_ell = compute_D_ell(Cell, A_s=2.1e-9, Tcmb=2.7255)
+    >>> # D_ell now contains the power spectrum in μK²
+
+    Notes
+    -----
+    The conversion formula is:
+        D_ℓ = ℓ(ℓ+1) × C_ℓ × A_s × 2 × T_CMB²
+
+    The factor of 2 comes from the convention difference between dimensionless
+    and dimensional power spectra. We start from ell=2 since monopole (ℓ=0)
+    and dipole (ℓ=1) are typically removed or unmeasured in CMB observations.
+    """
+    if ellmax is None:
+        ellmax = Cell.shape[0] - 1
+
+    ell = jnp.arange(ellmax + 1)
+
+    # Apply ell(ell+1) factor, primordial amplitude, and temperature normalization
+    # Start from ell=2 (monopole and dipole not included)
+    # Convert from K² to μK² by multiplying by (10^6)² = 1e12
+    D_ell = ell[2:] * (ell[2:] + 1) * Cell[2:] * A_s * 2 * Tcmb**2 * 1e12
+
+    return ell[2:], D_ell
+
+
+@partial(jax.jit, static_argnames=['ellmax', 'nmodes', 'kmin', 'kmax'])
+def compute_Cell_spectrum_from_cosmo_params(
+    param_dict,
+    ellmax=2500,
+    nmodes=512,
+    kmin=1e-4,
+    kmax=1.0
+):
+    """Compute CMB C_ell spectrum using DISCO-EB.
+
+    This function follows the same pipeline as DISCOEB_CMB_spectrum_simple.ipynb
+    to compute the temperature power spectrum.
+
+    Parameters
+    ----------
+    param_dict : dict
+        Dictionary of cosmological parameters
+    ellmax : int, optional
+        Maximum multipole to compute. Default: 2500
+    nmodes : int, optional
+        Number of k-modes. Default: 512
+    kmin : float, optional
+        Minimum wavenumber in 1/Mpc. Default: 1e-4
+    kmax : float, optional
+        Maximum wavenumber in 1/Mpc. Default: 1.0
+
+    Returns
+    -------
+    ell : jnp.ndarray
+        Multipole moments (starting from ell=2)
+    C_ell : jnp.ndarray
+        Temperature power spectrum in μK^2
+    """
+    # 1. Background evolution
+    param = param_dict.copy()
+    param = evolve_background(param=param, thermo_module='RECFAST', num_thermo=1024)
+
+    # 2. Perturbation evolution
+    aexp_out = jnp.concatenate([
+        jnp.geomspace(3e-4, 5e-3, 256, endpoint=False),
+        jnp.geomspace(5e-3, 1.0, 64)
+    ])
+
+    yout, kmodes, param = evolve_perturbations_batched(
+        param=param,
+        kmin=kmin,
+        kmax=kmax,
+        num_k=nmodes,
+        aexp_out=aexp_out,
+        rtol=1e-4,
+        atol=1e-4,
+        return_full=True,
+        dologk=True,
+    )
+
+    # 3. Time derivatives
+    tau = param['tau_out']
+    yprime = compute_time_derivatives(yout, tau, kmodes, param)
+
+    # 4. Extract parameters
+    lmaxg = param['lmaxg']
+    lmaxgp = param['lmaxgp']
+    lmaxr = param['lmaxr']
+    nqmax = param['nqmax']
+
+    # 5. Extract perturbations
+    perturbations = extract_perturbations(yout, yprime, lmaxg, lmaxgp, lmaxr)
+
+    # 6. Compute background quantities
+    background_quantities = compute_background_quantities(aexp_out, param)
+
+    # 7. Compute visibility functions
+    tau = param['tau_of_a_spline'].evaluate(aexp_out)
+    visibility_functions = compute_visibility_functions(tau, param)
+
+    # 8. Compute neutrino perturbations
+    neutrinos = compute_neutrino_perturbations(
+        yout, yprime, aexp_out, param, nqmax, perturbations['iq0']
+    )
+
+    # 9. Compute metric perturbations
+    metric = compute_metric_perturbations(
+        perturbations, neutrinos, background_quantities, param, kmodes, aexp_out
+    )
+
+    # 10. Compute source function
+    source_results = compute_source_function(
+        perturbations, metric, visibility_functions, yout, yprime, kmodes, lmaxg, lmaxgp
+    )
+    S = source_results['S']
+
+    # 11. Line-of-sight integration
+    tau0 = param['tau_of_a_spline'].evaluate(1.0)
+    theta_ell, kmodes_fine = compute_theta_ell(
+        ellmax=ellmax,
+        kmodes=kmodes,
+        tau=tau,
+        S=S,
+        tau0=tau0,
+        # The following parameters are hardware dependent as they can cause memory overflow
+        # TODO: make the batching dynamic according to how much memory is available on the user's GPU
+        nk_fine=512,
+        chunk_size=32,
+        k_chunk_size=32
+    )
+
+    # 12. Compute C_ell
+    Cell = compute_Cell(
+        theta_ell=theta_ell,
+        kmodes_fine=kmodes_fine,
+        n_s=param['n_s'],
+        k_p=param['k_p']
+    )
+
+    return Cell, param
