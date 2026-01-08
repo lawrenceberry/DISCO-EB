@@ -443,11 +443,8 @@ class TestCMBSpectrum:
         """
         cosmo_params = STANDARD_COSMOLOGIES[cosmology_name]
 
-        # Make sure the function is compiled
-        _ = compute_Cell_spectrum_from_cosmo_params(cosmo_params, ellmax=2500)
-
-        # Benchmark the computation
-        benchmark(compute_Cell_spectrum_from_cosmo_params, cosmo_params, ellmax=2500)
+        # Benchmark the computation, making sure the function is compiled first
+        benchmark.pedantic(compute_Cell_spectrum_from_cosmo_params, kwargs=dict(param_dict=cosmo_params, ellmax=2500), rounds=1, warmup_rounds=1)
 
         # Load performance baseline
         baseline_file = "tests/resources/cmb_performance_baseline.json"
