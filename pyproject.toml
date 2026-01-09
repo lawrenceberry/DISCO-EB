@@ -28,7 +28,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Astronomy",
 ]
 [project.optional-dependencies]
-dev = ["pytest", "pytest-benchmark", "camb>=1.6.0", "ipykernel>=6.31.0", "matplotlib>=3.9.4", "pandas"]
+dev = ["pytest", "pytest-benchmark", "pytest-regressions", "camb>=1.6.0", "ipykernel>=6.31.0", "matplotlib>=3.9.4", "pandas"]
 docs = ["sphinx", "nbsphinx"]
 
 [project.urls]
