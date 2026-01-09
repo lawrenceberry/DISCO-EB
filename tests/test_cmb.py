@@ -13,7 +13,7 @@ Usage:
     pytest tests/test_cmb.py::TestCMBSpectrum::test_cmb_vs_camb_accuracy -v
 
     # Run performance tests
-    pytest tests/test_cmb.py::TestCMBSpectrum::test_cmb_performance -v
+    pytest tests/test_cmb.py::TestCMBSpectrum::test_benchmark_cl_spectrum -v
 
     # Run all CMB tests
     pytest tests/test_cmb.py -v
