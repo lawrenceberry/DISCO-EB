@@ -95,7 +95,7 @@ class TestEvolvePerturbations:
     @pytest.mark.parametrize("batch_size", [4, 8, 16, 32, 64])
     def test_power_spectrum_varying_batchsize_small_kmax(self, batch_size, background_param):
 
-        y, kmodes = evolve_perturbations_batched(
+        y, kmodes, _ = evolve_perturbations_batched(
             param=background_param, kmin=kmin, kmax=kmax_small, num_k=nmodes, aexp_out=aexp_out,
             lmaxg = 31, lmaxgp = 31, lmaxr = 31, lmaxnu = 31, nqmax = 5,
             max_steps=2048, rtol=1e-4, atol=1e-4, batch_size=batch_size
@@ -111,7 +111,7 @@ class TestEvolvePerturbations:
 
     def test_power_spectrum_vs_CLASS_batched(self, background_param):
 
-        y, kmodes = evolve_perturbations_batched(
+        y, kmodes, _ = evolve_perturbations_batched(
             param=background_param, kmin=kmin, kmax=kmax, num_k=nmodes, aexp_out=aexp_out,
             lmaxg = 31, lmaxgp = 31, lmaxr = 31, lmaxnu = 31, nqmax = 5,
             max_steps=2048, rtol=1e-4, atol=1e-4, batch_size=32
@@ -127,7 +127,7 @@ class TestEvolvePerturbations:
 
     def test_power_spectrum_vs_CLASS(self, background_param):
 
-        y, kmodes = evolve_perturbations( 
+        y, kmodes, _ = evolve_perturbations(
             param=background_param, kmin=kmin, kmax=kmax, num_k=nmodes, aexp_out=aexp_out,
             lmaxg = 31, lmaxgp = 31, lmaxr = 31, lmaxnu = 31, nqmax = 5,
             max_steps=2048, rtol=1e-5, atol=1e-5
