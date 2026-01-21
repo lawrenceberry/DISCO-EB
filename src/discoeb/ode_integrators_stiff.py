@@ -3,6 +3,7 @@ from typing import ClassVar, Union, Literal, Optional
 from typing_extensions import TypeAlias
 
 import equinox.internal as eqxi
+import equinox as eqx
 from equinox.internal import ω
 import lineax as lx
 from jaxtyping import PyTree
@@ -843,6 +844,11 @@ class Rodas5Transformed(AbstractAdaptiveSolver):
         return terms.vf(t0, y0, args)
 
 
+class Rodas5BatchedState(eqx.Module):
+    step_index: IntScalarLike
+    jac_blocks: PyTree
+
+
 class Rodas5Batched(AbstractAdaptiveSolver):
     r"""Rodas5 method."""
 
@@ -850,6 +856,7 @@ class Rodas5Batched(AbstractAdaptiveSolver):
     interpolation_cls: ClassVar[Callable[..., LocalLinearInterpolation]] = (
         LocalLinearInterpolation
     )
+    jacobian_update_every: int = 1
 
     def order(self, terms):
         return 5
@@ -864,8 +871,22 @@ class Rodas5Batched(AbstractAdaptiveSolver):
         t1: RealScalarLike,
         y0: Y,
         args: Args,
-    ) -> _SolverState:
-        return None
+    ) -> Rodas5BatchedState:
+        f, _args = args
+
+        dt_f = jax.jacfwd(f, 0)
+        jac_f = jax.jacfwd(f, 1)
+
+        dt_f_batched = jax.vmap(dt_f,
+            in_axes=(None, 0, 0),
+        )
+        jac_f_batched = jax.vmap(jac_f,
+            in_axes=(None, 0, 0),
+        )
+        
+        jac_blocks = jac_f_batched(t0, y0, _args)
+        
+        return Rodas5BatchedState(step_index=0, jac_blocks=jac_blocks)
 
     def step(
         self,
@@ -874,10 +895,10 @@ class Rodas5Batched(AbstractAdaptiveSolver):
         t1: RealScalarLike,
         y0: Y,
         args: Args,
-        solver_state: _SolverState,
+        solver_state: Rodas5BatchedState,
         made_jump: BoolScalarLike,
-    ) -> tuple[Y, _ErrorEstimate, DenseInfo, _SolverState, RESULTS]:
-        del solver_state, made_jump
+    ) -> tuple[Y, _ErrorEstimate, DenseInfo, Rodas5BatchedState, RESULTS]:
+        # del made_jump
         
         f, _args = args
 
@@ -939,7 +960,16 @@ class Rodas5Batched(AbstractAdaptiveSolver):
 
 
         dT = dt_f_batched(t0, y0, _args)
-        jac_blocks = jac_f_batched(t0, y0, _args)
+        
+        def compute_jac(_):
+            return jac_f_batched(t0, y0, _args)
+            
+        def reuse_jac(_):
+            return solver_state.jac_blocks
+            
+        should_update = (solver_state.step_index != 0) & (solver_state.step_index % self.jacobian_update_every == 0)
+        
+        jac_blocks = jax.lax.cond(should_update, compute_jac, reuse_jac, operand=None)
         
         lu_and_piv = lu_batched(jac_blocks)
 
@@ -998,7 +1028,10 @@ class Rodas5Batched(AbstractAdaptiveSolver):
         du = terms.vf(t=t0 + dt, y=u, args=_args)
 
         dense_info = dict(y0=y0, y1=y1) 
-        return y1, k8, dense_info, None, RESULTS.successful
+        
+        new_state = Rodas5BatchedState(step_index=solver_state.step_index + 1, jac_blocks=jac_blocks)
+        
+        return y1, k8, dense_info, new_state, RESULTS.successful
 
     def func(
         self,

@@ -815,7 +815,7 @@ def evolve_modes_batched( *, tau_max, tau_out, param, kmodes,
                         nqmax : int, rtol: float, atol: float,
                         pcoeff : float, icoeff : float, dcoeff : float, 
                         factormax : float, factormin : float, max_steps : int  , 
-                        batch_size: int, return_full : bool = False):
+                        batch_size: int, return_full : bool = False, jacobian_update_every: int = 1):
 
     n_total = len(kmodes)
     n_batches = n_total // batch_size
@@ -878,7 +878,7 @@ def evolve_modes_batched( *, tau_max, tau_out, param, kmodes,
         filters = jax.vmap(lambda kmode: jnp.array([1,kmode**2,1,1,1/kmode**2,1]))(kmodes_batch)
         sol =  drx.diffeqsolve(
             terms=modelX_term,
-            solver=Rodas5Batched(),
+            solver=Rodas5Batched(jacobian_update_every=jacobian_update_every),
             t0=t0,
             t1=tau_max,
             dt0=jnp.minimum(t0/4, 0.5*(tau_max-t0)),
@@ -1003,7 +1003,7 @@ def evolve_perturbations_batched( *, param, aexp_out, kmin : float, kmax : float
                          nqmax : int = 3, rtol: float = 1e-4, atol: float = 1e-4,
                          pcoeff : float = 0.25, icoeff : float = 0.80, dcoeff : float = 0.0,
                          factormax : float = 20.0, factormin : float = 0.3, max_steps : int = 2048 , 
-                         batch_size: int = 16, return_full : bool = False, dologk : bool = True):
+                         batch_size: int = 16, return_full : bool = False, dologk : bool = True, jacobian_update_every: int = 1):
     """evolve cosmological perturbations in the synchronous gauge
 
     Parameters
@@ -1038,6 +1038,8 @@ def evolve_perturbations_batched( *, param, aexp_out, kmin : float, kmax : float
         if True, return full state vector; if False, return converted output variables
     dologk : bool
         if True, use logarithmic spacing for k; if False, use linear spacing
+    jacobian_update_every : int
+        Update Jacobian every n steps. Defaults to 1 (every step).
 
     Returns
     -------
@@ -1065,7 +1067,7 @@ def evolve_perturbations_batched( *, param, aexp_out, kmin : float, kmax : float
                                     lmaxnu=lmaxnu, nqmax=nqmax, rtol=rtol, atol=atol,
                                     pcoeff=pcoeff, icoeff=icoeff, dcoeff=dcoeff, 
                                     factormax=factormax, factormin=factormin, max_steps=max_steps,
-                                    batch_size=batch_size, return_full=return_full )
+                                    batch_size=batch_size, return_full=return_full, jacobian_update_every=jacobian_update_every )
     
     # Store parameters in param dict for compatibility with non-batched version
     param['lmaxg'] = lmaxg
