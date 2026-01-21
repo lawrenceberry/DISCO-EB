@@ -1275,5 +1275,5 @@ def test_cmb_vs_camb_accuracy(cosmology_name, camb_benchmarks, num_regression):
     print(f"  RMSE: {metrics['rmse']:.2f} μK²")
 
     # Standard accuracy assertion (should pass for all cosmologies)
-    assert metrics['mean_relative_error'] < 10.0, \
-        f"Mean relative error {metrics['mean_relative_error']:.4f} exceeds 1000% threshold"
+    assert metrics['mean_relative_error'] < 0.5, \
+        f"Mean relative error {metrics['mean_relative_error']:.4f} exceeds 50% threshold"
