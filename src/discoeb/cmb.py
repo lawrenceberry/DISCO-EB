@@ -791,7 +791,10 @@ def compute_Cell_spectrum_from_cosmo_params(
     ellmax=2500,
     nmodes=512,
     kmin=1e-4,
-    kmax=1.0
+    kmax=1.0,
+    nk_fine=512,
+    chunk_size=32,
+    k_chunk_size=32
 ):
     """Compute CMB C_ell spectrum using DISCO-EB.
 
@@ -886,9 +889,9 @@ def compute_Cell_spectrum_from_cosmo_params(
         tau0=tau0,
         # The following parameters are hardware dependent as they can cause memory overflow
         # TODO: make the batching dynamic according to how much memory is available on the user's GPU
-        nk_fine=512,
-        chunk_size=32,
-        k_chunk_size=32
+        nk_fine=nk_fine,
+        chunk_size=chunk_size,
+        k_chunk_size=k_chunk_size
     )
 
     # 12. Compute C_ell

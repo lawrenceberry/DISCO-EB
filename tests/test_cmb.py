@@ -3,7 +3,7 @@ CMB Spectrum Testing Suite
 
 This module provides comprehensive testing for DISCO-EB's CMB spectrum computation
 by comparing against CAMB benchmarks across multiple cosmologies. It uses pytest-regression
-to automatically track accuracy metrics and pytest-benchmark for timings. CAMB benchmarks are 
+to automatically track accuracy metrics and pytest-benchmark for timings. CAMB benchmarks are
 automatically generated on first test run if they don't exist.
 
 Usage:
@@ -27,8 +27,12 @@ Usage:
 
     # Update accuracy baseline after accuracy improvements
     pytest tests/test_cmb.py::test_cmb_vs_camb_accuracy --force-regen
+
+    # Force regeneration of cached cmb_test_data (by deleting cache file)
+    rm tests/resources/cmb_test_data_cache.pkl && pytest tests/test_cmb.py
 """
 import os
+import pickle
 from datetime import datetime
 from multiprocessing import Pool
 
@@ -87,10 +91,16 @@ STANDARD_COSMOLOGIES = {
 
 @pytest.fixture(scope="module")
 def cmb_test_data():
-    """Generate test data for CMB benchmarks.
+    """Generate test data for CMB benchmarks with file caching.
 
     This fixture runs once per module to generate all the intermediate
-    data needed for benchmarking individual functions.
+    data needed for benchmarking individual functions. The computed data
+    is cached to disk for faster subsequent runs.
+
+    Cache location: tests/resources/cmb_test_data_cache.pkl
+
+    To force regeneration, delete the cache file:
+        rm tests/resources/cmb_test_data_cache.pkl
     """
     # Enable 64-bit precision
     jax.config.update("jax_enable_x64", True)
@@ -99,12 +109,37 @@ def cmb_test_data():
     # Clear compilation cache
     jax.clear_caches()
 
-    # Standard cosmology parameters
-    param = STANDARD_COSMOLOGIES["DISCO-Notebook"]
+    # Cache file location
+    cache_dir = "tests/resources"
+    cache_file = os.path.join(cache_dir, "cmb_test_data_cache.pkl")
 
+    # Try to load from cache if it exists
+    if os.path.exists(cache_file):
+        print("\n" + "="*70)
+        print("Loading CMB test data from cache...")
+        print(f"  Cache file: {cache_file}")
+        print("="*70)
+
+        try:
+            with open(cache_file, 'rb') as f:
+                cached_data = pickle.load(f)
+
+            print("✓ CMB test data loaded from cache!")
+            print("  (Delete cache file to force regeneration)")
+            print("="*70 + "\n")
+
+            return cached_data
+
+        except Exception as e:
+            print(f"⚠ Failed to load cache ({e}), regenerating...")
+
+    # Generate fresh data
     print("\n" + "="*70)
     print("Setting up CMB test data (this may take a minute)...")
     print("="*70)
+
+    # Standard cosmology parameters
+    param = STANDARD_COSMOLOGIES["DISCO-Notebook"]
 
     # 1. Background evolution
     print("  [1/3] Computing background evolution...")
@@ -159,9 +194,9 @@ def cmb_test_data():
     )
 
     print("✓ CMB test data ready!")
-    print("="*70 + "\n")
 
-    return {
+    # Prepare data dictionary
+    data = {
         'param': param,
         'yout': yout,
         'yprime': yprime,
@@ -181,12 +216,27 @@ def cmb_test_data():
         'source_results': source_results,
     }
 
+    # Save to cache
+    print(f"  Saving to cache: {cache_file}")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    try:
+        with open(cache_file, 'wb') as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print("✓ Cache saved successfully!")
+    except Exception as e:
+        print(f"⚠ Failed to save cache: {e}")
+
+    print("="*70 + "\n")
+
+    return data
+
 
 # ==============================================================================
 # Benchmark Tests
 # ==============================================================================
 
-def test_benchmark_evolve_background(benchmark):
+def test_benchmark_evolve_background(benchmark, num_regression):
     """Benchmark evolve_background function.
 
     This is the first step in the CMB pipeline that computes the background
@@ -210,8 +260,18 @@ def test_benchmark_evolve_background(benchmark):
     assert 'tau_of_a_spline' in result
     assert 'xe_of_loga_spline' in result
 
+    # Numeric regression check - test full arrays and key scalar values
+    test_points = jnp.array([0.001, 0.01, 0.1, 0.5, 1.0])
+    num_regression.check({
+        "H0": result["H0"],
+        "Omegam": result["Omegam"],
+        "grhom": result["grhom"],
+        "tau_at_test_points": result['tau_of_a_spline'].evaluate(test_points),
+        "xe_at_test_points": jnp.exp(result['xe_of_loga_spline'].evaluate(jnp.log(test_points))),
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_compute_background_quantities(benchmark, cmb_test_data):
+
+def test_benchmark_compute_background_quantities(benchmark, cmb_test_data, num_regression):
     """Benchmark compute_background_quantities function.
 
     This function computes background density and equation of state quantities
@@ -235,8 +295,15 @@ def test_benchmark_compute_background_quantities(benchmark, cmb_test_data):
     assert 'w_Q' in result
     assert result['rhonu'].shape == data['aexp_out'].shape
 
+    # Numeric regression check - check full arrays
+    num_regression.check({
+        "rhonu": result['rhonu'],
+        "rho_Q": result['rho_Q'],
+        "w_Q": result['w_Q'],
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_evolve_perturbations_batched(benchmark):
+
+def test_benchmark_evolve_perturbations_batched(benchmark, num_regression):
     """Benchmark evolve_perturbations_batched function.
 
     This is the most computationally intensive step in the CMB pipeline,
@@ -287,8 +354,17 @@ def test_benchmark_evolve_perturbations_batched(benchmark):
     assert yout.shape[0] == 64  # num_k
     assert yout.shape[1] == len(aexp_out)
 
+    # Numeric regression check - check representative k-modes (flattened for 1D requirement)
+    # Select first, middle, and last k-modes to keep regression file manageable
+    num_regression.check({
+        "yout_k0_flat": yout[0, :, :].flatten(),
+        "yout_k31_flat": yout[31, :, :].flatten(),
+        "yout_k63_flat": yout[63, :, :].flatten(),
+        "kmodes": kmodes,  # Full kmodes array
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_compute_time_derivatives(benchmark, cmb_test_data):
+
+def test_benchmark_compute_time_derivatives(benchmark, cmb_test_data, num_regression):
     """Benchmark compute_time_derivatives function.
 
     This function computes time derivatives of perturbations, which is needed
@@ -311,8 +387,15 @@ def test_benchmark_compute_time_derivatives(benchmark, cmb_test_data):
     # Verify output shape matches input
     assert yprime.shape == data['yout'].shape
 
+    # Numeric regression check - sample representative k-modes (flattened for 1D requirement)
+    num_regression.check({
+        "yprime_k0_flat": yprime[0, :, :].flatten(),
+        "yprime_k63_flat": yprime[63, :, :].flatten(),
+        "yprime_k127_flat": yprime[127, :, :].flatten(),
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_extract_perturbations(benchmark, cmb_test_data):
+
+def test_benchmark_extract_perturbations(benchmark, cmb_test_data, num_regression):
     """Benchmark extract_perturbations function."""
     data = cmb_test_data
 
@@ -329,8 +412,23 @@ def test_benchmark_extract_perturbations(benchmark, cmb_test_data):
     assert 'deltag' in result
     assert result['deltag'].shape == data['yout'][:, :, data['perturbations']['idxg']].shape
 
+    # Numeric regression check - check full arrays for key quantities at sample k-modes
+    # Store each k-mode separately since num_regression only supports 1D arrays
+    num_regression.check({
+        "deltag_k0": result['deltag'][0, :],
+        "deltag_k63": result['deltag'][63, :],
+        "deltag_k127": result['deltag'][127, :],
+        "deltac_k0": result['deltac'][0, :],
+        "deltac_k63": result['deltac'][63, :],
+        "deltac_k127": result['deltac'][127, :],
+        "thetag_k0": result['thetag'][0, :],
+        "thetag_k63": result['thetag'][63, :],
+        "deltab_k0": result['deltab'][0, :],
+        "deltar_k0": result['deltar'][0, :],
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_compute_visibility_functions(benchmark, cmb_test_data):
+
+def test_benchmark_compute_visibility_functions(benchmark, cmb_test_data, num_regression):
     """Benchmark compute_visibility_functions function."""
     data = cmb_test_data
 
@@ -348,8 +446,15 @@ def test_benchmark_compute_visibility_functions(benchmark, cmb_test_data):
     assert 'optical_depth' in result
     assert result['gvis'].shape == data['tau'].shape
 
+    # Numeric regression check - check full arrays
+    num_regression.check({
+        "gvis": result['gvis'],
+        "optical_depth": result['optical_depth'],
+        "gvisprime": result['gvisprime'],
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_compute_neutrino_perturbations(benchmark, cmb_test_data):
+
+def test_benchmark_compute_neutrino_perturbations(benchmark, cmb_test_data, num_regression):
     """Benchmark compute_neutrino_perturbations function."""
     data = cmb_test_data
 
@@ -377,8 +482,16 @@ def test_benchmark_compute_neutrino_perturbations(benchmark, cmb_test_data):
     assert 'drhonu' in result
     assert result['drhonu'].shape[0] == data['yout'].shape[0]
 
+    # Numeric regression check - sample k-modes (separate 1D arrays)
+    num_regression.check({
+        "drhonu_k0": result['drhonu'][0, :],
+        "drhonu_k63": result['drhonu'][63, :],
+        "drhonu_k127": result['drhonu'][127, :],
+        "dpnu_k0": result['dpnu'][0, :],
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_compute_metric_perturbations(benchmark, cmb_test_data):
+
+def test_benchmark_compute_metric_perturbations(benchmark, cmb_test_data, num_regression):
     """Benchmark compute_metric_perturbations function."""
     data = cmb_test_data
 
@@ -406,8 +519,16 @@ def test_benchmark_compute_metric_perturbations(benchmark, cmb_test_data):
     assert 'alpha' in result
     assert 'alphaprime' in result
 
+    # Numeric regression check - sample k-modes (separate 1D arrays)
+    num_regression.check({
+        "alpha_k0": result['alpha'][0, :],
+        "alpha_k63": result['alpha'][63, :],
+        "alpha_k127": result['alpha'][127, :],
+        "alphaprime_k0": result['alphaprime'][0, :],
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_compute_polarization_terms(benchmark, cmb_test_data):
+
+def test_benchmark_compute_polarization_terms(benchmark, cmb_test_data, num_regression):
     """Benchmark compute_polarization_terms function."""
     data = cmb_test_data
 
@@ -438,8 +559,15 @@ def test_benchmark_compute_polarization_terms(benchmark, cmb_test_data):
     # Verify output
     assert 'polarization_term' in result
 
+    # Numeric regression check - sample k-modes (separate 1D arrays)
+    num_regression.check({
+        "polarization_term_k0": result['polarization_term'][0, :],
+        "polarization_term_k63": result['polarization_term'][63, :],
+        "polarization_term_k127": result['polarization_term'][127, :],
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_compute_source_term_isw(benchmark, cmb_test_data):
+
+def test_benchmark_compute_source_term_isw(benchmark, cmb_test_data, num_regression):
     """Benchmark compute_source_term_isw function."""
     data = cmb_test_data
 
@@ -452,8 +580,15 @@ def test_benchmark_compute_source_term_isw(benchmark, cmb_test_data):
     # Verify output shape
     assert result.shape[0] == data['kmodes'].shape[0]
 
+    # Numeric regression check - sample k-modes (separate 1D arrays)
+    num_regression.check({
+        "source_isw_k0": result[0, :],
+        "source_isw_k63": result[63, :],
+        "source_isw_k127": result[127, :],
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_compute_source_term_sachs_wolfe(benchmark, cmb_test_data):
+
+def test_benchmark_compute_source_term_sachs_wolfe(benchmark, cmb_test_data, num_regression):
     """Benchmark compute_source_term_sachs_wolfe function."""
     data = cmb_test_data
 
@@ -469,8 +604,15 @@ def test_benchmark_compute_source_term_sachs_wolfe(benchmark, cmb_test_data):
     # Verify output shape
     assert result.shape[0] == data['kmodes'].shape[0]
 
+    # Numeric regression check - sample k-modes (separate 1D arrays)
+    num_regression.check({
+        "source_sw_k0": result[0, :],
+        "source_sw_k63": result[63, :],
+        "source_sw_k127": result[127, :],
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_compute_source_term_doppler(benchmark, cmb_test_data):
+
+def test_benchmark_compute_source_term_doppler(benchmark, cmb_test_data, num_regression):
     """Benchmark compute_source_term_doppler function."""
     data = cmb_test_data
 
@@ -486,8 +628,15 @@ def test_benchmark_compute_source_term_doppler(benchmark, cmb_test_data):
     # Verify output shape
     assert result.shape[0] == data['kmodes'].shape[0]
 
+    # Numeric regression check - sample k-modes (separate 1D arrays)
+    num_regression.check({
+        "source_doppler_k0": result[0, :],
+        "source_doppler_k63": result[63, :],
+        "source_doppler_k127": result[127, :],
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_compute_source_term_polarization(benchmark, cmb_test_data):
+
+def test_benchmark_compute_source_term_polarization(benchmark, cmb_test_data, num_regression):
     """Benchmark compute_source_term_polarization function."""
     data = cmb_test_data
 
@@ -501,8 +650,15 @@ def test_benchmark_compute_source_term_polarization(benchmark, cmb_test_data):
     # Verify output shape
     assert result.shape[0] == data['kmodes'].shape[0]
 
+    # Numeric regression check - sample k-modes (separate 1D arrays)
+    num_regression.check({
+        "source_polarization_k0": result[0, :],
+        "source_polarization_k63": result[63, :],
+        "source_polarization_k127": result[127, :],
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_compute_source_function(benchmark, cmb_test_data):
+
+def test_benchmark_compute_source_function(benchmark, cmb_test_data, num_regression):
     """Benchmark compute_source_function function."""
     data = cmb_test_data
 
@@ -537,8 +693,19 @@ def test_benchmark_compute_source_function(benchmark, cmb_test_data):
     assert 'S3' in result
     assert 'S4' in result
 
+    # Numeric regression check - sample k-modes for all source terms (separate 1D arrays)
+    num_regression.check({
+        "S_k0": result['S'][0, :],
+        "S_k63": result['S'][63, :],
+        "S_k127": result['S'][127, :],
+        "S1_k0": result['S1'][0, :],
+        "S2_k0": result['S2'][0, :],
+        "S3_k0": result['S3'][0, :],
+        "S4_k0": result['S4'][0, :],
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_compute_theta_ell(benchmark, cmb_test_data):
+
+def test_benchmark_compute_theta_ell(benchmark, cmb_test_data, num_regression):
     """Benchmark compute_theta_ell function - LINE-OF-SIGHT INTEGRATION.
 
     This is typically the most expensive operation in CMB spectrum computation.
@@ -579,8 +746,14 @@ def test_benchmark_compute_theta_ell(benchmark, cmb_test_data):
     # Verify output shape
     assert theta_ell.shape == (nk_fine, ellmax + 1)
 
+    # Numeric regression check - sample k-modes with full ell range (separate 1D arrays)
+    num_regression.check({
+        "theta_ell_k_min": theta_ell[0, :],
+        "theta_ell_k_max": theta_ell[255, :],
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_compute_Cell(benchmark, cmb_test_data):
+
+def test_benchmark_compute_Cell(benchmark, cmb_test_data, num_regression):
     """Benchmark compute_Cell function."""
     data = cmb_test_data
     S = data['source_results']['S']
@@ -615,8 +788,13 @@ def test_benchmark_compute_Cell(benchmark, cmb_test_data):
     # Verify output shape
     assert Cell.shape == (ellmax + 1,)
 
+    # Numeric regression check - check full Cell array
+    num_regression.check({
+        "Cell": Cell,
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
-def test_benchmark_compute_Dell(benchmark, cmb_test_data):
+
+def test_benchmark_compute_Dell(benchmark, cmb_test_data, num_regression):
     """Benchmark compute_Dell function."""
     data = cmb_test_data
 
@@ -639,6 +817,12 @@ def test_benchmark_compute_Dell(benchmark, cmb_test_data):
     # Verify output
     assert len(ell) == len(Dell)
     assert ell[0] == 2  # Start from ell=2
+
+    # Numeric regression check - check full Dell array
+    num_regression.check({
+        "ell": ell,
+        "Dell": Dell,
+    }, default_tolerance=dict(atol=0, rtol=0.2))
 
 
 # ==============================================================================

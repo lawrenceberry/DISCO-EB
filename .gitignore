@@ -10,3 +10,6 @@ uv.lock
 # cache files
 .pyc
 __pycache__/
+
+# test cache files
+tests/resources/cmb_test_data_cache.pkl
