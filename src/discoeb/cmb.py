@@ -10,8 +10,8 @@ from functools import partial
 from .background import compute_background_quantities, evolve_background
 from .cosmo import get_aprimeoa
 from .perturbations import compute_time_derivatives, evolve_perturbations_batched, nu_perturb, nu_perturb_prime
-from .util import spherical_bessel
 from .spline_interpolation import spline_interpolation
+from .util import lngamma_complex_e
 
 
 def extract_perturbations(yout, youtprime, lmaxg, lmaxgp, lmaxr):
@@ -600,16 +600,61 @@ def compute_source_function(perturbations, metric, visibility_functions,
     }
 
 
-@partial(jax.jit, static_argnames=['ellmax', 'nk_fine', 'chunk_size', 'k_chunk_size'])
-def compute_theta_ell(ellmax, kmodes, tau, S, tau0, nk_fine=2048, chunk_size=500, k_chunk_size=1024):
-    """Compute multipole moments Θ_ℓ(k) via line-of-sight integration.
+def _fftlog_bessel_integral_coefficients(ell, p):
+    """Compute the analytical coefficient for ∫ χ^p j_ℓ(kχ) dχ.
 
-    The line-of-sight integral computes:
+    For power-law functions, the spherical Bessel integral has a closed form:
+
+        ∫₀^∞ χ^p j_ℓ(kχ) dχ = (2^(p-1) / k^(p+1)) × √π × Γ((1+ℓ+p)/2) / Γ((2+ℓ-p)/2)
+
+    This function computes the coefficient excluding the k-dependent part,
+    which is applied separately.
+
+    Parameters
+    ----------
+    ell : jnp.ndarray
+        Multipole moments (shape: n_ell)
+    p : jnp.ndarray
+        Complex power-law indices (shape: n_coeffs), typically p = bias + i*eta_n
+
+    Returns
+    -------
+    jnp.ndarray
+        Coefficients M_ℓ(p) with shape (n_ell, n_coeffs)
+
+    References
+    ----------
+    Assassi et al. (2017), JCAP 11 (2017) 054, arXiv:1705.05022
+    Reymond et al. (2025), arXiv:2505.22718
+    """
+    def compute_log_coeff(ell_val, p_val):
+        a1 = (1.0 + ell_val + p_val) / 2.0
+        a2 = (2.0 + ell_val - p_val) / 2.0
+        return (
+            (p_val - 1.0) * jnp.log(2.0)
+            + 0.5 * jnp.log(jnp.pi)
+            + lngamma_complex_e(a1)
+            - lngamma_complex_e(a2)
+        )
+
+    # Use nested vmap for efficient broadcasting over ell and p
+    compute_log_coeff_vmap = jax.vmap(jax.vmap(compute_log_coeff, in_axes=(None, 0)), in_axes=(0, None))
+    log_coeff = compute_log_coeff_vmap(jnp.atleast_1d(ell), jnp.atleast_1d(p))
+
+    return jnp.exp(log_coeff)
+
+
+@partial(jax.jit, static_argnames=['ellmax', 'n_fftlog'])
+def compute_theta_ell(ellmax, kmodes, tau, S, tau0, n_fftlog=16384):
+    """Compute multipole moments Θ_ℓ(k) via FFTLog-based line-of-sight integration.
+
+    Uses the FFTLog algorithm to efficiently compute the line-of-sight integral:
 
         Θ_ℓ(k) = ∫₀^τ₀ S(k,τ) j_ℓ(k(τ₀-τ)) dτ
 
-    where S(k,τ) is the CMB source function, j_ℓ is the spherical Bessel function,
-    and τ₀ is the conformal time today.
+    The method decomposes the source function into power laws using FFTLog,
+    then uses analytical formulas for the spherical Bessel integrals of power laws.
+    This avoids direct evaluation of oscillatory Bessel functions.
 
     Parameters
     ----------
@@ -623,78 +668,108 @@ def compute_theta_ell(ellmax, kmodes, tau, S, tau0, nk_fine=2048, chunk_size=500
         Source function (shape: n_kmodes × n_times)
     tau0 : float
         Conformal time today
-    nk_fine : int, optional
-        Number of k points for fine integration grid (default: 2048)
-    chunk_size : int, optional
-        Chunk size for multipole processing (default: 500)
-    k_chunk_size : int, optional
-        Chunk size for k-mode processing (default: 1024)
+    n_fftlog : int, optional
+        Number of FFTLog coefficients (default: 16384)
 
     Returns
     -------
-    jnp.ndarray
-        Multipole moments Θ_ℓ(k) with shape (nk_fine, ellmax+1)
+    theta_ell : jnp.ndarray
+        Multipole moments Θ_ℓ(k) with shape (n_kmodes, ellmax+1)
+
+    References
+    ----------
+    Assassi et al. (2017), JCAP 11 (2017) 054, arXiv:1705.05022
+    Reymond et al. (2025), arXiv:2505.22718
     """
-    # Create fine k-grid for better integration accuracy
-    kmin = jnp.min(kmodes)
-    kmax = jnp.max(kmodes)
-    kmodes_fine = jnp.geomspace(kmin, kmax, nk_fine)
-    log_kmodes_fine = jnp.log(kmodes_fine)
+    # Convert from conformal time τ to comoving distance χ = τ₀ - τ
+    chi = tau0 - tau
+    chi = chi[::-1]  # Reverse to have increasing χ
+    S_chi = S[:, ::-1]  # Reverse S accordingly
 
-    # Interpolate S to fine k-grid
-    def interpolate_S_slice(S_slice):
-        spline = spline_interpolation(jnp.log(kmodes), S_slice)
-        return spline.evaluate(log_kmodes_fine)
+    # Find valid chi range (χ > 0)
+    chi_min_val = jnp.maximum(chi[0], 1.0)  # Avoid χ=0
+    chi_max_val = chi[-1]
 
-    S_fine = jax.vmap(interpolate_S_slice, in_axes=1, out_axes=1)(S)
+    # Create log-spaced grid in χ for FFTLog
+    log_chi_min = jnp.log(chi_min_val)
+    log_chi_max = jnp.log(chi_max_val)
 
-    # Process in chunks to reduce memory usage
-    def process_chunk(ell_start, ell_end, k_start, k_end):
-        kmodes_chunk = kmodes_fine[k_start:k_end]
-        S_chunk = S_fine[k_start:k_end, :]
+    # Pad the range to suppress periodic artifacts in FFTLog
+    pad = 2.0
+    log_chi_min_padded = log_chi_min - pad
+    log_chi_max_padded = log_chi_max + pad
 
-        # Argument for Bessel functions: k(τ₀ - τ)
-        ktau_chunk = kmodes_chunk[:, None] * (tau0 - tau[None, :])
+    dlog_chi = (log_chi_max_padded - log_chi_min_padded) / n_fftlog
+    chi_fftlog = jnp.exp(log_chi_min_padded + jnp.arange(n_fftlog) * dlog_chi)
 
-        # Compute spherical Bessel functions for all needed ℓ
-        sj_chunk = spherical_bessel(ell_end - 1, ktau_chunk.flatten())[:, 0, :]
-        sj_chunk = sj_chunk.reshape(len(kmodes_chunk), len(tau), ell_end)
-        sj_chunk = sj_chunk[:, :, ell_start:ell_end]
+    # Interpolate S to FFTLog grid for each k
+    def interp_S_to_fftlog(S_k):
+        # Use linear interpolation in log-chi space for robustness
+        log_chi_orig = jnp.log(jnp.maximum(chi, 1e-10))
+        log_chi_fft = jnp.log(chi_fftlog)
+        return jnp.interp(log_chi_fft, log_chi_orig, S_k, left=0.0, right=0.0)
 
-        # Line-of-sight integral: ∫ S(k,τ) j_ℓ(k(τ₀-τ)) dτ
-        integrand_chunk = sj_chunk * S_chunk[:, :, None]
-        theta_l_chunk = jnp.trapezoid(integrand_chunk, x=tau, axis=1)
+    S_fftlog = jax.vmap(interp_S_to_fftlog)(S_chi)
+    # S_fftlog has shape (n_kmodes, n_fftlog)
 
-        return theta_l_chunk
+    # FFTLog decomposition parameters
+    # bias = -1.1 ensures Basis functions decay at large chi
+    bias = -1.1
 
-    # Process in chunks for both ℓ and k
-    num_ell_chunks = (ellmax + 1 + chunk_size - 1) // chunk_size
-    num_k_chunks = (nk_fine + k_chunk_size - 1) // k_chunk_size
+    # Compute FFT frequencies η_n = 2π n / (N × Δlog(χ))
+    n_freqs = n_fftlog // 2 + 1  # For rfft
+    eta_n = 2.0 * jnp.pi * jnp.arange(n_freqs) / (n_fftlog * dlog_chi)
 
-    ell_chunks = []
-    for i in range(num_ell_chunks):
-        ell_start = i * chunk_size
-        ell_end = min((i + 1) * chunk_size, ellmax + 1)
-        if ell_start < ell_end:
-            k_chunks = []
-            for j in range(num_k_chunks):
-                k_start = j * k_chunk_size
-                k_end = min((j + 1) * k_chunk_size, nk_fine)
-                if k_start < k_end:
-                    k_chunk_result = process_chunk(ell_start, ell_end, k_start, k_end)
-                    k_chunks.append(k_chunk_result)
-            # Concatenate k chunks
-            ell_chunk_result = jnp.concatenate(k_chunks, axis=0)
-            ell_chunks.append(ell_chunk_result)
+    # Complex power-law indices: p_n = bias + i × η_n
+    p_n = bias + 1j * eta_n
 
-    # Concatenate ℓ chunks
-    theta_ell = jnp.concatenate(ell_chunks, axis=1)
+    # Apply bias factor to the source function: f_m = S(χ_m) × χ_m^(-bias)
+    S_biased = S_fftlog * chi_fftlog[None, :] ** (-bias)
 
-    return theta_ell, kmodes_fine
+    # Compute FFT coefficients c_n for each k
+    c_n_fft = jnp.fft.rfft(S_biased, axis=-1)
+
+    # Phase shift to account for start of interval
+    phase_shift = jnp.exp(-1j * eta_n * log_chi_min_padded)
+
+    # Normalize coefficients using standard discrete expansion
+    c_n = c_n_fft * phase_shift / n_fftlog
+
+    # Precompute the analytical Bessel integral coefficients for all (ℓ, p_n)
+    ells = jnp.arange(ellmax + 1, dtype=jnp.float64)
+    M_ell_p = _fftlog_bessel_integral_coefficients(ells, p_n)
+    # M_ell_p has shape (ellmax+1, n_freqs)
+
+    # Compute Θ_ℓ(k) by summing over FFTLog coefficients
+    log_k = jnp.log(kmodes)[:, None]  # (n_kmodes, 1)
+    k_power = jnp.exp(-(p_n[None, :] + 1.0) * log_k)  # (n_kmodes, n_freqs)
+
+    # Combine: ck[k, n] = c_n[k, n] * k_power[k, n]
+    ck = c_n * k_power
+
+    # Standard rfft reconstruction sum
+    theta_ell_0 = jnp.einsum('k,l->kl', ck[:, 0].real, M_ell_p[:, 0].real)
+
+    if n_fftlog % 2 == 0:
+        ck_pos = ck[:, 1:-1]
+        M_pos = M_ell_p[:, 1:-1]
+        ck_nyq = ck[:, -1]
+        M_nyq = M_ell_p[:, -1]
+
+        theta_ell_pos = 2.0 * jnp.real(jnp.einsum('kn,ln->kl', ck_pos, M_pos))
+        theta_ell_nyq = jnp.real(jnp.einsum('k,l->kl', ck_nyq, M_nyq))
+        theta_ell = theta_ell_0 + theta_ell_pos + theta_ell_nyq
+    else:
+        ck_pos = ck[:, 1:]
+        M_pos = M_ell_p[:, 1:]
+        theta_ell_pos = 2.0 * jnp.real(jnp.einsum('kn,ln->kl', ck_pos, M_pos))
+        theta_ell = theta_ell_0 + theta_ell_pos
+
+    return theta_ell, kmodes
 
 
 @jax.jit
-def compute_Cell(theta_ell, kmodes_fine, n_s, k_p):
+def compute_Cell(theta_ell, kmodes, n_s, k_p):
     """Compute CMB angular power spectrum C_ℓ from multipole moments.
 
     The angular power spectrum is computed by integrating over k:
@@ -706,9 +781,9 @@ def compute_Cell(theta_ell, kmodes_fine, n_s, k_p):
     Parameters
     ----------
     theta_ell : jnp.ndarray
-        Multipole moments Θ_ℓ(k) with shape (nk_fine, ellmax+1)
-    kmodes_fine : jnp.ndarray
-        Fine wavenumber grid (shape: nk_fine)
+        Multipole moments Θ_ℓ(k) with shape (n_kmodes, ellmax+1)
+    kmodes : jnp.ndarray
+        Wavenumber grid (shape: n_kmodes)
     n_s : float
         Primordial spectral index
     k_p : float
@@ -719,12 +794,12 @@ def compute_Cell(theta_ell, kmodes_fine, n_s, k_p):
     jnp.ndarray
         Angular power spectrum C_ℓ (shape: ellmax+1)
     """
-    log_kmodes_fine = jnp.log(kmodes_fine)
+    log_kmodes = jnp.log(kmodes)
 
     # Integrate over k: ∫ (k/k_p)^(n_s-1) |Θ_ℓ(k)|² d(log k)
     Cell = jnp.trapezoid(
-        (kmodes_fine[:, None] / k_p)**(n_s - 1) * theta_ell**2,
-        x=log_kmodes_fine,
+        (kmodes[:, None] / k_p)**(n_s - 1) * theta_ell**2,
+        x=log_kmodes,
         axis=0
     )
 
@@ -759,7 +834,7 @@ def compute_Dell(Cell, A_s, Tcmb, ellmax=None):
 
     Examples
     --------
-    >>> Cell = compute_Cell(theta_ell, kmodes_fine, n_s=0.96, k_p=0.05)
+    >>> Cell = compute_Cell(theta_ell, kmodes, n_s=0.96, k_p=0.05)
     >>> ell, D_ell = compute_D_ell(Cell, A_s=2.1e-9, Tcmb=2.7255)
     >>> # D_ell now contains the power spectrum in μK²
 
@@ -791,10 +866,7 @@ def compute_Cell_spectrum_from_cosmo_params(
     ellmax=2500,
     nmodes=512,
     kmin=1e-4,
-    kmax=1.0,
-    nk_fine=512,
-    chunk_size=32,
-    k_chunk_size=32
+    kmax=1.0
 ):
     """Compute CMB C_ell spectrum using DISCO-EB.
 
@@ -881,23 +953,18 @@ def compute_Cell_spectrum_from_cosmo_params(
 
     # 11. Line-of-sight integration
     tau0 = param['tau_of_a_spline'].evaluate(1.0)
-    theta_ell, kmodes_fine = compute_theta_ell(
+    theta_ell, kmodes = compute_theta_ell(
         ellmax=ellmax,
         kmodes=kmodes,
         tau=tau,
         S=S,
-        tau0=tau0,
-        # The following parameters are hardware dependent as they can cause memory overflow
-        # TODO: make the batching dynamic according to how much memory is available on the user's GPU
-        nk_fine=nk_fine,
-        chunk_size=chunk_size,
-        k_chunk_size=k_chunk_size
+        tau0=tau0
     )
 
     # 12. Compute C_ell
     Cell = compute_Cell(
         theta_ell=theta_ell,
-        kmodes_fine=kmodes_fine,
+        kmodes=kmodes,
         n_s=param['n_s'],
         k_p=param['k_p']
     )

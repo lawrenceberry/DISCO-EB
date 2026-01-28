@@ -714,9 +714,8 @@ def test_benchmark_compute_theta_ell(benchmark, cmb_test_data, num_regression):
     S = data['source_results']['S']
     tau0 = data['param']['tau_of_a_spline'].evaluate(1.0)
 
-    # Use smaller ellmax and nk_fine for benchmarking
+    # Use smaller ellmax for benchmarking
     ellmax = 100
-    nk_fine = 256
 
     # Warmup compilation
     compute_theta_ell(
@@ -725,31 +724,25 @@ def test_benchmark_compute_theta_ell(benchmark, cmb_test_data, num_regression):
         tau=data['tau'],
         S=S,
         tau0=tau0,
-        nk_fine=nk_fine,
-        chunk_size=32,
-        k_chunk_size=32
     )
 
     # Benchmark
-    theta_ell, kmodes_fine = benchmark(
+    theta_ell, kmodes = benchmark(
         compute_theta_ell,
         ellmax=ellmax,
         kmodes=data['kmodes'],
         tau=data['tau'],
         S=S,
         tau0=tau0,
-        nk_fine=nk_fine,
-        chunk_size=32,
-        k_chunk_size=32
     )
 
     # Verify output shape
-    assert theta_ell.shape == (nk_fine, ellmax + 1)
+    assert theta_ell.shape == (kmodes.shape[0], ellmax + 1)
 
     # Numeric regression check - sample k-modes with full ell range (separate 1D arrays)
     num_regression.check({
         "theta_ell_k_min": theta_ell[0, :],
-        "theta_ell_k_max": theta_ell[255, :],
+        "theta_ell_k_max": theta_ell[127, :],
     }, default_tolerance=dict(atol=0, rtol=0.2))
 
 
@@ -761,26 +754,22 @@ def test_benchmark_compute_Cell(benchmark, cmb_test_data, num_regression):
 
     # Compute theta_ell first
     ellmax = 100
-    nk_fine = 256
-    theta_ell, kmodes_fine = compute_theta_ell(
+    theta_ell, kmodes = compute_theta_ell(
         ellmax=ellmax,
         kmodes=data['kmodes'],
         tau=data['tau'],
         S=S,
-        tau0=tau0,
-        nk_fine=nk_fine,
-        chunk_size=32,
-        k_chunk_size=32
+        tau0=tau0
     )
 
     # Warmup
-    compute_Cell(theta_ell, kmodes_fine, data['param']['n_s'], data['param']['k_p'])
+    compute_Cell(theta_ell, kmodes, data['param']['n_s'], data['param']['k_p'])
 
     # Benchmark
     Cell = benchmark(
         compute_Cell,
         theta_ell,
-        kmodes_fine,
+        kmodes,
         data['param']['n_s'],
         data['param']['k_p']
     )
@@ -1053,43 +1042,12 @@ def test_detailed_timing_analysis():
     print("-" * 80)
     tau0 = param['tau_of_a_spline'].evaluate(1.0)
 
-    # Test different configurations
-    configs = [
-        {"ellmax": 50, "nk_fine": 128, "chunk_size": 32, "k_chunk_size": 32},
-        {"ellmax": 100, "nk_fine": 256, "chunk_size": 32, "k_chunk_size": 32},
-        {"ellmax": 100, "nk_fine": 512, "chunk_size": 64, "k_chunk_size": 64},
-    ]
-
-    los_times = []
-    for config in configs:
-        def compute_theta():
-            return compute_theta_ell(
-                ellmax=config['ellmax'],
-                kmodes=kmodes,
-                tau=tau,
-                S=S,
-                tau0=tau0,
-                nk_fine=config['nk_fine'],
-                chunk_size=config['chunk_size'],
-                k_chunk_size=config['k_chunk_size']
-            )
-
-        result, t = time_step(
-            compute_theta,
-            f"  compute_theta_ell (ellmax={config['ellmax']}, nk_fine={config['nk_fine']})",
-        )
-        los_times.append(t)
-
-    # Use the middle config for subsequent steps
-    theta_ell, kmodes_fine = compute_theta_ell(
+    theta_ell, kmodes = compute_theta_ell(
         ellmax=100,
         kmodes=kmodes,
         tau=tau,
         S=S,
-        tau0=tau0,
-        nk_fine=256,
-        chunk_size=32,
-        k_chunk_size=32
+        tau0=tau0
     )
 
     # Angular power spectrum
@@ -1097,7 +1055,7 @@ def test_detailed_timing_analysis():
     Cell, t = time_step(
         compute_Cell,
         "compute_Cell",
-        theta_ell, kmodes_fine, param['n_s'], param['k_p']
+        theta_ell, kmodes, param['n_s'], param['k_p']
     )
     total_time += t
 
@@ -1113,17 +1071,7 @@ def test_detailed_timing_analysis():
     print("\n" + "="*80)
     print("PIPELINE TIMING SUMMARY")
     print("="*80)
-    print(f"Total pipeline time (excl. LOI configs): {total_time:10.2f} ms ({total_time/1000:.2f} s)")
-    print(f"Line-of-sight integration time range:     {min(los_times):10.2f} - {max(los_times):10.2f} ms")
-    print("\nPRIMARY BOTTLENECKS:")
-    print("  1. evolve_perturbations_batched - Solves coupled ODEs for all k-modes")
-    print("  2. compute_theta_ell - Line-of-sight integration (scales with ellmax)")
-    print("\nINTERPRETATION:")
-    print("  - Functions taking < 10 ms are negligible")
-    print("  - Functions taking 10-100 ms may benefit from optimization")
-    print("  - Functions taking > 100 ms are primary bottlenecks")
-    print("  - For production CMB spectra (ellmax=2500), compute_theta_ell")
-    print("    will take significantly longer than shown here")
+    print(f"Total pipeline time: {total_time:10.2f} ms ({total_time/1000:.2f} s)")
     print("="*80 + "\n")
 
     # Verify output
@@ -1417,7 +1365,7 @@ def test_cmb_vs_camb_accuracy(cosmology_name, camb_benchmarks, num_regression):
     CAMB benchmarks are automatically generated by the fixture if missing.
 
     To update the baseline after intentional improvements:
-        pytest tests/test_cmb.py::TestCMBSpectrum::test_cmb_vs_camb_accuracy --force-regen
+        pytest tests/test_cmb.py::test_cmb_vs_camb_accuracy --force-regen
     """
     import jax
     jax.config.update("jax_enable_x64", True)
@@ -1431,7 +1379,7 @@ def test_cmb_vs_camb_accuracy(cosmology_name, camb_benchmarks, num_regression):
 
     # Compute DISCO-EB spectrum
     print(f"\nComputing DISCO-EB spectrum for {cosmology_name}...")
-    Cell_disco, param = compute_Cell_spectrum_from_cosmo_params(cosmo_params, ellmax=50, nmodes=64, kmin=1e-4, kmax=1.0)
+    Cell_disco, param = compute_Cell_spectrum_from_cosmo_params(cosmo_params, ellmax=100, nmodes=512, kmin=1e-4, kmax=1.0)
     ell_disco, Dell_disco = compute_Dell(Cell_disco, A_s=param["A_s"], Tcmb=param["Tcmb"])
 
     # Get CAMB benchmark (guaranteed to exist by fixture)
