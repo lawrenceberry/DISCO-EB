@@ -400,7 +400,12 @@ def compute_source_term_isw(metric, visibility_functions):
     traverse time-evolving gravitational potentials during radiation-matter
     transition and dark energy domination.
 
-    S1 = exp(-τ) × (Ψ' - Φ')
+    In synchronous gauge, the ISW term is:
+
+        S1 = exp(-τ_c) × (η' + α'')
+
+    which corresponds to (Ψ' - Φ') in Newtonian gauge, where Ψ and Φ are
+    the two gravitational potentials.
 
     Parameters
     ----------
@@ -415,6 +420,7 @@ def compute_source_term_isw(metric, visibility_functions):
         ISW source term S1
     """
     # Time derivative of potential difference (Ψ' - Φ')
+    # In synchronous gauge: η' + α''
     s1 = metric['etaprime'] + metric['alphapprime']
 
     # Suppress before recombination (universe opaque)
