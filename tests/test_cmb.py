@@ -1302,7 +1302,7 @@ def compute_accuracy_metrics(disco_D_ell, camb_D_ell):
     Returns
     -------
     dict
-        Accuracy metrics with keys: mean_relative_error, max_relative_error, rmse, timestamp
+        Accuracy metrics with keys: relative_error, mean_relative_error, max_relative_error, rmse
     """
     # Convert to numpy for safer computation
     disco_D_ell = np.asarray(disco_D_ell)
@@ -1312,10 +1312,10 @@ def compute_accuracy_metrics(disco_D_ell, camb_D_ell):
     rel_error = np.abs(disco_D_ell - camb_D_ell) / camb_D_ell
 
     return {
+        "relative_error": rel_error,
         "mean_relative_error": float(np.mean(rel_error)),
         "max_relative_error": float(np.max(rel_error)),
         "rmse": float(np.sqrt(np.mean((disco_D_ell - camb_D_ell)**2))),
-        "timestamp": datetime.now().isoformat()
     }
 
 
@@ -1370,14 +1370,6 @@ def test_cmb_vs_camb(cosmology_name, camb_benchmarks, num_regression, benchmark)
     # Compute accuracy metrics
     metrics = compute_accuracy_metrics(Dell_disco, D_ell_camb_interp)
 
-    # Use pytest-regression to automatically compare against baseline
-    # This will create a baseline on first run and check regression on subsequent runs
-    num_regression.check({
-        "mean_relative_error": metrics['mean_relative_error'],
-        "max_relative_error": metrics['max_relative_error'],
-        "rmse": metrics['rmse'],
-    }, default_tolerance=dict(atol=0, rtol=0.1))  # Allow 10% relative tolerance
-
     # Print current metrics
     print(f"\n✓ Accuracy metrics for {cosmology_name}:")
     print(f"  Mean rel. error: {metrics['mean_relative_error']:.4f}")
@@ -1385,5 +1377,9 @@ def test_cmb_vs_camb(cosmology_name, camb_benchmarks, num_regression, benchmark)
     print(f"  RMSE: {metrics['rmse']:.2f} μK²")
 
     # Standard accuracy assertion (should pass for all cosmologies)
-    assert metrics['mean_relative_error'] < 0.5, \
-        f"Mean relative error {metrics['mean_relative_error']:.4f} exceeds 50% threshold"
+    assert metrics['mean_relative_error'] < 0.25, \
+        f"Mean relative error {metrics['mean_relative_error']:.4f} exceeds 25% threshold"
+
+    # Use pytest-regression to automatically compare against baseline
+    # This will create a baseline on first run and check regression on subsequent runs
+    num_regression.check(metrics, default_tolerance=dict(atol=0, rtol=0.1))  # allow 10% relative tolerance
