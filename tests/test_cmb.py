@@ -888,7 +888,7 @@ def test_detailed_timing_analysis():
     )
     total_time += t
 
-    # 2. Perturbation evolution (MOST EXPENSIVE)
+    # 2. Perturbation evolution
     print("\n[2/15] PERTURBATION EVOLUTION")
     print("-" * 80)
     aexp_out = jnp.concatenate([
@@ -1037,18 +1037,21 @@ def test_detailed_timing_analysis():
     total_time += t
     S = source_results['S'] # type: ignore
 
-    # 15. Line-of-sight integration (SECOND MOST EXPENSIVE)
+    # 15. Line-of-sight integration
     print("\n[15/15] LINE-OF-SIGHT INTEGRATION")
     print("-" * 80)
     tau0 = param['tau_of_a_spline'].evaluate(1.0)
 
-    theta_ell, kmodes = compute_theta_ell(
-        ellmax=100,
+    (theta_ell, kmodes), t = time_step(
+        compute_theta_ell,
+        "compute_theta_ell",
+        ellmax=2500,
         kmodes=kmodes,
         tau=tau,
         S=S,
         tau0=tau0
     )
+    total_time += t
 
     # Angular power spectrum
     print("\n" + "-" * 80)
@@ -1063,7 +1066,7 @@ def test_detailed_timing_analysis():
     (ell, Dell), t = time_step(
         compute_Dell,
         "compute_Dell",
-        Cell, param['A_s'], param['Tcmb'], ellmax=100
+        Cell, param['A_s'], param['Tcmb'], ellmax=2500
     )
     total_time += t
 
@@ -1075,8 +1078,8 @@ def test_detailed_timing_analysis():
     print("="*80 + "\n")
 
     # Verify output
-    assert len(ell) == 99  # ell starts from 2, ellmax=100
-    assert len(Dell) == 99
+    assert len(ell) == 2499  # ell starts from 2, ellmax=2500
+    assert len(Dell) == 2499
 
 
 #==============================================================================
