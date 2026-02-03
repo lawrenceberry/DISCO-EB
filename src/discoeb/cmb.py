@@ -734,10 +734,11 @@ def compute_theta_ell(ellmax, kmodes, tau, S, tau0, n_fftlog=16384, n_k_dense=0)
 
     # Interpolate S to FFTLog grid for each k
     def interp_S_to_fftlog(S_k):
-        # Use linear interpolation in log-chi space for robustness
+        # Use cubic spline interpolation in log-chi space for robustness
         log_chi_orig = jnp.log(jnp.maximum(chi, 1e-10))
+        spline = spline_interpolation(log_chi_orig, S_k)
         log_chi_fft = jnp.log(chi_fftlog)
-        return jnp.interp(log_chi_fft, log_chi_orig, S_k, left=0.0, right=0.0)
+        return spline.evaluate(log_chi_fft)
 
     S_fftlog = jax.vmap(interp_S_to_fftlog)(S_chi)
     # S_fftlog has shape (n_kmodes, n_fftlog)
