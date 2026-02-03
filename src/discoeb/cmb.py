@@ -650,8 +650,8 @@ def _fftlog_bessel_integral_coefficients(ell, p):
     return jnp.exp(log_coeff)
 
 
-@partial(jax.jit, static_argnames=['ellmax', 'n_fftlog'])
-def compute_theta_ell(ellmax, kmodes, tau, S, tau0, n_fftlog=16384):
+@partial(jax.jit, static_argnames=['ellmax', 'n_fftlog', 'n_k_dense'])
+def compute_theta_ell(ellmax, kmodes, tau, S, tau0, n_fftlog=16384, n_k_dense=0):
     """Compute multipole moments Θ_ℓ(k) via FFTLog-based line-of-sight integration.
 
     Uses the FFTLog algorithm to efficiently compute the line-of-sight integral:
@@ -661,6 +661,11 @@ def compute_theta_ell(ellmax, kmodes, tau, S, tau0, n_fftlog=16384):
     The method decomposes the source function into power laws using FFTLog,
     then uses analytical formulas for the spherical Bessel integrals of power laws.
     This avoids direct evaluation of oscillatory Bessel functions.
+
+    When ``n_k_dense > 0`` the source function is cubic-spline-interpolated
+    from the input k-grid onto a denser ``n_k_dense``-point log-k grid before
+    the FFTLog step.  S is smooth in k while Θ_ℓ(k) is oscillatory, so this
+    resolves the subsequent k-integral in ``compute_Cell`` cheaply.
 
     Parameters
     ----------
@@ -676,17 +681,36 @@ def compute_theta_ell(ellmax, kmodes, tau, S, tau0, n_fftlog=16384):
         Conformal time today
     n_fftlog : int, optional
         Number of FFTLog coefficients (default: 16384)
+    n_k_dense : int, optional
+        If > 0, cubic-spline-interpolate S onto this many log-spaced k-modes
+        before integration.  Default: 0 (use the input k-grid as-is).
 
     Returns
     -------
     theta_ell : jnp.ndarray
         Multipole moments Θ_ℓ(k) with shape (n_kmodes, ellmax+1)
+    kmodes : jnp.ndarray
+        The k-grid actually used (dense grid if ``n_k_dense > 0``, otherwise
+        the input ``kmodes``)
 
     References
     ----------
     Assassi et al. (2017), JCAP 11 (2017) 054, arXiv:1705.05022
     Reymond et al. (2025), arXiv:2505.22718
     """
+    # Optionally interpolate S onto a denser k-grid
+    if n_k_dense > 0:
+        log_k_orig = jnp.log(kmodes)
+        log_k_dense = jnp.linspace(log_k_orig[0], log_k_orig[-1], n_k_dense)
+        kmodes = jnp.exp(log_k_dense)
+
+        def _interp_one_slice(y_slice):
+            spl = spline_interpolation(log_k_orig, y_slice)
+            return spl.evaluate(log_k_dense)
+
+        # vmap over time slices: S.T is (n_times, n_k), output is (n_times, n_k_dense)
+        S = jax.vmap(_interp_one_slice)(S.T).T
+
     # Convert from conformal time τ to comoving distance χ = τ₀ - τ
     chi = tau0 - tau
     chi = chi[::-1]  # Reverse to have increasing χ
@@ -866,18 +890,26 @@ def compute_Dell(Cell, A_s, Tcmb, ellmax=None):
     return ell[2:], D_ell
 
 
-@partial(jax.jit, static_argnames=['ellmax', 'nmodes', 'kmin', 'kmax'])
+@partial(jax.jit, static_argnames=['ellmax', 'nmodes', 'kmin', 'kmax', 'n_k_dense'])
 def compute_Cell_spectrum_from_cosmo_params(
     param_dict,
     ellmax=2500,
     nmodes=512,
     kmin=1e-4,
-    kmax=1.0
+    kmax=1.0,
+    n_k_dense=8192
 ):
     """Compute CMB C_ell spectrum using DISCO-EB.
 
     This function follows the same pipeline as DISCOEB_CMB_spectrum_simple.ipynb
     to compute the temperature power spectrum.
+
+    The source function S(k, tau) is cubic-spline-interpolated from the
+    ``nmodes`` perturbation k-modes onto a denser ``n_k_dense``-point grid
+    in log(k) before the line-of-sight integration.  This resolves the
+    oscillatory structure of theta_ell(k) cheaply (S is smooth) and reduces
+    high-ell errors by an order of magnitude compared to integrating on
+    the raw perturbation grid.
 
     Parameters
     ----------
@@ -886,11 +918,15 @@ def compute_Cell_spectrum_from_cosmo_params(
     ellmax : int, optional
         Maximum multipole to compute. Default: 2500
     nmodes : int, optional
-        Number of k-modes. Default: 512
+        Number of k-modes for perturbation evolution. Default: 512
     kmin : float, optional
         Minimum wavenumber in 1/Mpc. Default: 1e-4
     kmax : float, optional
         Maximum wavenumber in 1/Mpc. Default: 1.0
+    n_k_dense : int, optional
+        Number of k-modes for the dense grid used in the line-of-sight
+        integration.  Set to 0 to skip interpolation and use the raw
+        perturbation grid.  Default: 8192
 
     Returns
     -------
@@ -957,14 +993,15 @@ def compute_Cell_spectrum_from_cosmo_params(
     )
     S = source_results['S']
 
-    # 11. Line-of-sight integration
+    # 11. Line-of-sight integration (with optional k-interpolation of S)
     tau0 = param['tau_of_a_spline'].evaluate(1.0)
     theta_ell, kmodes = compute_theta_ell(
         ellmax=ellmax,
         kmodes=kmodes,
         tau=tau,
         S=S,
-        tau0=tau0
+        tau0=tau0,
+        n_k_dense=n_k_dense,
     )
 
     # 12. Compute C_ell
