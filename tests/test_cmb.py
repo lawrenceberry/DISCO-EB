@@ -1104,6 +1104,9 @@ def disco_params_to_camb(param_dict):
     ombh2 = param_dict['Omegab'] * h**2
     omch2 = (param_dict['Omegam'] - param_dict['Omegab']) * h**2
 
+    # Total neutrino species: massless (Neff) + massive (Nmnu)
+    nnu = param_dict['Neff'] + param_dict['Nmnu']
+
     pars = camb.CAMBparams()
     pars.set_cosmology(
         H0=H0,
@@ -1112,10 +1115,20 @@ def disco_params_to_camb(param_dict):
         omk=param_dict['Omegak'],
         tau=0.0,  # Reionization optical depth
         mnu=param_dict['mnu'],
+        num_massive_neutrinos=param_dict['Nmnu'],
+        nnu=nnu,
+        YHe=param_dict['YHe'],
+        TCMB=param_dict['Tcmb'],
     )
+
+    # Dark energy equation of state
+    pars.DarkEnergy.w = param_dict['w_DE_0']
+    pars.DarkEnergy.wa = param_dict['w_DE_a']
+
     pars.InitPower.set_params(
         As=param_dict['A_s'],
-        ns=param_dict['n_s']
+        ns=param_dict['n_s'],
+        pivot_scalar=param_dict['k_p'],
     )
 
     # Set accuracy parameters
