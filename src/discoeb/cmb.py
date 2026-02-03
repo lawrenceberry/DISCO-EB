@@ -941,10 +941,24 @@ def compute_Cell_spectrum_from_cosmo_params(
     param = evolve_background(param=param, thermo_module='RECFAST', num_thermo=1024)
 
     # 2. Perturbation evolution
-    aexp_out = jnp.concatenate([
-        jnp.geomspace(3e-4, 5e-3, 256, endpoint=False),
-        jnp.geomspace(5e-3, 1.0, 64)
-    ])
+    def _get_aexp_out(n_early=32, n_pre_recomb=64, n_recomb=128, n_post=96):
+        z_break1 = 3000.
+        z_break2 = 1400.
+        z_break3 = 600.
+        a_start = 1e-4
+        a_end = 1.0
+
+        a_break1 = 1.0 / (1.0 + z_break1)
+        a_break2 = 1.0 / (1.0 + z_break2)
+        a_break3 = 1.0 / (1.0 + z_break3)
+
+        a1 = jnp.geomspace(a_start, a_break1, n_early, endpoint=False)
+        a2 = jnp.geomspace(a_break1, a_break2, n_pre_recomb, endpoint=False)
+        a3 = jnp.geomspace(a_break2, a_break3, n_recomb, endpoint=False)
+        a4 = jnp.geomspace(a_break3, a_end, n_post)
+        return jnp.concatenate([a1, a2, a3, a4])
+
+    aexp_out = _get_aexp_out()
 
     yout, kmodes, param = evolve_perturbations_batched(
         param=param,
