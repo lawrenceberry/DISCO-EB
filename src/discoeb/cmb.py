@@ -955,7 +955,7 @@ def compute_Cell_spectrum_from_cosmo_params(
         rtol=1e-4,
         atol=1e-4,
         return_full=True,
-        dologk=True,
+        k_sampling_method='camb',
     )
 
     # 3. Time derivatives

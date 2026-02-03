@@ -333,6 +333,9 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
     param['gvisprime'] = dvis
     param['gvispprime'] = ddvis
 
+    param['tau0'] = param['tau_of_a_spline'].evaluate(1.0)
+    param['tau_maxvis'] = param['tau'][jnp.argmax(param['gvis'])]
+
     if thermo_module == 'RECFAST':
         param['xeprime_recf'] = xeprime_recfast
 

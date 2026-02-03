@@ -926,7 +926,7 @@ def evolve_perturbations( *, param, aexp_out, kmin : float, kmax : float, num_k 
                          lmaxg : int = 11, lmaxgp : int = 11, lmaxr : int = 11, lmaxnu : int = 8,
                          nqmax : int = 3, rtol: float = 1e-4, atol: float = 1e-4,
                          pcoeff : float = 0.25, icoeff : float = 0.80, dcoeff : float = 0.0,
-                         factormax : float = 20.0, factormin : float = 0.3, max_steps : int = 2048, return_full : bool = False, dologk : bool = True):
+                         factormax : float = 20.0, factormin : float = 0.3, max_steps : int = 2048, return_full : bool = False, k_sampling_method: str = 'camb'):
     """evolve cosmological perturbations in the synchronous gauge
 
     Parameters
@@ -955,6 +955,8 @@ def evolve_perturbations( *, param, aexp_out, kmin : float, kmax : float, num_k 
         relative tolerance for ODE solver
     atol : float
         absolute tolerance for ODE solver
+    k_sampling_method : str
+        'log' for logarithmic, 'linear' for linear, 'camb' for CAMB-like hybrid sampling.
 
     Returns
     -------
@@ -963,12 +965,29 @@ def evolve_perturbations( *, param, aexp_out, kmin : float, kmax : float, num_k 
     k : jnp.ndarray
         array of shape (num_k) containing the wavenumbers [in units 1/Mpc]
     """
-    if dologk:
+    if k_sampling_method == 'log':
         kmodes = jnp.geomspace(kmin, kmax, num_k)
-    else:
+    elif k_sampling_method == 'linear':
         kmodes = jnp.linspace(kmin, kmax, num_k)
-        # kkmin = kmax / num_k
-        # kmodes = jnp.append(jnp.geomspace(kmin,kkmin,16,endpoint=False),jnp.linspace(kkmin, kmax, num_k))
+    elif k_sampling_method == 'camb':
+        if 'tau_maxvis' not in param:
+            raise ValueError("param dictionary must contain 'tau_maxvis' for 'camb' k-sampling.")
+        taurst = param['tau_maxvis']
+        
+        # Simplified CAMB-like sampling
+        q_switch1 = 8.0 / taurst
+        q_switch2 = 30.0 / taurst
+        
+        n1 = int(num_k * 0.2)
+        n2 = int(num_k * 0.4)
+        n3 = num_k - n1 - n2
+        
+        k1 = jnp.geomspace(kmin, q_switch1, n1, endpoint=False)
+        k2 = jnp.linspace(q_switch1, q_switch2, n2, endpoint=False)
+        k3 = jnp.geomspace(q_switch2, kmax, n3)
+        kmodes = jnp.concatenate([k1, k2, k3])
+    else:
+        raise ValueError(f"Unknown k_sampling_method: {k_sampling_method}")
     
 
     # determine output times from aexp_out
@@ -1003,7 +1022,7 @@ def evolve_perturbations_batched( *, param, aexp_out, kmin : float, kmax : float
                          nqmax : int = 3, rtol: float = 1e-4, atol: float = 1e-4,
                          pcoeff : float = 0.25, icoeff : float = 0.80, dcoeff : float = 0.0,
                          factormax : float = 20.0, factormin : float = 0.3, max_steps : int = 2048 , 
-                         batch_size: int = 16, return_full : bool = False, dologk : bool = True):
+                         batch_size: int = 16, return_full : bool = False, k_sampling_method: str = 'camb'):
     """evolve cosmological perturbations in the synchronous gauge
 
     Parameters
@@ -1036,8 +1055,8 @@ def evolve_perturbations_batched( *, param, aexp_out, kmin : float, kmax : float
         number of modes to batch together for ODE solver
     return_full : bool
         if True, return full state vector; if False, return converted output variables
-    dologk : bool
-        if True, use logarithmic spacing for k; if False, use linear spacing
+    k_sampling_method : str
+        'log' for logarithmic, 'linear' for linear, 'camb' for CAMB-like hybrid sampling.
 
     Returns
     -------
@@ -1048,10 +1067,29 @@ def evolve_perturbations_batched( *, param, aexp_out, kmin : float, kmax : float
     param : dict
         updated parameter dictionary with output information
     """
-    if dologk:
+    if k_sampling_method == 'log':
         kmodes = jnp.geomspace(kmin, kmax, num_k)
-    else:
+    elif k_sampling_method == 'linear':
         kmodes = jnp.linspace(kmin, kmax, num_k)
+    elif k_sampling_method == 'camb':
+        if 'tau_maxvis' not in param:
+            raise ValueError("param dictionary must contain 'tau_maxvis' for 'camb' k-sampling.")
+        taurst = param['tau_maxvis']
+        
+        # Simplified CAMB-like sampling
+        q_switch1 = 8.0 / taurst
+        q_switch2 = 30.0 / taurst
+        
+        n1 = int(num_k * 0.2)
+        n2 = int(num_k * 0.4)
+        n3 = num_k - n1 - n2
+        
+        k1 = jnp.geomspace(kmin, q_switch1, n1, endpoint=False)
+        k2 = jnp.linspace(q_switch1, q_switch2, n2, endpoint=False)
+        k3 = jnp.geomspace(q_switch2, kmax, n3)
+        kmodes = jnp.concatenate([k1, k2, k3])
+    else:
+        raise ValueError(f"Unknown k_sampling_method: {k_sampling_method}")
     
 
     # determine output times from aexp_out
