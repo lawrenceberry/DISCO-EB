@@ -190,7 +190,7 @@ def cmb_test_data():
         perturbations, metric, visibility_functions, yout, yprime, kmodes, lmaxg, lmaxgp
     )
     source_results = compute_source_function(
-        perturbations, metric, visibility_functions, yout, yprime, kmodes, lmaxg, lmaxgp
+        perturbations, metric, visibility_functions, yout, yprime, kmodes, lmaxg, lmaxgp, tau
     )
 
     print("✓ CMB test data ready!")
@@ -574,7 +574,9 @@ def test_benchmark_compute_source_term_isw(benchmark, cmb_test_data, num_regress
     result = benchmark(
         compute_source_term_isw,
         data['metric'],
-        data['visibility_functions']
+        data['visibility_functions'],
+        data['perturbations'],
+        data['tau']
     )
 
     # Verify output shape
@@ -671,7 +673,8 @@ def test_benchmark_compute_source_function(benchmark, cmb_test_data, num_regress
         data['yprime'],
         data['kmodes'],
         data['lmaxg'],
-        data['lmaxgp']
+        data['lmaxgp'],
+        data['tau']
     )
 
     result = benchmark(
@@ -683,7 +686,8 @@ def test_benchmark_compute_source_function(benchmark, cmb_test_data, num_regress
         data['yprime'],
         data['kmodes'],
         data['lmaxg'],
-        data['lmaxgp']
+        data['lmaxgp'],
+        data['tau']
     )
 
     # Verify output
@@ -995,7 +999,7 @@ def test_detailed_timing_analysis():
     source_isw, t = time_step(
         compute_source_term_isw,
         "compute_source_term_isw",
-        metric, visibility_functions
+        metric, visibility_functions, perturbations, tau
     )
     total_time += t
 
@@ -1032,7 +1036,7 @@ def test_detailed_timing_analysis():
     source_results, t = time_step(
         compute_source_function,
         "compute_source_function",
-        perturbations, metric, visibility_functions, yout, yprime, kmodes, lmaxg, lmaxgp
+        perturbations, metric, visibility_functions, yout, yprime, kmodes, lmaxg, lmaxgp, tau
     )
     total_time += t
     S = source_results['S'] # type: ignore

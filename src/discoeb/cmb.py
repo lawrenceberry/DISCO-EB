@@ -393,7 +393,7 @@ def compute_polarization_terms(perturbations, metric, visibility_functions,
     }
 
 
-def compute_source_term_isw(metric, visibility_functions):
+def compute_source_term_isw(metric, visibility_functions, perturbations, tau):
     """Compute the Integrated Sachs-Wolfe (ISW) source term.
 
     The ISW effect arises from photons gaining or losing energy as they
@@ -407,21 +407,37 @@ def compute_source_term_isw(metric, visibility_functions):
     which corresponds to (Ψ' - Φ') in Newtonian gauge, where Ψ and Φ are
     the two gravitational potentials.
 
+    The algebraic computation η' + α'' suffers from catastrophic cancellation
+    at late times when both terms are individually large but nearly equal in
+    magnitude.  Using the identity η' + α'' = d/dτ(η + α'), we instead
+    differentiate the smooth composite potential via cubic-spline interpolation,
+    which is O(h⁴)-accurate and avoids the cancellation entirely.
+
     Parameters
     ----------
     metric : dict
-        Metric perturbations including etaprime, alphapprime
+        Metric perturbations including alphaprime
     visibility_functions : dict
         Visibility function and optical depth
+    perturbations : dict
+        Extracted perturbation variables including eta
+    tau : jnp.ndarray
+        Conformal time array (n_tau,)
 
     Returns
     -------
     jnp.ndarray
         ISW source term S1
     """
-    # Time derivative of potential difference (Ψ' - Φ')
-    # In synchronous gauge: η' + α''
-    s1 = metric['etaprime'] + metric['alphapprime']
+    # η + α' is smooth in τ; differentiate via cubic spline to get η' + α''
+    # without cancellation.  Shape: (n_k, n_tau)
+    potential = perturbations['eta'] + metric['alphaprime']
+
+    def _deriv_one_k(pot_k):
+        spl = spline_interpolation(tau, pot_k)
+        return spl.derivative(tau)
+
+    s1 = jax.vmap(_deriv_one_k)(potential)
 
     # Suppress before recombination (universe opaque)
     expmmu = jnp.exp(-visibility_functions['optical_depth'])
@@ -540,7 +556,7 @@ def compute_source_term_polarization(visibility_functions, polarization_terms, k
 
 
 def compute_source_function(perturbations, metric, visibility_functions,
-                            yout, yprime, kmodes, lmaxg, lmaxgp):
+                            yout, yprime, kmodes, lmaxg, lmaxgp, tau):
     """Compute the CMB temperature anisotropy source function.
 
     Computes the four source terms:
@@ -567,6 +583,8 @@ def compute_source_function(perturbations, metric, visibility_functions,
         Maximum photon temperature multipole
     lmaxgp : int
         Maximum photon polarization multipole
+    tau : jnp.ndarray
+        Conformal time array (n_tau,)
 
     Returns
     -------
@@ -579,7 +597,7 @@ def compute_source_function(perturbations, metric, visibility_functions,
     )
 
     # Compute each source term
-    S1 = compute_source_term_isw(metric, visibility_functions)
+    S1 = compute_source_term_isw(metric, visibility_functions, perturbations, tau)
 
     S2 = compute_source_term_sachs_wolfe(
         perturbations, metric, visibility_functions, polarization_terms, kmodes
@@ -1004,7 +1022,7 @@ def compute_Cell_spectrum_from_cosmo_params(
 
     # 10. Compute source function
     source_results = compute_source_function(
-        perturbations, metric, visibility_functions, yout, yprime, kmodes, lmaxg, lmaxgp
+        perturbations, metric, visibility_functions, yout, yprime, kmodes, lmaxg, lmaxgp, tau
     )
     S = source_results['S']
 
