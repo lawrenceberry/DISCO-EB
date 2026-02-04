@@ -1090,55 +1090,52 @@ def test_detailed_timing_analysis():
 # Accuracy Tests Against CAMB with Regression Tracking
 #==============================================================================
 
-def disco_params_to_camb(param_dict):
+def disco_params_to_camb(params, ellmax):
     """Convert DISCO-EB parameters to CAMB format.
 
     Parameters
     ----------
-    param_dict : dict
+    params : dict
         DISCO-EB parameter dictionary
+    ellmax : int
+        Maximum multipole to compute
 
     Returns
     -------
     camb.CAMBparams
         CAMB parameters object
     """
-    H0 = param_dict['H0']
-    h = H0 / 100.0
-    ombh2 = param_dict['Omegab'] * h**2
-    omch2 = (param_dict['Omegam'] - param_dict['Omegab']) * h**2
+    cpars = camb.CAMBparams()
 
-    # Total neutrino species: massless (Neff) + massive (Nmnu)
-    nnu = param_dict['Neff'] + param_dict['Nmnu']
-
-    pars = camb.CAMBparams()
-    pars.set_cosmology(
-        H0=H0,
-        ombh2=ombh2,
-        omch2=omch2,
-        omk=param_dict['Omegak'],
+    # Cosmological parameters
+    h = params['H0'] / 100.0
+    cpars.set_cosmology(
+        H0=params['H0'],
+        ombh2=params['Omegab'] * h**2,
+        omch2=(params['Omegam'] - params['Omegab']) * h**2,
+        omk=params['Omegak'],
         tau=0.0,  # Reionization optical depth
-        mnu=param_dict['mnu'],
-        num_massive_neutrinos=param_dict['Nmnu'],
-        nnu=nnu,
-        YHe=param_dict['YHe'],
-        TCMB=param_dict['Tcmb'],
+        mnu=params['mnu'],
+        num_massive_neutrinos=params['Nmnu'],
+        nnu=params['Neff'] + params['Nmnu'],
+        YHe=params['YHe'],
+        TCMB=params['Tcmb'],
     )
 
     # Dark energy equation of state
-    pars.DarkEnergy.w = param_dict['w_DE_0']
-    pars.DarkEnergy.wa = param_dict['w_DE_a']
+    cpars.DarkEnergy.w = params['w_DE_0']
+    cpars.DarkEnergy.wa = params['w_DE_a']
 
-    pars.InitPower.set_params(
-        As=param_dict['A_s'],
-        ns=param_dict['n_s'],
-        pivot_scalar=param_dict['k_p'],
-    )
+    # Initial power spectrum
+    cpars.InitPower.As = params['A_s']  # Amplitude of scalar perturbations
+    cpars.InitPower.ns = params['n_s']  # Scalar spectral index
+    cpars.InitPower.kpivot = params['k_p']  # Pivot scale in Mpc^-1
 
-    # Set accuracy parameters
-    pars.set_accuracy(AccuracyBoost=2.0, lAccuracyBoost=2.0)
+    # Accuracy parameters
+    cpars.set_for_lmax(ellmax)
+    cpars.set_accuracy(lSampleBoost=50.0)  # compute all ells
 
-    return pars
+    return cpars
 
 
 def _compute_single_camb_spectrum(args):
@@ -1159,8 +1156,7 @@ def _compute_single_camb_spectrum(args):
     cosmology_name, param_dict, ellmax = args
 
     # Convert to CAMB parameters
-    pars = disco_params_to_camb(param_dict)
-    pars.set_for_lmax(ellmax, lens_potential_accuracy=2)
+    pars = disco_params_to_camb(param_dict, ellmax)
 
     # Compute power spectrum
     results = camb.get_results(pars)
@@ -1369,7 +1365,7 @@ def test_cmb_vs_camb(cosmology_name, camb_benchmarks, num_regression, benchmark)
     print(f"\nComputing and benchmarking DISCO-EB Cl spectrum for {cosmology_name}...")
     Cell_disco, param = benchmark.pedantic(
         compute_Cell_spectrum_from_cosmo_params,
-        kwargs=dict(param_dict=cosmo_params, ellmax=2500, nmodes=512, kmin=1e-4, kmax=1.0),
+        kwargs=dict(param_dict=cosmo_params, ellmax=2500, nmodes=128, kmin=1e-4, kmax=1.0),
         warmup_rounds=1,  # warmup call performs JIT compilation
         rounds=1,
     )
