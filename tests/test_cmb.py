@@ -1133,7 +1133,7 @@ def disco_params_to_camb(params, ellmax):
 
     # Accuracy parameters
     cpars.set_for_lmax(ellmax)
-    cpars.set_accuracy(lSampleBoost=50.0)  # compute all ells
+    cpars.set_accuracy(lSampleBoost=50.0, AccuracyBoost=8.0)  # compute all ells with high accuracy
 
     return cpars
 
