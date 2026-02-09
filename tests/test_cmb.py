@@ -1470,3 +1470,385 @@ def test_cmb_vs_camb(cosmology_name, camb_benchmarks, num_regression, benchmark)
     # Use pytest-regression to automatically compare against baseline
     # This will create a baseline on first run and check regression on subsequent runs
     num_regression.check(metrics, default_tolerance=dict(atol=0, rtol=0.1))  # allow 10% relative tolerance
+
+
+# ==============================================================================
+# Accuracy Tests Against CLASS with Regression Tracking
+# ==============================================================================
+
+def disco_params_to_class(params, ellmax):
+    """Convert DISCO-EB parameters to CLASS format.
+
+    Parameters
+    ----------
+    params : dict
+        DISCO-EB parameter dictionary
+    ellmax : int
+        Maximum multipole to compute
+
+    Returns
+    -------
+    dict
+        CLASS parameter dictionary
+    """
+    h = params['H0'] / 100.0
+    omega_b = params['Omegab'] * h**2
+    omega_cdm = (params['Omegam'] - params['Omegab']) * h**2
+
+    class_params = {
+        'output': 'tCl,pCl',
+        'lensing': 'no',
+        'l_max_scalars': ellmax,
+        'H0': params['H0'],
+        'omega_b': omega_b,
+        'omega_cdm': omega_cdm,
+        'A_s': params['A_s'],
+        'n_s': params['n_s'],
+        'k_pivot': params['k_p'],
+        'T_cmb': params['Tcmb'],
+        'YHe': params['YHe'],
+        'N_ur': params['Neff'],
+        'N_ncdm': params['Nmnu'],
+        'm_ncdm': params['mnu'],
+        # Dark energy: w0wa fluid parametrization
+        'Omega_Lambda': 0,
+        'w0_fld': params['w_DE_0'],
+        'wa_fld': params['w_DE_a'],
+        # No reionization (matches CAMB test with tau=0)
+        'reio_parametrization': 'reio_none',
+        # --- Disable all physical approximations ---
+        # Use ndf15 integrator (required when disabling approximations)
+        'evolver': 1,
+        # Use second-order tight coupling (most accurate; CLASS v3.x requires
+        # TCA for initial conditions so it cannot be fully disabled)
+        'tight_coupling_approximation': 1,
+        # ODE solver tolerances
+        'tol_perturbations_integration': 1e-4,
+        # Disable radiation streaming approximation (photons)
+        # l_max_g and l_max_pol_g match DISCO-EB defaults (lmaxg=lmaxgp=11)
+        'radiation_streaming_approximation': 3,
+        'l_max_g': 11,
+        'l_max_pol_g': 11,
+        # Disable ultra-relativistic fluid approximation (massless neutrinos)
+        'ur_fluid_approximation': 3,
+        'l_max_ur': 11,
+        # Disable non-cold dark matter fluid approximation (massive neutrinos)
+        'ncdm_fluid_approximation': 3,
+        'l_max_ncdm': 8,
+    }
+
+    return class_params
+
+
+def _compute_single_class_spectrum(args):
+    """Helper function to compute CLASS spectrum for a single cosmology.
+
+    This function is designed to be called by multiprocessing.Pool.map()
+
+    Parameters
+    ----------
+    args : tuple
+        (cosmology_name, param_dict, ellmax)
+
+    Returns
+    -------
+    tuple
+        (cosmology_name, ell_array, D_ell_TT_array, D_ell_EE_array, D_ell_TE_array, elapsed_s)
+    """
+    from classy import Class
+
+    cosmology_name, param_dict, ellmax = args
+
+    # Convert to CLASS parameters
+    class_params = disco_params_to_class(param_dict, ellmax)
+
+    # Compute power spectrum with timing
+    t0 = time.perf_counter()
+    cosmo = Class()
+    cosmo.set(class_params)
+    cosmo.compute()
+    cl = cosmo.raw_cl(ellmax)
+    elapsed_s = time.perf_counter() - t0
+
+    ell_full = cl['ell']
+    Tcmb = param_dict['Tcmb']
+
+    # Convert C_ell to D_ell = ell*(ell+1)*C_ell/(2*pi) in muK^2
+    prefactor = ell_full * (ell_full + 1) / (2 * np.pi) * Tcmb**2 * 1e12
+
+    D_ell_TT = cl['tt'] * prefactor
+    D_ell_EE = cl['ee'] * prefactor
+    D_ell_TE = cl['te'] * prefactor
+
+    # Only keep ell >= 2
+    mask = ell_full >= 2
+    ell = ell_full[mask]
+    D_ell_TT = D_ell_TT[mask]
+    D_ell_EE = D_ell_EE[mask]
+    D_ell_TE = D_ell_TE[mask]
+
+    cosmo.struct_cleanup()
+    cosmo.empty()
+
+    return (cosmology_name, ell, D_ell_TT, D_ell_EE, D_ell_TE, elapsed_s)
+
+
+def generate_class_benchmarks(
+    cosmologies=None,
+    ellmax=2500,
+    output_dir="tests/resources/class_benchmarks",
+    force_regenerate=False,
+    n_processes=None
+):
+    """Generate CLASS benchmark data for standard cosmologies in parallel.
+
+    CLASS is run with physical approximations disabled for maximum accuracy:
+    - Second-order tight coupling approximation (most accurate available)
+    - Radiation streaming approximation pushed to very late times
+    - Ultra-relativistic fluid approximation pushed to very late times
+    - Non-cold dark matter fluid approximation pushed to very late times
+
+    Parameters
+    ----------
+    cosmologies : dict, optional
+        Dictionary of cosmology name -> parameter dict.
+        If None, uses STANDARD_COSMOLOGIES.
+    ellmax : int, optional
+        Maximum multipole to compute. Default: 2500
+    output_dir : str, optional
+        Directory to save CSV files. Default: "tests/resources/class_benchmarks"
+    force_regenerate : bool, optional
+        If True, regenerate even if files exist. Default: False
+    n_processes : int, optional
+        Number of parallel processes. If None, uses all available CPUs.
+
+    Returns
+    -------
+    None
+        Saves CSV files to output_dir
+    """
+    if cosmologies is None:
+        cosmologies = STANDARD_COSMOLOGIES
+
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Check which cosmologies need computation
+    tasks = []
+    for cosmo_name, cosmo_params in cosmologies.items():
+        csv_path = os.path.join(output_dir, f"{cosmo_name}.csv")
+
+        if force_regenerate or not os.path.exists(csv_path):
+            tasks.append((cosmo_name, cosmo_params, ellmax))
+        else:
+            print(f"Skipping {cosmo_name} (already exists)")
+
+    if not tasks:
+        print("All CLASS benchmarks already exist. Use force_regenerate=True to regenerate.")
+        return
+
+    # Compute CLASS spectra in parallel
+    print(f"Generating CLASS benchmarks for {len(tasks)} cosmologies...")
+
+    with Pool(processes=n_processes) as pool:
+        results = pool.map(_compute_single_class_spectrum, tasks)
+
+    # Save results to CSV files (spectra + timing metadata)
+    for cosmo_name, ell, D_ell_TT, D_ell_EE, D_ell_TE, elapsed_s in results:
+        csv_path = os.path.join(output_dir, f"{cosmo_name}.csv")
+        df = pd.DataFrame({
+            'ell': ell,
+            'D_ell_TT': D_ell_TT,
+            'D_ell_EE': D_ell_EE,
+            'D_ell_TE': D_ell_TE,
+        })
+        # Store CLASS timing as DataFrame attribute in a comment header
+        # We use a separate metadata file for clean separation
+        df.to_csv(csv_path, index=False)
+
+        meta_path = os.path.join(output_dir, f"{cosmo_name}_meta.json")
+        import json
+        with open(meta_path, 'w') as f:
+            json.dump({'class_time_s': elapsed_s}, f)
+
+        print(f"  Saved {cosmo_name} -> {csv_path} (CLASS time: {elapsed_s*1000:.1f} ms)")
+
+    print(f"\nGenerated {len(results)} CLASS benchmarks successfully!")
+
+
+@pytest.fixture(scope="session")
+def class_benchmarks():
+    """Load CLASS benchmark data for all standard cosmologies.
+
+    This fixture loads pre-computed CLASS CMB spectra from CSV files in
+    tests/resources/class_benchmarks/. If any benchmarks are missing, they
+    will be automatically generated with approximations disabled.
+
+    Returns
+    -------
+    dict
+        Dictionary mapping cosmology names to benchmark data:
+        {
+            'cosmology_name': {
+                'ell': array of multipole moments,
+                'D_ell_TT': array of TT D_ell values,
+                'D_ell_EE': array of EE D_ell values,
+                'D_ell_TE': array of TE D_ell values,
+                'class_time_s': CLASS computation time in seconds,
+            },
+            ...
+        }
+    """
+    import json as _json
+
+    benchmark_dir = "tests/resources/class_benchmarks"
+
+    # Create directory if it doesn't exist
+    os.makedirs(benchmark_dir, exist_ok=True)
+
+    # Check which benchmarks are missing
+    missing_cosmologies = {}
+    for cosmo_name in STANDARD_COSMOLOGIES:
+        csv_path = os.path.join(benchmark_dir, f"{cosmo_name}.csv")
+        if not os.path.exists(csv_path):
+            missing_cosmologies[cosmo_name] = STANDARD_COSMOLOGIES[cosmo_name]
+
+    # Generate missing benchmarks
+    if missing_cosmologies:
+        print(f"\nGenerating {len(missing_cosmologies)} missing CLASS benchmarks...")
+        print(f"   Cosmologies: {', '.join(missing_cosmologies.keys())}")
+        generate_class_benchmarks(
+            cosmologies=missing_cosmologies,
+            ellmax=2500,
+            output_dir=benchmark_dir,
+            force_regenerate=False,
+        )
+        print("CLASS benchmarks generated successfully\n")
+
+    # Load all CSV files in the benchmark directory
+    benchmarks = {}
+    for filename in os.listdir(benchmark_dir):
+        if filename.endswith('.csv'):
+            cosmology_name = filename.replace('.csv', '')
+            csv_path = os.path.join(benchmark_dir, filename)
+
+            try:
+                df = pd.read_csv(csv_path)
+                entry = {
+                    'ell': jnp.array(df['ell'].values),
+                    'D_ell_TT': jnp.array(df['D_ell_TT'].values),
+                    'D_ell_EE': jnp.array(df['D_ell_EE'].values),
+                    'D_ell_TE': jnp.array(df['D_ell_TE'].values),
+                }
+
+                # Load timing metadata if available
+                meta_path = os.path.join(benchmark_dir, f"{cosmology_name}_meta.json")
+                if os.path.exists(meta_path):
+                    with open(meta_path, 'r') as f:
+                        meta = _json.load(f)
+                    entry['class_time_s'] = meta['class_time_s']
+
+                benchmarks[cosmology_name] = entry
+            except Exception as e:
+                print(f"Warning: Failed to load {csv_path}: {e}")
+
+    return benchmarks
+
+
+@pytest.mark.parametrize("cosmology_name", list(STANDARD_COSMOLOGIES.keys()))
+def test_cmb_vs_class(cosmology_name, class_benchmarks, num_regression, benchmark):
+    """Test CMB spectrum accuracy against CLASS benchmarks with timing.
+
+    CLASS is run with physical approximations disabled for maximum accuracy:
+    - Second-order tight coupling approximation (most accurate available)
+    - Radiation streaming, ultra-relativistic fluid, and non-cold dark matter
+      fluid approximations are disabled.
+
+    Both CLASS and DISCO-EB are timed. CLASS timing includes the full
+    computation from parameter setup to spectrum extraction. DISCO-EB timing
+    uses pytest-benchmark with JIT warmup.
+
+    Uses pytest-regression to automatically track accuracy metrics. On first run,
+    it establishes a baseline. On subsequent runs, it checks that accuracy hasn't
+    worsened relative to the baseline.
+
+    CLASS benchmarks are automatically generated by the fixture if missing.
+
+    To update the accuracy baseline after intentional improvements:
+        pytest tests/test_cmb.py::test_cmb_vs_class --force-regen
+
+    To update the timing baseline after intentional improvements:
+        pytest tests/test_cmb.py::test_cmb_vs_class --benchmark-autosave
+    """
+    import jax
+    jax.config.update("jax_enable_x64", True)
+    jax.config.update('jax_platform_name', 'gpu')
+
+    # Clear JAX compilation cache
+    jax.clear_caches()
+
+    # Get cosmology parameters
+    cosmo_params = STANDARD_COSMOLOGIES[cosmology_name]
+    ellmax = 2500
+
+    # ------------------------------------------------------------------
+    # CLASS timing (recorded during benchmark generation)
+    # ------------------------------------------------------------------
+    bench_data = class_benchmarks[cosmology_name]
+    t_class = bench_data.get('class_time_s', float('nan'))
+    print(f"\nCLASS time (from benchmark generation): {t_class*1000:.1f} ms ({t_class:.3f} s)")
+
+    # ------------------------------------------------------------------
+    # Time DISCO-EB computation (with JIT warmup via benchmark)
+    # ------------------------------------------------------------------
+    print(f"Computing and benchmarking DISCO-EB Cl spectrum for {cosmology_name}...")
+    Cell_disco, param = benchmark.pedantic(
+        compute_Cell_spectrum_from_cosmo_params,
+        kwargs=dict(param_dict=cosmo_params, ellmax=ellmax, nmodes=128, kmin=1e-4, kmax=1.0),
+        warmup_rounds=1,  # warmup call performs JIT compilation
+        rounds=1,
+    )
+    ell_disco, Dell_disco = compute_Dell(Cell_disco, A_s=param["A_s"], Tcmb=param["Tcmb"])
+
+    # Verify output
+    assert Cell_disco.shape == (ellmax + 1,)
+    assert 'tau_of_a_spline' in param
+
+    t_disco = benchmark.stats['mean']
+    print(f"  DISCO-EB time: {t_disco*1000:.1f} ms ({t_disco:.3f} s)")
+    if t_disco > 0 and not np.isnan(t_class):
+        print(f"  Speedup: {t_class/t_disco:.1f}x")
+
+    # ------------------------------------------------------------------
+    # Compare against cached CLASS benchmark (from fixture)
+    # ------------------------------------------------------------------
+    ell_bench = bench_data['ell']
+    D_ell_bench = bench_data['D_ell_TT']
+
+    # Interpolate CLASS benchmark to DISCO-EB ell range
+    D_ell_class_interp = jnp.interp(ell_disco, ell_bench, D_ell_bench)
+
+    # Compute accuracy metrics
+    metrics = compute_accuracy_metrics(Dell_disco, D_ell_class_interp)
+
+    # Add timing information to metrics
+    metrics['class_time_s'] = t_class
+    metrics['disco_time_s'] = t_disco
+    metrics['speedup'] = t_class / t_disco if t_disco > 0 and not np.isnan(t_class) else 0.0
+
+    # Print results
+    print(f"\nAccuracy metrics (DISCO-EB vs CLASS) for {cosmology_name}:")
+    print(f"  Mean rel. error: {metrics['mean_relative_error']:.4f}")
+    print(f"  Max rel. error:  {metrics['max_relative_error']:.4f}")
+    print(f"  RMSE:            {metrics['rmse']:.2f} muK^2")
+    print(f"\nTiming comparison:")
+    print(f"  CLASS:    {t_class*1000:10.1f} ms")
+    print(f"  DISCO-EB: {t_disco*1000:10.1f} ms")
+    print(f"  Speedup:  {metrics['speedup']:10.1f}x")
+
+    # Standard accuracy assertion
+    assert metrics['mean_relative_error'] < 0.01, \
+        f"Mean relative error {metrics['mean_relative_error']:.4f} exceeds 1% threshold"
+
+    # Use pytest-regression to automatically compare against baseline
+    num_regression.check(metrics, default_tolerance=dict(atol=0, rtol=0.1))
