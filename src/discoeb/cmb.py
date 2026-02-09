@@ -909,14 +909,15 @@ def compute_Dell(Cell, A_s, Tcmb, ellmax=None):
     return ell[2:], D_ell
 
 
-@partial(jax.jit, static_argnames=['ellmax', 'nmodes', 'kmin', 'kmax', 'n_k_dense'])
+@partial(jax.jit, static_argnames=['ellmax', 'nmodes', 'kmin', 'kmax', 'n_k_dense', 'n_fftlog'])
 def compute_Cell_spectrum_from_cosmo_params(
     param_dict,
     ellmax=2500,
     nmodes=512,
     kmin=1e-4,
     kmax=1.0,
-    n_k_dense=8192
+    n_k_dense=8192,
+    n_fftlog=16384
 ):
     """Compute CMB C_ell spectrum using DISCO-EB.
 
@@ -946,6 +947,9 @@ def compute_Cell_spectrum_from_cosmo_params(
         Number of k-modes for the dense grid used in the line-of-sight
         integration.  Set to 0 to skip interpolation and use the raw
         perturbation grid.  Default: 8192
+    n_fftlog : int, optional
+        Number of FFTLog basis functions used in the line-of-sight
+        integration.  Must be a power of two.  Default: 16384
 
     Returns
     -------
@@ -1035,6 +1039,7 @@ def compute_Cell_spectrum_from_cosmo_params(
         S=S,
         tau0=tau0,
         n_k_dense=n_k_dense,
+        n_fftlog=n_fftlog,
     )
 
     # 12. Compute C_ell

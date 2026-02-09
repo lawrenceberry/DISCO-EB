@@ -911,7 +911,7 @@ def test_detailed_timing_analysis():
         rtol=1e-4,
         atol=1e-4,
         return_full=True,
-        dologk=True,
+        k_sampling_method="camb",
     )
     total_time += t
 
@@ -1053,7 +1053,8 @@ def test_detailed_timing_analysis():
         kmodes=kmodes,
         tau=tau,
         S=S,
-        tau0=tau0
+        tau0=tau0,
+        n_k_dense=8192,
     )
     total_time += t
 
@@ -1393,8 +1394,8 @@ def test_cmb_vs_camb(cosmology_name, camb_benchmarks, num_regression, benchmark)
     print(f"  RMSE: {metrics['rmse']:.2f} μK²")
 
     # Standard accuracy assertion (should pass for all cosmologies)
-    assert metrics['mean_relative_error'] < 0.25, \
-        f"Mean relative error {metrics['mean_relative_error']:.4f} exceeds 25% threshold"
+    assert metrics['mean_relative_error'] < 0.01, \
+        f"Mean relative error {metrics['mean_relative_error']:.4f} exceeds 1% threshold"
 
     # Use pytest-regression to automatically compare against baseline
     # This will create a baseline on first run and check regression on subsequent runs
