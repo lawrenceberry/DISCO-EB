@@ -878,6 +878,7 @@ def test_detailed_timing_analysis():
         return result, elapsed
 
     total_time = 0.0
+    timings = []  # Store (name, time) tuples for percentage calculation
 
     # 1. Background evolution
     print("\n[1/15] BACKGROUND EVOLUTION")
@@ -891,6 +892,7 @@ def test_detailed_timing_analysis():
         num_thermo=1024
     )
     total_time += t
+    timings.append(("evolve_background", t))
 
     # 2. Perturbation evolution
     print("\n[2/15] PERTURBATION EVOLUTION")
@@ -914,6 +916,7 @@ def test_detailed_timing_analysis():
         k_sampling_method="camb",
     )
     total_time += t
+    timings.append(("evolve_perturbations_batched", t))
 
     # 3. Time derivatives
     print("\n[3/15] TIME DERIVATIVES")
@@ -925,6 +928,7 @@ def test_detailed_timing_analysis():
         yout, tau, kmodes, param
     )
     total_time += t
+    timings.append(("compute_time_derivatives", t))
 
     # Extract parameters
     lmaxg = param['lmaxg']
@@ -941,6 +945,7 @@ def test_detailed_timing_analysis():
         yout, yprime, lmaxg, lmaxgp, lmaxr
     )
     total_time += t
+    timings.append(("extract_perturbations", t))
 
     # 5. Compute background quantities
     print("\n[5/15] BACKGROUND QUANTITIES")
@@ -951,6 +956,7 @@ def test_detailed_timing_analysis():
         aexp_out, param
     )
     total_time += t
+    timings.append(("compute_background_quantities", t))
 
     # 6. Visibility functions
     print("\n[6/15] VISIBILITY FUNCTIONS")
@@ -962,6 +968,7 @@ def test_detailed_timing_analysis():
         tau, param
     )
     total_time += t
+    timings.append(("compute_visibility_functions", t))
 
     # 7. Neutrino perturbations
     print("\n[7/15] NEUTRINO PERTURBATIONS")
@@ -972,6 +979,7 @@ def test_detailed_timing_analysis():
         yout, yprime, aexp_out, param, nqmax, perturbations['iq0'] # type: ignore
     )
     total_time += t
+    timings.append(("compute_neutrino_perturbations", t))
 
     # 8. Metric perturbations
     print("\n[8/15] METRIC PERTURBATIONS")
@@ -982,6 +990,7 @@ def test_detailed_timing_analysis():
         perturbations, neutrinos, background_quantities, param, kmodes, aexp_out
     )
     total_time += t
+    timings.append(("compute_metric_perturbations", t))
 
     # 9. Polarization terms
     print("\n[9/15] POLARIZATION TERMS")
@@ -992,6 +1001,7 @@ def test_detailed_timing_analysis():
         perturbations, metric, visibility_functions, yout, yprime, kmodes, lmaxg, lmaxgp
     )
     total_time += t
+    timings.append(("compute_polarization_terms", t))
 
     # 10-13. Individual source terms
     print("\n[10/15] SOURCE TERM: ISW")
@@ -1002,6 +1012,7 @@ def test_detailed_timing_analysis():
         metric, visibility_functions, perturbations, tau
     )
     total_time += t
+    timings.append(("compute_source_term_isw", t))
 
     print("\n[11/15] SOURCE TERM: SACHS-WOLFE")
     print("-" * 80)
@@ -1011,6 +1022,7 @@ def test_detailed_timing_analysis():
         perturbations, metric, visibility_functions, polarization_terms, kmodes
     )
     total_time += t
+    timings.append(("compute_source_term_sachs_wolfe", t))
 
     print("\n[12/15] SOURCE TERM: DOPPLER")
     print("-" * 80)
@@ -1020,6 +1032,7 @@ def test_detailed_timing_analysis():
         perturbations, metric, visibility_functions, polarization_terms, kmodes
     )
     total_time += t
+    timings.append(("compute_source_term_doppler", t))
 
     print("\n[13/15] SOURCE TERM: POLARIZATION")
     print("-" * 80)
@@ -1029,6 +1042,7 @@ def test_detailed_timing_analysis():
         visibility_functions, polarization_terms, kmodes
     )
     total_time += t
+    timings.append(("compute_source_term_polarization", t))
 
     # 14. Full source function (combines all source terms)
     print("\n[14/15] FULL SOURCE FUNCTION")
@@ -1039,6 +1053,7 @@ def test_detailed_timing_analysis():
         perturbations, metric, visibility_functions, yout, yprime, kmodes, lmaxg, lmaxgp, tau
     )
     total_time += t
+    timings.append(("compute_source_function", t))
     S = source_results['S'] # type: ignore
 
     # 15. Line-of-sight integration
@@ -1057,6 +1072,7 @@ def test_detailed_timing_analysis():
         n_k_dense=8192,
     )
     total_time += t
+    timings.append(("compute_theta_ell", t))
 
     # Angular power spectrum
     print("\n" + "-" * 80)
@@ -1066,6 +1082,7 @@ def test_detailed_timing_analysis():
         theta_ell, kmodes, param['n_s'], param['k_p']
     )
     total_time += t
+    timings.append(("compute_Cell", t))
 
     # Temperature power spectrum
     (ell, Dell), t = time_step(
@@ -1074,12 +1091,37 @@ def test_detailed_timing_analysis():
         Cell, param['A_s'], param['Tcmb'], ellmax=2500
     )
     total_time += t
+    timings.append(("compute_Dell", t))
+
+    # Get GPU information
+    try:
+        gpu_devices = jax.devices('gpu')
+        gpu_name = gpu_devices[0].device_kind if gpu_devices else "No GPU detected"
+    except:
+        gpu_name = "Unknown GPU"
 
     # Summary
     print("\n" + "="*80)
     print("PIPELINE TIMING SUMMARY")
     print("="*80)
+    print(f"Hardware: {gpu_name}")
     print(f"Total pipeline time: {total_time:10.2f} ms ({total_time/1000:.2f} s)")
+    print("="*80)
+
+    # Detailed breakdown table
+    print("\nDetailed Breakdown:")
+    print("-" * 80)
+    print(f"{'Function':<50s} {'Time (ms)':>12s} {'%':>8s} {'Cumulative %':>13s}")
+    print("-" * 80)
+
+    cumulative_pct = 0.0
+    for func_name, func_time in timings:
+        pct = (func_time / total_time) * 100
+        cumulative_pct += pct
+        print(f"{func_name:<50s} {func_time:12.2f} {pct:7.1f}% {cumulative_pct:12.1f}%")
+
+    print("-" * 80)
+    print(f"{'TOTAL':<50s} {total_time:12.2f} {'100.0%':>8s}")
     print("="*80 + "\n")
 
     # Verify output
