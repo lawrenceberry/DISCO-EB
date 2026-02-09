@@ -809,7 +809,7 @@ def calculate_ics(tau_start_batched, kmode_batches, param, nvar, lmaxg, lmaxgp, 
 
     return calc_ics_all_batches(jnp.array(tau_start_batched), jnp.array(kmode_batches))
 
-# @partial(jax.jit, static_argnames=('lmaxg', 'lmaxgp', 'lmaxr', 'lmaxnu', 'nqmax','max_steps'))
+# @partial(jax.jit, static_argnames=('lmaxg', 'lmaxgp', 'lmaxr', 'lmaxnu', 'nqmax', 'max_steps', 'batch_size', 'return_full'))
 def evolve_modes_batched( *, tau_max, tau_out, param, kmodes, 
                         lmaxg : int, lmaxgp : int, lmaxr : int, lmaxnu : int,
                         nqmax : int, rtol: float, atol: float,
@@ -1017,6 +1017,7 @@ def evolve_perturbations( *, param, aexp_out, kmin : float, kmax : float, num_k 
     return y1, kmodes, param
 
 
+@partial(jax.jit, static_argnames=('kmin', 'kmax', 'num_k', 'lmaxg', 'lmaxgp', 'lmaxr', 'lmaxnu', 'nqmax', 'max_steps', 'batch_size', 'return_full', 'k_sampling_method'))
 def evolve_perturbations_batched( *, param, aexp_out, kmin : float, kmax : float, num_k : int,
                          lmaxg : int = 11, lmaxgp : int = 11, lmaxr : int = 11, lmaxnu : int = 8,
                          nqmax : int = 3, rtol: float = 1e-4, atol: float = 1e-4,
@@ -1116,8 +1117,8 @@ def evolve_perturbations_batched( *, param, aexp_out, kmin : float, kmax : float
     
     return y1, kmodes, param
 
-
-def compute_time_derivatives(yout, tau, kmodes, param):
+@partial(jax.jit, static_argnames=('lmaxg', 'lmaxgp', 'lmaxr', 'lmaxnu', 'nqmax'))
+def compute_time_derivatives(yout, tau, kmodes, param, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax):
     """Compute time derivatives by re-evaluating the ODE system.
 
     This function computes dy/dτ by re-evaluating the synchronous gauge
@@ -1133,12 +1134,17 @@ def compute_time_derivatives(yout, tau, kmodes, param):
     kmodes : jnp.ndarray
         Wavenumber array with shape (n_kmodes,)
     param : dict
-        Parameter dictionary containing:
-        - lmaxg: Maximum photon temperature multipole
-        - lmaxgp: Maximum photon polarization multipole
-        - lmaxr: Maximum massless neutrino multipole
-        - lmaxnu: Maximum massive neutrino multipole
-        - nqmax: Number of neutrino momentum bins
+        Parameter dictionary (excluding static integer parameters)
+    lmaxg : int
+        Maximum photon temperature multipole (static)
+    lmaxgp : int
+        Maximum photon polarization multipole (static)
+    lmaxr : int
+        Maximum massless neutrino multipole (static)
+    lmaxnu : int
+        Maximum massive neutrino multipole (static)
+    nqmax : int
+        Number of neutrino momentum bins (static)
 
     Returns
     -------
@@ -1149,14 +1155,13 @@ def compute_time_derivatives(yout, tau, kmodes, param):
     --------
     >>> yout, kmodes, param = evolve_perturbations_batched(...)
     >>> tau = param['tau_out']
-    >>> yprime = compute_time_derivatives(yout, tau, kmodes, param)
+    >>> lmaxg = param['lmaxg']
+    >>> lmaxgp = param['lmaxgp']
+    >>> lmaxr = param['lmaxr']
+    >>> lmaxnu = param['lmaxnu']
+    >>> nqmax = param['nqmax']
+    >>> yprime = compute_time_derivatives(yout, tau, kmodes, param, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax)
     """
-    # Extract parameters
-    lmaxg = param['lmaxg']
-    lmaxgp = param['lmaxgp']
-    lmaxr = param['lmaxr']
-    lmaxnu = param['lmaxnu']
-    nqmax = param['nqmax']
 
     # Create indices for vectorization
     idxtau = jnp.arange(len(tau))

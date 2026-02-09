@@ -1,3 +1,4 @@
+from functools import partial
 import jax
 import jax.numpy as jnp
 import diffrax as drx
@@ -187,7 +188,7 @@ def setup_background_evolution( *, amin, amax, param ):
 
     return param
 
-
+@partial(jax.jit, static_argnames=('thermo_module', 'num_thermo', 'rtol', 'atol', 'order', 'class_thermo'))
 def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 256, rtol: float = 1e-5, atol: float = 1e-7, order: int = 5, class_thermo = None ):
     """Evolve the cosmological background and thermal history
 
@@ -344,6 +345,7 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
     return param
 
 
+@jax.jit
 def compute_background_quantities(aexp, param):
     """Compute background density and equation of state at given scale factors.
 

@@ -14,6 +14,7 @@ from .spline_interpolation import spline_interpolation
 from .util import lngamma_complex_e
 
 
+@jax.jit
 def extract_perturbations(yout, youtprime, lmaxg, lmaxgp, lmaxr):
     """Extract perturbation variables from the state vector.
 
@@ -87,6 +88,7 @@ def extract_perturbations(yout, youtprime, lmaxg, lmaxgp, lmaxr):
     return perturbations
 
 
+@jax.jit
 def compute_visibility_functions(tau, param):
     """Create splines and evaluate visibility functions at given conformal times.
 
@@ -165,7 +167,7 @@ def compute_visibility_functions(tau, param):
         'optical_depth': optical_depth,
     }
 
-
+@partial(jax.jit, static_argnames=('nqmax', 'iq0'))
 def compute_neutrino_perturbations(yout, yprime, aexp_out, param, nqmax, iq0):
     """Compute massive neutrino perturbations by integrating over momentum bins.
 
@@ -180,9 +182,9 @@ def compute_neutrino_perturbations(yout, yprime, aexp_out, param, nqmax, iq0):
     param : dict
         Cosmological parameters
     nqmax : int
-        Number of neutrino momentum bins
+        Number of neutrino momentum bins (static)
     iq0 : int
-        Starting index for neutrino perturbations
+        Starting index for neutrino perturbations (static)
 
     Returns
     -------
@@ -240,6 +242,7 @@ def compute_neutrino_perturbations(yout, yprime, aexp_out, param, nqmax, iq0):
     }
 
 
+@jax.jit
 def compute_metric_perturbations(perturbations, neutrinos, background_quantities,
                                  param, kmodes, aexp_out):
     """Compute metric perturbations from Einstein equations.
@@ -343,6 +346,7 @@ def compute_metric_perturbations(perturbations, neutrinos, background_quantities
     }
 
 
+@jax.jit
 def compute_polarization_terms(perturbations, metric, visibility_functions,
                                yout, yprime, kmodes, lmaxg, lmaxgp):
     """Compute polarization-related quantities for CMB source function.
@@ -393,6 +397,7 @@ def compute_polarization_terms(perturbations, metric, visibility_functions,
     }
 
 
+@jax.jit
 def compute_source_term_isw(metric, visibility_functions, perturbations, tau):
     """Compute the Integrated Sachs-Wolfe (ISW) source term.
 
@@ -447,6 +452,7 @@ def compute_source_term_isw(metric, visibility_functions, perturbations, tau):
     return S1
 
 
+@jax.jit
 def compute_source_term_sachs_wolfe(perturbations, metric, visibility_functions,
                                     polarization_terms, kmodes):
     """Compute the Sachs-Wolfe source term at last scattering.
@@ -489,6 +495,7 @@ def compute_source_term_sachs_wolfe(perturbations, metric, visibility_functions,
     return S2
 
 
+@jax.jit
 def compute_source_term_doppler(perturbations, metric, visibility_functions,
                                 polarization_terms, kmodes):
     """Compute the Doppler source term.
@@ -526,6 +533,7 @@ def compute_source_term_doppler(perturbations, metric, visibility_functions,
     return S3
 
 
+@jax.jit
 def compute_source_term_polarization(visibility_functions, polarization_terms, kmodes):
     """Compute the polarization coupling source term.
 
@@ -555,6 +563,7 @@ def compute_source_term_polarization(visibility_functions, polarization_terms, k
     return S4
 
 
+@jax.jit
 def compute_source_function(perturbations, metric, visibility_functions,
                             yout, yprime, kmodes, lmaxg, lmaxgp, tau):
     """Compute the CMB temperature anisotropy source function.
@@ -909,7 +918,7 @@ def compute_Dell(Cell, A_s, Tcmb, ellmax=None):
     return ell[2:], D_ell
 
 
-@partial(jax.jit, static_argnames=['ellmax', 'nmodes', 'kmin', 'kmax', 'n_k_dense', 'n_fftlog'])
+@partial(jax.jit, static_argnames=['ellmax', 'nmodes', 'kmin', 'kmax', 'n_k_dense', 'n_fftlog', 'lmaxg', 'lmaxgp', 'lmaxr', 'lmaxnu', 'nqmax'])
 def compute_Cell_spectrum_from_cosmo_params(
     param_dict,
     ellmax=2500,
@@ -917,7 +926,12 @@ def compute_Cell_spectrum_from_cosmo_params(
     kmin=1e-4,
     kmax=1.0,
     n_k_dense=8192,
-    n_fftlog=16384
+    n_fftlog=16384,
+    lmaxg=11,
+    lmaxgp=11,
+    lmaxr=11,
+    lmaxnu=8,
+    nqmax=3
 ):
     """Compute CMB C_ell spectrum using DISCO-EB.
 
@@ -950,6 +964,16 @@ def compute_Cell_spectrum_from_cosmo_params(
     n_fftlog : int, optional
         Number of FFTLog basis functions used in the line-of-sight
         integration.  Must be a power of two.  Default: 16384
+    lmaxg : int, optional
+        Maximum photon temperature multipole. Default: 11
+    lmaxgp : int, optional
+        Maximum photon polarization multipole. Default: 11
+    lmaxr : int, optional
+        Maximum massless neutrino multipole. Default: 11
+    lmaxnu : int, optional
+        Maximum massive neutrino multipole. Default: 8
+    nqmax : int, optional
+        Number of neutrino momentum bins. Default: 3
 
     Returns
     -------
@@ -988,35 +1012,39 @@ def compute_Cell_spectrum_from_cosmo_params(
         kmax=kmax,
         num_k=nmodes,
         aexp_out=aexp_out,
+        lmaxg=lmaxg,
+        lmaxgp=lmaxgp,
+        lmaxr=lmaxr,
+        lmaxnu=lmaxnu,
+        nqmax=nqmax,
         rtol=1e-4,
         atol=1e-4,
         return_full=True,
         k_sampling_method='camb',
     )
 
-    # 3. Time derivatives
+    # 3. Static parameters are passed as function arguments above
+
+    # 4. Time derivatives
     tau = param['tau_out']
-    yprime = compute_time_derivatives(yout, tau, kmodes, param)
+    yprime = compute_time_derivatives(yout, tau, kmodes, param, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax)
 
-    # 4. Extract parameters
-    lmaxg = param['lmaxg']
-    lmaxgp = param['lmaxgp']
-    lmaxr = param['lmaxr']
-    nqmax = param['nqmax']
+    # 5. Compute iq0 for neutrino indexing
+    iq0 = 10 + lmaxg + lmaxgp + lmaxr
 
-    # 5. Extract perturbations
+    # 6. Extract perturbations
     perturbations = extract_perturbations(yout, yprime, lmaxg, lmaxgp, lmaxr)
 
-    # 6. Compute background quantities
+    # 7. Compute background quantities
     background_quantities = compute_background_quantities(aexp_out, param)
 
-    # 7. Compute visibility functions
+    # 8. Compute visibility functions
     tau = param['tau_of_a_spline'].evaluate(aexp_out)
     visibility_functions = compute_visibility_functions(tau, param)
 
-    # 8. Compute neutrino perturbations
+    # 9. Compute neutrino perturbations
     neutrinos = compute_neutrino_perturbations(
-        yout, yprime, aexp_out, param, nqmax, perturbations['iq0']
+        yout, yprime, aexp_out, param, nqmax, iq0
     )
 
     # 9. Compute metric perturbations

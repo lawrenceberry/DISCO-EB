@@ -161,17 +161,22 @@ def cmb_test_data():
         rtol=1e-4,
         atol=1e-4,
         return_full=True,
-        dologk=True,
+        k_sampling_method="camb",
     )
 
-    # 3. Time derivatives
+    # 3. Extract parameters (convert to Python integers for static args)
+    lmaxg = int(param['lmaxg'])
+    lmaxgp = int(param['lmaxgp'])
+    lmaxr = int(param['lmaxr'])
+    lmaxnu = int(param['lmaxnu'])
+    nqmax = int(param['nqmax'])
+
+    # 4. Time derivatives
     print("  [3/3] Computing time derivatives...")
     tau = param['tau_out']
-    yprime = compute_time_derivatives(yout, tau, kmodes, param)
+    yprime = compute_time_derivatives(yout, tau, kmodes, param, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax)
 
-    # Extract parameters
-    lmaxg = param['lmaxg']
-    lmaxgp = param['lmaxgp']
+    # Extract additional parameters
     lmaxr = param['lmaxr']
     nqmax = param['nqmax']
 
@@ -181,7 +186,7 @@ def cmb_test_data():
     tau = param['tau_of_a_spline'].evaluate(aexp_out)
     visibility_functions = compute_visibility_functions(tau, param)
     neutrinos = compute_neutrino_perturbations(
-        yout, yprime, aexp_out, param, nqmax, perturbations['iq0']
+        yout, yprime, aexp_out, param, int(nqmax), int(perturbations['iq0'])
     )
     metric = compute_metric_perturbations(
         perturbations, neutrinos, background_quantities, param, kmodes, aexp_out
@@ -333,7 +338,7 @@ def test_benchmark_evolve_perturbations_batched(benchmark, num_regression):
         rtol=1e-4,
         atol=1e-4,
         return_full=True,
-        dologk=True,
+        k_sampling_method="camb",
     )
 
     # Benchmark with 64 k-modes
@@ -347,7 +352,7 @@ def test_benchmark_evolve_perturbations_batched(benchmark, num_regression):
         rtol=1e-4,
         atol=1e-4,
         return_full=True,
-        dologk=True,
+        k_sampling_method="camb",
     )
 
     # Verify output shape
@@ -372,8 +377,16 @@ def test_benchmark_compute_time_derivatives(benchmark, cmb_test_data, num_regres
     """
     data = cmb_test_data
 
+    # Extract static parameters (convert to Python integers)
+    param = data['param']
+    lmaxg = int(param['lmaxg'])
+    lmaxgp = int(param['lmaxgp'])
+    lmaxr = int(param['lmaxr'])
+    lmaxnu = int(param['lmaxnu'])
+    nqmax = int(param['nqmax'])
+
     # Warmup
-    compute_time_derivatives(data['yout'], data['tau'], data['kmodes'], data['param'])
+    compute_time_derivatives(data['yout'], data['tau'], data['kmodes'], param, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax)
 
     # Benchmark
     yprime = benchmark(
@@ -381,7 +394,12 @@ def test_benchmark_compute_time_derivatives(benchmark, cmb_test_data, num_regres
         data['yout'],
         data['tau'],
         data['kmodes'],
-        data['param']
+        param,
+        lmaxg,
+        lmaxgp,
+        lmaxr,
+        lmaxnu,
+        nqmax
     )
 
     # Verify output shape matches input
@@ -459,13 +477,16 @@ def test_benchmark_compute_neutrino_perturbations(benchmark, cmb_test_data, num_
     data = cmb_test_data
 
     # Warmup JIT compilation
+    nqmax = int(data['nqmax'])
+    iq0 = int(data['perturbations']['iq0'])
+
     compute_neutrino_perturbations(
         data['yout'],
         data['yprime'],
         data['aexp_out'],
         data['param'],
-        data['nqmax'],
-        data['perturbations']['iq0']
+        nqmax,
+        iq0
     )
 
     result = benchmark(
@@ -474,8 +495,8 @@ def test_benchmark_compute_neutrino_perturbations(benchmark, cmb_test_data, num_
         data['yprime'],
         data['aexp_out'],
         data['param'],
-        data['nqmax'],
-        data['perturbations']['iq0']
+        nqmax,
+        iq0
     )
 
     # Verify output
@@ -844,33 +865,38 @@ def test_detailed_timing_analysis():
     print("to identify bottlenecks in the complete pipeline.\n")
 
     def time_step(func, name, *args, **kwargs):
-        """Time a single step with warmup."""
-        # Warmup
-        result = func(*args, **kwargs)
-        if hasattr(result, 'block_until_ready'):
-            result.block_until_ready()
-        elif isinstance(result, (tuple, list)):
-            for r in result:
-                if hasattr(r, 'block_until_ready'):
-                    r.block_until_ready()
-        elif isinstance(result, dict):
-            for v in result.values():
-                if hasattr(v, 'block_until_ready'):
-                    v.block_until_ready()
+        """Time a single step with JIT compilation warmup.
 
-        # Timed run
+        JAX's JIT compilation is lazy - it only compiles on the first call with
+        concrete argument shapes/types. We explicitly wrap with jax.jit() and
+        call the function twice:
+        1. First call: triggers JIT compilation (not timed)
+        2. Second call: times the already-compiled code
+
+        Parameters
+        ----------
+        func : callable
+            Function to time
+        name : str
+            Display name for the function
+        *args : positional arguments
+            Arguments to pass to func
+        **kwargs : keyword arguments
+            Arguments to pass to func
+        """
+        # First call: JIT compilation + execution (not timed)
+        result = func(*args, **kwargs)
+
+        # Block until compilation and first execution complete
+        jax.block_until_ready(result)
+
+        # Second call: Timed execution of compiled code
         t0 = time.perf_counter()
         result = func(*args, **kwargs)
-        if hasattr(result, 'block_until_ready'):
-            result.block_until_ready()
-        elif isinstance(result, (tuple, list)):
-            for r in result:
-                if hasattr(r, 'block_until_ready'):
-                    r.block_until_ready()
-        elif isinstance(result, dict):
-            for v in result.values():
-                if hasattr(v, 'block_until_ready'):
-                    v.block_until_ready()
+
+        # Block until execution completes for accurate timing
+        jax.block_until_ready(result)
+
         t1 = time.perf_counter()
 
         elapsed = (t1 - t0) * 1000  # Convert to ms
@@ -918,6 +944,13 @@ def test_detailed_timing_analysis():
     total_time += t
     timings.append(("evolve_perturbations_batched", t))
 
+    # Extract parameters
+    lmaxg = int(param['lmaxg'])
+    lmaxgp = int(param['lmaxgp'])
+    lmaxr = int(param['lmaxr'])
+    lmaxnu = int(param['lmaxnu'])
+    nqmax = int(param['nqmax'])
+
     # 3. Time derivatives
     print("\n[3/15] TIME DERIVATIVES")
     print("-" * 80)
@@ -925,16 +958,11 @@ def test_detailed_timing_analysis():
     yprime, t = time_step(
         compute_time_derivatives,
         "compute_time_derivatives",
-        yout, tau, kmodes, param
+        yout, tau, kmodes, param,
+        lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax
     )
     total_time += t
     timings.append(("compute_time_derivatives", t))
-
-    # Extract parameters
-    lmaxg = param['lmaxg']
-    lmaxgp = param['lmaxgp']
-    lmaxr = param['lmaxr']
-    nqmax = param['nqmax']
 
     # 4. Extract perturbations
     print("\n[4/15] EXTRACT PERTURBATIONS")
@@ -976,7 +1004,7 @@ def test_detailed_timing_analysis():
     neutrinos, t = time_step(
         compute_neutrino_perturbations,
         "compute_neutrino_perturbations",
-        yout, yprime, aexp_out, param, nqmax, perturbations['iq0'] # type: ignore
+        yout, yprime, aexp_out, param, nqmax, int(perturbations['iq0']) # type: ignore
     )
     total_time += t
     timings.append(("compute_neutrino_perturbations", t))
