@@ -1555,6 +1555,11 @@ def _compute_single_class_spectrum(args):
     tuple
         (cosmology_name, ell_array, D_ell_TT_array, D_ell_EE_array, D_ell_TE_array, elapsed_s)
     """
+    import os
+
+    # Set the number of threads to 1 to disable parallelism
+    os.environ["OMP_NUM_THREADS"] = "1"
+
     from classy import Class
 
     cosmology_name, param_dict, ellmax = args
