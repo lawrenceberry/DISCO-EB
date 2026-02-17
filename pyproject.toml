@@ -6,13 +6,15 @@ build-backend = "setuptools.build_meta"
 name = "discoeb"
 version = "0.1.0"
 dependencies = [
-    "jax",
+    "jax[cuda12]",
     "diffrax",
     "equinox",
     "jaxtyping",
     "jax_cosmo",
-    "setuptools",
+    "setuptools<67",
     "lineax",
+    "tensorboard>=2.20.0",
+    "tensorboard-plugin-profile>=2.21.6",
 ]
 authors = [{ name = "Oliver Hahn", email = "oliver.hahn@univie.ac.at" }]
 
