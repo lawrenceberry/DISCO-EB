@@ -5,7 +5,7 @@ from jax.tree_util import register_pytree_node_class
 
 @register_pytree_node_class
 class spline_interpolation(object):
-    def __init__(self, xin: jnp.ndarray, yin: jnp.ndarray, integrate_from_start: bool = True):
+    def __init__(self, xin: jnp.ndarray, yin: jnp.ndarray, integrate_from_start: bool = True, uniform: bool = False):
         # def spline_interpolation(x: jnp.ndarray, y: jnp.ndarray, integrate_from_start: bool = True):
         """
         Constructs a natural cubic spline interpolator and an integrator from input data x and y.
@@ -111,21 +111,35 @@ class spline_interpolation(object):
         self._n_ = n
         self._x_, self._y_, self._integrate_from_start_ = x, y, integrate_from_start
         self._S_full_, self._I_total_, self._I_cum_ = S_full, I_total, I_cum
+        self._uniform_ = uniform
+        self._x0_ = x[0]
+        self._dx_inv_ = 1.0 / (x[1] - x[0])
 
     # Operations for flattening/unflattening representation
     def tree_flatten(self):
-        children = (self._x_, self._y_, self._integrate_from_start_, (self._S_full_, self._I_total_, self._I_cum_))
-        # The leaves (child nodes) are the JAX arrays that we want to be traced.
-        # Any auxiliary static data can be put in aux_data.
-        aux_data = {'n': self._n_}
+        children = (self._x_, self._y_, self._integrate_from_start_, (self._S_full_, self._I_total_, self._I_cum_), self._x0_, self._dx_inv_)
+        aux_data = {'n': self._n_, 'uniform': self._uniform_}
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         obj = cls.__new__(cls)  # Create instance without calling __init__
-        obj._x_, obj._y_, obj._integrate_from_start_, (obj._S_full_, obj._I_total_, obj._I_cum_) = children
+        obj._x_, obj._y_, obj._integrate_from_start_, (obj._S_full_, obj._I_total_, obj._I_cum_), obj._x0_, obj._dx_inv_ = children
         obj._n_ = aux_data['n']
+        obj._uniform_ = aux_data.get('uniform', False)
         return obj
+
+    def _find_index(self, x_new):
+        """Find the interval index for spline evaluation.
+
+        For uniform grids, uses O(1) direct index computation instead of searchsorted.
+        """
+        n = self._n_
+        if self._uniform_:
+            idx = jnp.clip(jnp.floor((x_new - self._x0_) * self._dx_inv_).astype(jnp.int32), 0, n - 2)
+        else:
+            idx = jnp.clip(jnp.searchsorted(self._x_, x_new) - 1, 0, n - 2)
+        return idx
 
     def evaluate(self, x_new: jnp.ndarray):
         """
@@ -138,9 +152,8 @@ class spline_interpolation(object):
             Interpolated y values.
         """
         n = self._x_.shape[0]
-        # x_new = jnp.atleast_1d(x_new)
         # Find the interval index i such that x[i] <= x_new < x[i+1]
-        idx = jnp.clip(jnp.searchsorted(self._x_, x_new) - 1, 0, n - 2)
+        idx = self._find_index(x_new)
         h_local = self._x_[idx + 1] - self._x_[idx]
         d_val = x_new - self._x_[idx]  # local offset
         t = d_val / h_local     # normalized coordinate
@@ -167,7 +180,7 @@ class spline_interpolation(object):
         n = self._x_.shape[0]
         x_new = jnp.atleast_1d(x_new)
         # Locate the interval index for each x_new.
-        idx = jnp.clip(jnp.searchsorted(self._x_, x_new) - 1, 0, n - 2)
+        idx = self._find_index(x_new)
         h_local = self._x_[idx + 1] - self._x_[idx]
         d_val = x_new - self._x_[idx]
         # Compute the local coefficients for the interval.
@@ -200,7 +213,7 @@ class spline_interpolation(object):
         """
         n = self._x_.shape[0]
         x_new = jnp.atleast_1d(x_new)
-        idx = jnp.clip(jnp.searchsorted(self._x_, x_new) - 1, 0, n - 2)
+        idx = self._find_index(x_new)
         h_local = self._x_[idx + 1] - self._x_[idx]
         d_val = x_new - self._x_[idx]
         # Local coefficients (as defined in the cubic polynomial):
@@ -210,20 +223,20 @@ class spline_interpolation(object):
         # Derivative of P_i(x) = b_i + 2*c_i*(x-x_i) + 3*d_i*(x-x_i)^2
         dydx = b_local + 2 * c_local * d_val + 3 * d_local * d_val**2
         return jnp.where(x_new.shape[0] == 1, dydx[0], dydx)
-    
+
     def derivative2(self, x_new: jnp.ndarray):
         """
         Computes the second derivative of the spline at new x positions.
-        
+
         Args:
             x_new: scalar or 1D array of new x values.
-            
+
         Returns:
             The derivative (d^2y/dx^2) evaluated at x_new.
         """
         n = self._x_.shape[0]
         x_new = jnp.atleast_1d(x_new)
-        idx = jnp.clip(jnp.searchsorted(self._x_, x_new) - 1, 0, n - 2)
+        idx = self._find_index(x_new)
         h_local = self._x_[idx + 1] - self._x_[idx]
         d_val = x_new - self._x_[idx]
         # Local coefficients (as defined in the cubic polynomial):
@@ -237,7 +250,7 @@ class spline_interpolation(object):
     def derivative12(self, x_new: jnp.ndarray):
         """
         Computes both the first and the second derivative of the spline at new x positions.
-        
+
         Args:
             x_new: scalar or 1D array of new x values.
             
@@ -246,7 +259,7 @@ class spline_interpolation(object):
         """
         n = self._x_.shape[0]
         x_new = jnp.atleast_1d(x_new)
-        idx = jnp.clip(jnp.searchsorted(self._x_, x_new) - 1, 0, n - 2)
+        idx = self._find_index(x_new)
         h_local = self._x_[idx + 1] - self._x_[idx]
         d_val = x_new - self._x_[idx]
         # Local coefficients (as defined in the cubic polynomial):

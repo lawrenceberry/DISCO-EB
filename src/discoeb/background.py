@@ -163,9 +163,9 @@ def setup_background_evolution( *, amin, amax, param ):
     # Compute the neutrino density and pressure
     rhonu_, pnu_, ppnu_ = jax.vmap( lambda a_ : nu_background( a_, param['amnu'] ), in_axes=0 )( a )
 
-    param['logrhonu_of_loga_spline']     = spline_interpolation( loga, jnp.log(rhonu_) )
-    param['logpnu_of_loga_spline']       = spline_interpolation( loga, jnp.log(pnu_) )
-    param['logppseudonu_of_loga_spline'] = spline_interpolation( loga, jnp.log(ppnu_) )
+    param['logrhonu_of_loga_spline']     = spline_interpolation( loga, jnp.log(rhonu_), uniform=True )
+    param['logpnu_of_loga_spline']       = spline_interpolation( loga, jnp.log(pnu_), uniform=True )
+    param['logppseudonu_of_loga_spline'] = spline_interpolation( loga, jnp.log(ppnu_), uniform=True )
 
     # compute the energy density today due to massive neutrinos
     rhonu = jnp.exp(param['logrhonu_of_loga_spline'].evaluate(0.0))
