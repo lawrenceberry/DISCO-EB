@@ -296,8 +296,9 @@ def solve_ionization( *, astart : float, aend : float, ystart : jnp.ndarray, rto
         # adjoint=drx.ImplicitAdjoint(),
         throw=False,
     )
-  dyda = ionization( aend, sol.ys[-1,:], (param,) )
-  return jnp.append(sol.ys[-1,:], dyda)
+  y_end = sol.ys[-1, :]
+  dyda = ionization( aend, y_end, (param,) )
+  return jnp.array([y_end[0], y_end[1], y_end[2], dyda[0], dyda[1], dyda[2]])
 
 def Saha_HeII( a, param ):
     """
