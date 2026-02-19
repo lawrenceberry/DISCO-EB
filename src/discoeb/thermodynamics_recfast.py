@@ -479,24 +479,14 @@ def evaluate_thermo( *, param : dict, num_thermo = 2048 ) -> jax.Array:
     dxedtau  = (dxeHIda + param['fHe'] * dxeHeIda + dxHeIIda) * dadtau(a=a, param=param)
 
     # compute conformal times tau for all entries in a
-    def step(cum_tau, a_pair):
-        a_low, a_high = a_pair
-        # Integrate dtauda_ between a_low and a_high using romb
-        dtau = romb(lambda a: dtauda_(a, param['grhom'], param['grhog'], param['grhor'],
-                        param['Omegam'], param['OmegaDE'],
-                        param['w_DE_0'], param['w_DE_a'],
-                        param['Omegak'], param['Neff'], param['Nmnu'],
-                        param['logrhonu_of_loga_spline']),
-            a_low, a_high)
-        new_tau = cum_tau + dtau
-        return new_tau, new_tau
-
-    # Stack adjacent pairs of aexp for integration over each interval
-    segments = jnp.stack([a[:-1], a[1:]], axis=1)
+    # vmap romb over all intervals in parallel instead of sequentially via scan
+    _dtauda = lambda a_: dtauda_(a_, param['grhom'], param['grhog'], param['grhor'],
+                    param['Omegam'], param['OmegaDE'],
+                    param['w_DE_0'], param['w_DE_a'],
+                    param['Omegak'], param['Neff'], param['Nmnu'],
+                    param['logrhonu_of_loga_spline'])
+    tau_increments = jax.vmap(lambda lo, hi: romb(_dtauda, lo, hi))(a[:-1], a[1:])
     tau0 = param['taumin']
-    # Use scan to perform the cumulative integration
-    tau_segments = jax.lax.scan(step, tau0, segments)[1]
-    # Prepend the initial tau (0.0) to obtain the tau array corresponding to aexp
-    tau = jnp.concatenate([jnp.array([tau0]), tau_segments], axis=0)
+    tau = tau0 + jnp.concatenate([jnp.array([0.0]), jnp.cumsum(tau_increments)])
 
     return param, tau, a, cs2, Tm, mu, xe, xeHI, xeHeI, xeHeII, dxedtau
