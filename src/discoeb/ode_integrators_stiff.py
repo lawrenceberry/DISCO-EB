@@ -64,6 +64,55 @@ def is_sde(terms: PyTree[AbstractTerm]) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Direct 3×3 LU solver (no BLAS, pure scalar arithmetic)
+#
+# For the RECFAST system (x_H, x_He, Tmat) the Jacobian matrix is 3×3.
+# Using jax.scipy.linalg.lu_factor / lu_solve for such tiny matrices launches
+# 7+ separate GPU kernels per factorisation and 3+ per solve, each with nearly
+# zero GPU occupancy.  Replacing them with explicit scalar operations lets XLA
+# fuse everything into a single kernel and dramatically cuts launch overhead.
+# ---------------------------------------------------------------------------
+
+def _lu_factor_3x3(A):
+    """LU factorisation of a 3×3 matrix without pivoting.
+
+    Returns a flat tuple of 9 scalar values encoding L (unit lower triangular)
+    and U (upper triangular) such that A = L @ U.
+    """
+    u00 = A[0, 0];  u01 = A[0, 1];  u02 = A[0, 2]
+
+    l10 = A[1, 0] / u00
+    u11 = A[1, 1] - l10 * u01
+    u12 = A[1, 2] - l10 * u02
+
+    l20 = A[2, 0] / u00
+    r21 = A[2, 1] - l20 * u01
+    r22 = A[2, 2] - l20 * u02
+
+    l21 = r21 / u11
+    u22 = r22 - l21 * u12
+
+    return (u00, u01, u02, l10, u11, u12, l20, l21, u22)
+
+
+def _lu_solve_3x3(lu_factors, b):
+    """Solve Ax = b given the LU factorisation from _lu_factor_3x3."""
+    u00, u01, u02, l10, u11, u12, l20, l21, u22 = lu_factors
+
+    # Forward substitution  L y = b  (L has unit diagonal)
+    y0 = b[0]
+    y1 = b[1] - l10 * y0
+    y2 = b[2] - l20 * y0 - l21 * y1
+
+    # Back substitution  U x = y
+    x2 = y2 / u22
+    x1 = (y1 - u12 * x2) / u11
+    x0 = (y0 - u01 * x1 - u02 * x2) / u00
+
+    return jnp.array([x0, x1, x2])
+
+
 from diffrax import LocalLinearInterpolation
 from diffrax import RESULTS
 from diffrax import AbstractTerm, ODETerm
@@ -182,32 +231,41 @@ class GRKT4(AbstractAdaptiveSolver):
         I = jnp.eye(n)
         A = jax.lax.stop_gradient(I - gamma * J.as_matrix())
 
-        LU_and_piv = jax.scipy.linalg.lu_factor(A, overwrite_a=True, check_finite=False)
+        # For small systems (n==3: the RECFAST x_H/x_He/Tmat system) use a direct
+        # hand-coded LU solver.  This avoids 7+ BLAS kernel launches per step that
+        # are essentially empty on GPU for a 3×3 matrix.  For larger systems fall
+        # back to jax.scipy.linalg.
+        if n == 3:
+            _lu3 = _lu_factor_3x3(A)
+            _solve = lambda b: _lu_solve_3x3(_lu3, b)
+        else:
+            LU_and_piv = jax.scipy.linalg.lu_factor(A, overwrite_a=True, check_finite=False)
+            _solve = lambda b: jax.scipy.linalg.lu_solve(LU_and_piv, b)
 
         # Stage 1
         b1 = terms.vf_prod(t0, y0, args, control)
-        k1 = jax.scipy.linalg.lu_solve(LU_and_piv, b1)
+        k1 = _solve(b1)
 
         # Stage 2
         t1, y1 = t0, (y0**ω + alpha21 * k1**ω).ω
         f1 = terms.vf_prod(t1, y1, args, control)
         Jk1 = J.mv(k1)
         b2 = (f1**ω + gamma21 * Jk1**ω).ω
-        k2 = jax.scipy.linalg.lu_solve(LU_and_piv, b2)
+        k2 = _solve(b2)
 
         # Stage 3
         t2, y2 = t0, (y0**ω + alpha31 * k1**ω + alpha32 * k2**ω).ω
         f2 = terms.vf_prod(t2, y2, args, control)
         Jk2 = J.mv(k2)
         b3 = (f2**ω + gamma31 * Jk1**ω + gamma32 * Jk2**ω).ω
-        k3 = jax.scipy.linalg.lu_solve(LU_and_piv, b3)
+        k3 = _solve(b3)
 
         # Stage 4
         # t3, y3 = t2, y2
         f3 = f2
         Jk3 = J.mv(k3)
         b4 = (f3**ω + gamma41 * Jk1**ω + gamma42 * Jk2**ω + gamma43 * Jk3**ω).ω
-        k4 = jax.scipy.linalg.lu_solve(LU_and_piv, b4)
+        k4 = _solve(b4)
 
         # Advance Solution
         y1 = (y0**ω + c1 * k1**ω + c2 * k2**ω + c3 * k3**ω + c4 * k4**ω).ω

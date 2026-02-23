@@ -15,6 +15,12 @@ dependencies = [
     "lineax",
     "xprof>=2.21.6",
     "tensorflow>=2.20.0",
+    "pytest>=8.4.2",
+    "pytest-benchmark>=5.2.3",
+    "pytest-regressions>=2.8.3",
+    "camb>=1.6.0",
+    "pandas>=2.3.3",
+    "matplotlib>=3.9.4",
 ]
 authors = [{ name = "Oliver Hahn", email = "oliver.hahn@univie.ac.at" }]
 
