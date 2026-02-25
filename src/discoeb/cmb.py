@@ -677,8 +677,8 @@ def _fftlog_bessel_integral_coefficients(ell, p):
     return jnp.exp(log_coeff)
 
 
-@partial(jax.jit, static_argnames=['ellmax', 'n_fftlog', 'n_k_dense'])
-def compute_theta_ell(ellmax, kmodes, tau, S, tau0, n_fftlog=16384, n_k_dense=0):
+@partial(jax.jit, static_argnames=['ellmax', 'n_fftlog', 'n_k_dense', 'k_batch_size'])
+def compute_theta_ell(ellmax, kmodes, tau, S, tau0, n_fftlog=16384, n_k_dense=0, k_batch_size=128):
     """Compute multipole moments Θ_ℓ(k) via FFTLog-based line-of-sight integration.
 
     Uses the FFTLog algorithm to efficiently compute the line-of-sight integral:
@@ -693,6 +693,13 @@ def compute_theta_ell(ellmax, kmodes, tau, S, tau0, n_fftlog=16384, n_k_dense=0)
     from the input k-grid onto a denser ``n_k_dense``-point log-k grid before
     the FFTLog step.  S is smooth in k while Θ_ℓ(k) is oscillatory, so this
     resolves the subsequent k-integral in ``compute_Cell`` cheaply.
+
+    The FFTLog computation is performed in batches of ``k_batch_size`` k-modes
+    using ``jax.lax.map``.  This keeps only one batch of intermediate arrays
+    (shape ``k_batch_size × n_fftlog``) in memory at a time, rather than the
+    full ``n_k × n_fftlog`` array, reducing peak GPU memory by roughly
+    ``n_k / k_batch_size``.  The Bessel coefficients ``M_ell_p`` (shape
+    ``(ellmax+1) × n_freqs``) are computed once and shared across all batches.
 
     Parameters
     ----------
@@ -711,6 +718,10 @@ def compute_theta_ell(ellmax, kmodes, tau, S, tau0, n_fftlog=16384, n_k_dense=0)
     n_k_dense : int, optional
         If > 0, cubic-spline-interpolate S onto this many log-spaced k-modes
         before integration.  Default: 0 (use the input k-grid as-is).
+    k_batch_size : int, optional
+        Number of k-modes to process per batch in the FFTLog loop.  Smaller
+        values reduce peak GPU memory at a modest cost in GPU utilisation.
+        Default: 512.
 
     Returns
     -------
@@ -759,20 +770,14 @@ def compute_theta_ell(ellmax, kmodes, tau, S, tau0, n_fftlog=16384, n_k_dense=0)
     dlog_chi = (log_chi_max_padded - log_chi_min_padded) / n_fftlog
     chi_fftlog = jnp.exp(log_chi_min_padded + jnp.arange(n_fftlog) * dlog_chi)
 
-    # Interpolate S to FFTLog grid for each k
-    def interp_S_to_fftlog(S_k):
-        # Use cubic spline interpolation in log-chi space for robustness
-        log_chi_orig = jnp.log(jnp.maximum(chi, 1e-10))
-        spline = spline_interpolation(log_chi_orig, S_k)
-        log_chi_fft = jnp.log(chi_fftlog)
-        return spline.evaluate(log_chi_fft)
-
-    S_fftlog = jax.vmap(interp_S_to_fftlog)(S_chi)
-    # S_fftlog has shape (n_kmodes, n_fftlog)
+    # Precompute quantities shared across all k-modes
+    log_chi_orig = jnp.log(jnp.maximum(chi, 1e-10))
+    log_chi_fft = jnp.log(chi_fftlog)
 
     # FFTLog decomposition parameters
-    # bias = -1.1 ensures Basis functions decay at large chi
+    # bias = -1.1 ensures basis functions decay at large chi
     bias = -1.1
+    chi_fftlog_biased = chi_fftlog ** (-bias)  # (n_fftlog,)
 
     # Compute FFT frequencies η_n = 2π n / (N × Δlog(χ))
     n_freqs = n_fftlog // 2 + 1  # For rfft
@@ -781,47 +786,74 @@ def compute_theta_ell(ellmax, kmodes, tau, S, tau0, n_fftlog=16384, n_k_dense=0)
     # Complex power-law indices: p_n = bias + i × η_n
     p_n = bias + 1j * eta_n
 
-    # Apply bias factor to the source function: f_m = S(χ_m) × χ_m^(-bias)
-    S_biased = S_fftlog * chi_fftlog[None, :] ** (-bias)
-
-    # Compute FFT coefficients c_n for each k
-    c_n_fft = jnp.fft.rfft(S_biased, axis=-1)
-
-    # Phase shift to account for start of interval
-    phase_shift = jnp.exp(-1j * eta_n * log_chi_min_padded)
-
-    # Normalize coefficients using standard discrete expansion
-    c_n = c_n_fft * phase_shift / n_fftlog
+    # Phase shift and normalisation combined into one (n_freqs,) vector
+    phase_shift_scaled = jnp.exp(-1j * eta_n * log_chi_min_padded) / n_fftlog
 
     # Precompute the analytical Bessel integral coefficients for all (ℓ, p_n)
+    # Shape (ellmax+1, n_freqs) — computed once, shared across all k-batches
     ells = jnp.arange(ellmax + 1, dtype=jnp.float64)
     M_ell_p = _fftlog_bessel_integral_coefficients(ells, p_n)
-    # M_ell_p has shape (ellmax+1, n_freqs)
 
-    # Compute Θ_ℓ(k) by summing over FFTLog coefficients
-    log_k = jnp.log(kmodes)[:, None]  # (n_kmodes, 1)
-    k_power = jnp.exp(-(p_n[None, :] + 1.0) * log_k)  # (n_kmodes, n_freqs)
+    # -----------------------------------------------------------------------
+    # Batch the FFTLog computation over k-modes using jax.lax.map.
+    # This keeps only k_batch_size × n_fftlog intermediate values in memory
+    # at any one time instead of the full n_k × n_fftlog array.
+    # -----------------------------------------------------------------------
+    n_k = S_chi.shape[0]
 
-    # Combine: ck[k, n] = c_n[k, n] * k_power[k, n]
-    ck = c_n * k_power
+    # Pad n_k to a multiple of k_batch_size (shapes must be static for XLA)
+    n_k_padded = ((n_k + k_batch_size - 1) // k_batch_size) * k_batch_size
+    n_pad = n_k_padded - n_k
 
-    # Standard rfft reconstruction sum
-    theta_ell_0 = jnp.einsum('k,l->kl', ck[:, 0].real, M_ell_p[:, 0].real)
-
-    if n_fftlog % 2 == 0:
-        ck_pos = ck[:, 1:-1]
-        M_pos = M_ell_p[:, 1:-1]
-        ck_nyq = ck[:, -1]
-        M_nyq = M_ell_p[:, -1]
-
-        theta_ell_pos = 2.0 * jnp.real(jnp.einsum('kn,ln->kl', ck_pos, M_pos))
-        theta_ell_nyq = jnp.real(jnp.einsum('k,l->kl', ck_nyq, M_nyq))
-        theta_ell = theta_ell_0 + theta_ell_pos + theta_ell_nyq
+    if n_pad > 0:
+        S_chi_pad = jnp.pad(S_chi, ((0, n_pad), (0, 0)))
+        kmodes_pad = jnp.pad(kmodes, (0, n_pad), mode='edge')
     else:
-        ck_pos = ck[:, 1:]
-        M_pos = M_ell_p[:, 1:]
-        theta_ell_pos = 2.0 * jnp.real(jnp.einsum('kn,ln->kl', ck_pos, M_pos))
-        theta_ell = theta_ell_0 + theta_ell_pos
+        S_chi_pad = S_chi
+        kmodes_pad = kmodes
+
+    n_batches = n_k_padded // k_batch_size
+    S_batched = S_chi_pad.reshape(n_batches, k_batch_size, -1)   # (n_batches, k_batch_size, n_times)
+    km_batched = kmodes_pad.reshape(n_batches, k_batch_size)      # (n_batches, k_batch_size)
+
+    def process_batch(inputs):
+        """Compute Θ_ℓ for a single batch of k_batch_size k-modes."""
+        S_b, km_b = inputs  # (k_batch_size, n_times), (k_batch_size,)
+
+        # Interpolate each k-mode's source to the FFTLog χ-grid
+        def interp_one(S_k):
+            return spline_interpolation(log_chi_orig, S_k).evaluate(log_chi_fft)
+
+        S_fftlog_b = jax.vmap(interp_one)(S_b)  # (k_batch_size, n_fftlog)
+
+        # Apply bias factor and compute FFT coefficients
+        S_biased_b = S_fftlog_b * chi_fftlog_biased[None, :]
+        c_n_b = jnp.fft.rfft(S_biased_b, axis=-1) * phase_shift_scaled[None, :]
+        # c_n_b: (k_batch_size, n_freqs)
+
+        # k-dependent power-law factor
+        log_km_b = jnp.log(km_b)[:, None]                              # (k_batch_size, 1)
+        k_power_b = jnp.exp(-(p_n[None, :] + 1.0) * log_km_b)         # (k_batch_size, n_freqs)
+        ck_b = c_n_b * k_power_b                                        # (k_batch_size, n_freqs)
+
+        # Reconstruct Θ_ℓ via inverse FFTLog sum
+        theta_b_0 = jnp.einsum('k,l->kl', ck_b[:, 0].real, M_ell_p[:, 0].real)
+
+        if n_fftlog % 2 == 0:
+            theta_b_pos = 2.0 * jnp.real(jnp.einsum('kn,ln->kl', ck_b[:, 1:-1], M_ell_p[:, 1:-1]))
+            theta_b_nyq = jnp.real(jnp.einsum('k,l->kl', ck_b[:, -1], M_ell_p[:, -1]))
+            return theta_b_0 + theta_b_pos + theta_b_nyq
+        else:
+            theta_b_pos = 2.0 * jnp.real(jnp.einsum('kn,ln->kl', ck_b[:, 1:], M_ell_p[:, 1:]))
+            return theta_b_0 + theta_b_pos
+
+    # Apply process_batch sequentially: only one batch's intermediates live in
+    # memory at a time, giving ~k_batch_size / n_k reduction in peak usage.
+    theta_ell_batched = jax.lax.map(process_batch, (S_batched, km_batched))
+    # theta_ell_batched: (n_batches, k_batch_size, ellmax+1)
+
+    # Flatten batches and strip padding rows
+    theta_ell = theta_ell_batched.reshape(n_k_padded, ellmax + 1)[:n_k, :]
 
     return theta_ell, kmodes
 
@@ -918,7 +950,7 @@ def compute_Dell(Cell, A_s, Tcmb, ellmax=None):
     return ell[2:], D_ell
 
 
-@partial(jax.jit, static_argnames=['ellmax', 'nmodes', 'kmin', 'kmax', 'n_k_dense', 'n_fftlog', 'lmaxg', 'lmaxgp', 'lmaxr', 'lmaxnu', 'nqmax'])
+@partial(jax.jit, static_argnames=['ellmax', 'nmodes', 'kmin', 'kmax', 'n_k_dense', 'n_fftlog', 'k_batch_size', 'lmaxg', 'lmaxgp', 'lmaxr', 'lmaxnu', 'nqmax'])
 def compute_Cell_spectrum_from_cosmo_params(
     param_dict,
     ellmax=2500,
@@ -927,6 +959,7 @@ def compute_Cell_spectrum_from_cosmo_params(
     kmax=1.0,
     n_k_dense=8192,
     n_fftlog=16384,
+    k_batch_size=128,
     lmaxg=11,
     lmaxgp=11,
     lmaxr=11,
@@ -964,6 +997,9 @@ def compute_Cell_spectrum_from_cosmo_params(
     n_fftlog : int, optional
         Number of FFTLog basis functions used in the line-of-sight
         integration.  Must be a power of two.  Default: 16384
+    k_batch_size : int, optional
+        Number of k-modes processed per batch in the FFTLog loop; controls
+        the peak GPU memory of ``compute_theta_ell``.  Default: 512.
     lmaxg : int, optional
         Maximum photon temperature multipole. Default: 11
     lmaxgp : int, optional
@@ -1068,6 +1104,7 @@ def compute_Cell_spectrum_from_cosmo_params(
         tau0=tau0,
         n_k_dense=n_k_dense,
         n_fftlog=n_fftlog,
+        k_batch_size=k_batch_size,
     )
 
     # 12. Compute C_ell

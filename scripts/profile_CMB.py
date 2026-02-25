@@ -39,8 +39,8 @@ compute_Cell_spectrum_from_cosmo_params(cosmo_params, ellmax=2500)
                                             
 print("STARTING COMPUTATION...")
 start = time.time()
-# with jax.profiler.trace("./profile_CMB_trace"):
-result = compute_Cell_spectrum_from_cosmo_params(cosmo_params, ellmax=2500)
+with jax.profiler.trace("./profile_CMB_trace"):
+    result = compute_Cell_spectrum_from_cosmo_params(cosmo_params, ellmax=2500)
 jax.block_until_ready(result)
 end = time.time()
 
