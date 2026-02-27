@@ -138,7 +138,8 @@ class spline_interpolation(object):
         if self._uniform_:
             idx = jnp.clip(jnp.floor((x_new - self._x0_) * self._dx_inv_).astype(jnp.int32), 0, n - 2)
         else:
-            idx = jnp.clip(jnp.searchsorted(self._x_, x_new) - 1, 0, n - 2)
+            #idx = jnp.clip(jnp.searchsorted(self._x_, x_new) - 1, 0, n - 2)
+            idx = jnp.clip(jnp.sum(self._x_ < x_new)-1, 0, n-2)
         return idx
 
     def evaluate(self, x_new: jnp.ndarray):
