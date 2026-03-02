@@ -922,7 +922,7 @@ def compute_Dell(Cell, A_s, Tcmb, ellmax=None):
 def compute_Cell_spectrum_from_cosmo_params(
     param_dict,
     ellmax=2500,
-    nmodes=512,
+    nmodes=128,
     kmin=1e-4,
     kmax=1.0,
     n_k_dense=8192,
