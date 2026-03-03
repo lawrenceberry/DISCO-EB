@@ -12,6 +12,7 @@ import jax.flatten_util as fu
 
 from .ode_integrators_stiff import Rodas5, Rodas5Transformed, Rodas5Batched
 from diffrax import Kvaerno5
+from .rsa import compute_fields_rsa, in_rsa_regime, apply_rsa_state_projection, get_rsa_settings
 
 # Import background functions
 from .background import get_aprimeoa, get_neutrino_momentum_bins
@@ -75,6 +76,7 @@ def nu_perturb_prime( *, a : float, amnu : float, aprimeoa : float, psi0: jax.Ar
 
     return rho_nu_prime, shear_nu_prime
 
+
 def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax ):     
     """Solve the synchronous gauge perturbation equations for a single mode.
 
@@ -104,6 +106,16 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     f : array_like
         RHS of perturbation equations
     """
+    def to_scalar(x):
+        return jnp.ravel(x)[0]
+    rsa_settings = get_rsa_settings(param)
+    use_rsa = rsa_settings['use_rsa']
+    tau_c_over_tau_trigger = rsa_settings['tau_c_over_tau_trigger']
+    tau_over_tau_k_trigger = rsa_settings['tau_over_tau_k_trigger']
+
+    y = jnp.ravel(y)
+    tau = to_scalar(tau)
+    kmode = to_scalar(kmode)
     Omegac = param['Omegam'] - param['Omegab']
 
     iq0 = 10 + lmaxg + lmaxgp + lmaxr
@@ -167,8 +179,8 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     # xe      = param['xe_of_tau_spline'].evaluate( tau )
 
     # Use pre-composed splines for direct log(a) lookup (performance optimization)
-    cs2     = param['cs2a_of_loga_spline'].evaluate( loga ) / a
-    xe      = param['xe_of_loga_spline'].evaluate( loga )
+    cs2     = to_scalar(param['cs2a_of_loga_spline'].evaluate( loga ) / a)
+    xe      = to_scalar(param['xe_of_loga_spline'].evaluate( loga ))
     
     # ... Photon mass density over baryon mass density
     photbar = param['grhog'] / (param['grhom'] * param['Omegab'] * a)
@@ -197,7 +209,8 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     # ) / a**2 + w_Q * param['grhom'] * param['OmegaDE'] * rho_Q * a**2
 
     # ... compute expansion rate
-    aprimeoa = get_aprimeoa( param=param, aexp=a )
+    aprimeoa = to_scalar(get_aprimeoa( param=param, aexp=a ))
+    xeprime = to_scalar(param['xe_of_loga_spline'].derivative( loga ) * aprimeoa)
     # aprimeoa = jnp.sqrt(grho / 3.0)                # Friedmann I
     # aprimeprimeoa = 0.5 * (aprimeoa**2 - gpres)    # Friedmann II
 
@@ -209,7 +222,18 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     akthom = 2.3038921003709498e-9 * (1.0 - param['YHe']) * param['Omegab'] * param['H0']**2
 
     # ... Thomson opacity
-    opac    = xe * akthom / a**2
+    opac    = to_scalar(xe * akthom / a**2)
+    tauc    = to_scalar(1. / jnp.maximum(opac, 1e-30))
+    taucprime = to_scalar(tauc * (2 * aprimeoa - xeprime / jnp.maximum(xe, 1e-30)))
+    do_relativistic_sa = use_rsa and (
+        to_scalar(in_rsa_regime(
+            tau=tau,
+            kmode=kmode,
+            tau_c=tauc,
+            tau_c_over_tau_trigger=tau_c_over_tau_trigger,
+            tau_over_tau_k_trigger=tau_over_tau_k_trigger,
+        )) > 0
+    )
     #tauc    = 1. / opac
     #taucprime = tauc * (2*aprimeoa - xeprime/xe)
     #F       = tauc / (1+pb43) #CLASS perturbations.c:10072
@@ -227,19 +251,45 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
         + (param['grhog'] * deltag + param['grhor'] * (param['Neff'] * deltar + param['Nmnu'] * drhonu)) / a**2
         + param['grhom'] * param['OmegaDE'] * deltaq * rho_Q * a**2
     )
+
+    # RSA metric estimate without relativistic species (BLT11-inspired closure)
+    dgrho_wo_rel = (
+        param['grhom'] * (Omegac * deltac + param['Omegab'] * deltab) / a
+        + param['grhor'] * param['Nmnu'] * drhonu / a**2
+        + param['grhom'] * param['OmegaDE'] * deltaq * rho_Q * a**2
+    )
+    hprime_rsa = to_scalar((2.0 * kmode**2 * eta + dgrho_wo_rel) / jnp.maximum(aprimeoa, 1e-30))
+    deltag_rsa, thetag_rsa, shearg_rsa, deltar_rsa, thetar_rsa, shearr_rsa = compute_fields_rsa(
+        kmode=kmode,
+        aprimeoa=aprimeoa,
+        hprime=hprime_rsa,
+        eta=eta,
+        deltab=deltab,
+        thetab=thetab,
+        cs2_b=cs2,
+        tau_c=tauc,
+        tau_c_prime=taucprime,
+    )
+
+    deltag_eff = jnp.where(do_relativistic_sa, deltag_rsa, deltag)
+    thetag_eff = jnp.where(do_relativistic_sa, thetag_rsa, thetag)
+    shearg_eff = jnp.where(do_relativistic_sa, shearg_rsa, shearg)
+    deltar_eff = jnp.where(do_relativistic_sa, deltar_rsa, deltar)
+    thetar_eff = jnp.where(do_relativistic_sa, thetar_rsa, thetar)
+    shearr_eff = jnp.where(do_relativistic_sa, shearr_rsa, shearr)
     dgpres = (
-        (param['grhog'] * deltag + param['grhor'] * param['Neff'] * deltar) / a**2 / 3.0 
+        (param['grhog'] * deltag_eff + param['grhor'] * param['Neff'] * deltar_eff) / a**2 / 3.0 
         + param['grhor'] * param['Nmnu'] * dpnu / a**2 
         + (cs2_Q * param['grhom'] * param['OmegaDE'] * deltaq * rho_Q * a**2 + (cs2_Q-ca2_Q)*(3*aprimeoa * rho_plus_p_theta_Q / kmode**2))
     )
     dgtheta = (
         param['grhom'] * (Omegac * thetac + param['Omegab'] * thetab) / a
-        + 4.0 / 3.0 * (param['grhog'] * thetag + param['Neff'] * param['grhor'] * thetar) / a**2
+        + 4.0 / 3.0 * (param['grhog'] * thetag_eff + param['Neff'] * param['grhor'] * thetar_eff) / a**2
         + param['Nmnu'] * param['grhor'] * kmode * fnu / a**2
         + rho_plus_p_theta_Q
     )
     dgshear = (
-        4.0 / 3.0 * (param['grhog'] * shearg + param['Neff'] * param['grhor'] * shearr) / a**2
+        4.0 / 3.0 * (param['grhog'] * shearg_eff + param['Neff'] * param['grhor'] * shearr_eff) / a**2
         + param['Nmnu'] * param['grhor'] * shearnu / a**2
     )
 
@@ -248,10 +298,11 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     f = f.at[1].set( dahprimedtau )
 
     # ... force energy conservation
-    hprime = (2.0 * kmode**2 * eta + dgrho) / aprimeoa
+    hprime_full = to_scalar((2.0 * kmode**2 * eta + dgrho) / aprimeoa)
+    hprime = to_scalar(jnp.where(do_relativistic_sa, hprime_rsa, hprime_full))
 
-    etaprime = 0.5 * dgtheta / kmode**2
-    alpha  = (hprime + 6.*etaprime)/2./kmode**2
+    etaprime = to_scalar(0.5 * dgtheta / kmode**2)
+    alpha  = to_scalar((hprime + 6.*etaprime)/2./kmode**2)
     f = f.at[2].set( etaprime )
     
     # alphaprime = -3*dgshear/(2*kmode**2) + eta - 2*aprimeoa*alpha
@@ -270,7 +321,7 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     f = f.at[idxb+0].set( deltabprime )
     # ... baryon velocity, BLT11 eq. (2.1b)
     thetabprime = -aprimeoa * thetab + kmode**2 * cs2 * deltab \
-                + pb43 * opac * (thetag - thetab)
+                + pb43 * opac * (thetag_eff - thetab)
     f = f.at[idxb+1].set( thetabprime )
 
     # --- photon equations of motion, MB95 eqs. (63) ---------------------------------------------
@@ -279,14 +330,14 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     # ... polarization term
     polter = y[idxg+2] + y[idxgp+0] + y[idxgp+2]
     # ... photon density, BLT11 eq. (2.4a)
-    deltagprime = 4.0 / 3.0 * (-thetag - 0.5 * hprime)
+    deltagprime = 4.0 / 3.0 * (-thetag_eff - 0.5 * hprime)
     f = f.at[idxg+0].set( deltagprime )
     # ... photon velocity, BLT11 eq. (2.4b)
-    thetagprime = kmode**2 * (0.25 * deltag - s2_squared * shearg) \
-                - opac * (thetag - thetab)
+    thetagprime = kmode**2 * (0.25 * deltag_eff - s2_squared * shearg_eff) \
+                - opac * (thetag_eff - thetab)
     f = f.at[idxg+1].set( thetagprime )
     # ... photon shear, BLT11 eq. (2.4c)
-    sheargprime = 8./15. * (thetag+kmode**2*alpha) -3/5*kmode*s_l3/s_l2*y[idxg+3] \
+    sheargprime = 8./15. * (thetag_eff+kmode**2*alpha) -3/5*kmode*s_l3/s_l2*y[idxg+3] \
                 - opac*(y[idxg+2]-0.1*s_l2*polter)
     f = f.at[idxg+2].set( sheargprime )
 
@@ -308,17 +359,29 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     
     # --- Massless neutrino equations of motion -------------------------------------------------------
     idxr = 9 + lmaxg + lmaxgp
-    deltarprime = 4.0 / 3.0 * (-thetar - 0.5 * hprime)
+    deltarprime = 4.0 / 3.0 * (-thetar_eff - 0.5 * hprime)
     f = f.at[idxr+0].set( deltarprime )
-    thetarprime = kmode**2 * (0.25 * deltar - shearr)
+    thetarprime = kmode**2 * (0.25 * deltar_eff - shearr_eff)
     f = f.at[idxr+1].set( thetarprime )
-    shearrprime = 8./15. * (thetar + kmode**2 * alpha) - 0.6 * kmode * y[idxr+3]
+    shearrprime = 8./15. * (thetar_eff + kmode**2 * alpha) - 0.6 * kmode * y[idxr+3]
     f = f.at[idxr+2].set( shearrprime )
     ell = jnp.arange(3, lmaxr)
     f = f.at[idxr+ell].set( kmode / (2 * ell + 1) * (ell * y[idxr+ell-1] - (ell + 1) * y[idxr+ell+1]) )
     
     # ... truncate moment expansion
     f = f.at[idxr+lmaxr].set( kmode * y[idxr+lmaxr-1] - (lmaxr + 1) / tau * y[idxr+lmaxr] )
+
+    # Freeze photon/massless-neutrino hierarchies in RSA regime
+    f = jax.lax.cond(
+        do_relativistic_sa,
+        lambda f_in: (
+            f_in.at[idxg:idxg + lmaxg + 1].set(0.0)
+                .at[idxgp:idxgp + lmaxgp + 1].set(0.0)
+                .at[idxr:idxr + lmaxr + 1].set(0.0)
+        ),
+        lambda f_in: f_in,
+        f,
+    )
 
     # --- Massive neutrino equations of motion --------------------------------------------------------
     q, _ = get_neutrino_momentum_bins( nqmax )
@@ -763,13 +826,27 @@ def evolve_one_mode( *, tau_max, tau_out, param, kmode,
     saveat = drx.SaveAt(ts=tau_out)
     sol = DEsolve_implicit( model=modelX, t0=tau_start, t1=tau_max, y0=y0, saveat=saveat, kmode=kmode )
 
+    ys_projected = jax.vmap(
+        lambda _tau, _y: apply_rsa_state_projection(
+            y=_y,
+            tau=_tau,
+            kmode=kmode,
+            param=param,
+            lmaxg=lmaxg,
+            lmaxgp=lmaxgp,
+            lmaxr=lmaxr,
+            nqmax=nqmax,
+            nu_perturb_fn=nu_perturb,
+        )
+    )(tau_out, sol.ys)
+
     if not return_full:
         # convert outputs
         yout = jax.vmap( lambda y : convert_to_output_variables( y=y, param=param, kmode=kmode, 
-                                                    lmaxg=lmaxg, lmaxgp=lmaxgp, lmaxr=lmaxr, lmaxnu=lmaxnu, nqmax=nqmax) )( sol.ys )
+                                                    lmaxg=lmaxg, lmaxgp=lmaxgp, lmaxr=lmaxr, lmaxnu=lmaxnu, nqmax=nqmax) )( ys_projected )
     else:
         # return full solution output
-        yout = sol.ys
+        yout = ys_projected
 
     return yout
 
@@ -909,16 +986,32 @@ def evolve_modes_batched( *, tau_max, tau_out, param, kmodes,
     ys_transposed = jnp.transpose(ys, (0, 2, 1, 3))
     reordered_ys = jnp.reshape(ys_transposed, (n_total, n_steps, _nvar))
 
+    projected_ys = jax.vmap(
+        lambda _k, _ys: jax.vmap(
+            lambda _tau, _y: apply_rsa_state_projection(
+                y=_y,
+                tau=_tau,
+                kmode=_k,
+                param=param,
+                lmaxg=lmaxg,
+                lmaxgp=lmaxgp,
+                lmaxr=lmaxr,
+                nqmax=nqmax,
+                nu_perturb_fn=nu_perturb,
+            )
+        )(tau_out, _ys)
+    )(kmodes, reordered_ys)
+
     if not return_full:
         # convert outputs
         def calculate_final_ys( kmode, ys): 
             return jax.vmap( lambda y : convert_to_output_variables( y=y, param=param, kmode=kmode, 
                                                        lmaxg=lmaxg, lmaxgp=lmaxgp, lmaxr=lmaxr, lmaxnu=lmaxnu, nqmax=nqmax) )( ys )
         
-        return jax.vmap(calculate_final_ys, (0,0))(kmodes, reordered_ys)
+        return jax.vmap(calculate_final_ys, (0,0))(kmodes, projected_ys)
     else:
         # return full solution output
-        return reordered_ys
+        return projected_ys
 
 
 
@@ -933,6 +1026,10 @@ def evolve_perturbations( *, param, aexp_out, kmin : float, kmax : float, num_k 
     ----------
     param : dict
         dictionary of parameters and interpolated functions
+        Optional RSA controls:
+        - use_rsa (bool): enable/disable radiation streaming approximation (default: True)
+        - rsa_tau_c_over_tau_trigger (float): trigger threshold for tau_c/tau (default: 10.0)
+        - rsa_tau_over_tau_k_trigger (float): trigger threshold for tau/tau_k = k*tau (default: 80.0)
     aexp_out : jnp.ndarray
         array of scale factors at which to output
     kmin : float
@@ -1030,6 +1127,10 @@ def evolve_perturbations_batched( *, param, aexp_out, kmin : float, kmax : float
     ----------
     param : dict
         dictionary of parameters and interpolated functions
+        Optional RSA controls:
+        - use_rsa (bool): enable/disable radiation streaming approximation (default: True)
+        - rsa_tau_c_over_tau_trigger (float): trigger threshold for tau_c/tau (default: 10.0)
+        - rsa_tau_over_tau_k_trigger (float): trigger threshold for tau/tau_k = k*tau (default: 80.0)
     aexp_out : jnp.ndarray
         array of scale factors at which to output
     kmin : float
