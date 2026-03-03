@@ -6,13 +6,20 @@ from functools import partial
 from .background import get_aprimeoa
 
 
-def get_rsa_settings(param):
-    """Return RSA configuration with defaults from parameter dictionary."""
+def get_approximation_settings(param):
+    """Return approximation configuration with defaults from parameter dictionary."""
     return {
-        'use_rsa': bool(param.get('use_rsa', True)),
+        'use_rsa': param.get('use_rsa', True),
         'tau_c_over_tau_trigger': float(param.get('rsa_tau_c_over_tau_trigger', 10.0)),
         'tau_over_tau_k_trigger': float(param.get('rsa_tau_over_tau_k_trigger', 80.0)),
+        'use_ur_fluid': param.get('use_ur_fluid', True),
+        'ur_fluid_tau_over_tau_k_trigger': float(param.get('ur_fluid_tau_over_tau_k_trigger', 120.0)),
     }
+
+
+def get_rsa_settings(param):
+    """Backward-compatible alias for approximation settings."""
+    return get_approximation_settings(param)
 
 
 @partial(jax.jit, inline=True)
@@ -46,19 +53,28 @@ def in_rsa_regime(*, tau, kmode, tau_c, tau_c_over_tau_trigger, tau_over_tau_k_t
     )
 
 
+@partial(jax.jit, inline=True)
+def in_ur_fluid_regime(*, tau, kmode, tau_over_tau_k_trigger):
+    """CLASS-inspired UFA trigger based on horizon entry (k*tau)."""
+    return tau * kmode > tau_over_tau_k_trigger
+
+
+@partial(jax.jit, inline=True)
+def compute_shearprime_ufa(*, tau, shearr, thetar, hprime):
+    """UFA closure for massless-neutrino shear evolution."""
+    return -3.0 / jnp.maximum(tau, 1e-30) * shearr + 4.0 / 15.0 * (thetar + 0.5 * hprime)
+
+
 def apply_rsa_state_projection(*, y, tau, kmode, param, lmaxg, lmaxgp, lmaxr, nqmax, nu_perturb_fn):
     """Replace relativistic hierarchy variables with RSA fields at a given output time."""
 
     def to_scalar(x):
         return jnp.ravel(x)[0]
 
-    rsa_settings = get_rsa_settings(param)
+    rsa_settings = get_approximation_settings(param)
     use_rsa = rsa_settings['use_rsa']
     tau_c_over_tau_trigger = rsa_settings['tau_c_over_tau_trigger']
     tau_over_tau_k_trigger = rsa_settings['tau_over_tau_k_trigger']
-
-    if not use_rsa:
-        return y
 
     y = jnp.ravel(y)
     tau = to_scalar(tau)
@@ -125,14 +141,19 @@ def apply_rsa_state_projection(*, y, tau, kmode, param, lmaxg, lmaxgp, lmaxr, nq
     y_rsa = y_rsa.at[idxr + 2].set(2.0 * shearr)
     y_rsa = y_rsa.at[idxr + 3:idxr + lmaxr + 1].set(0.0)
 
-    return jax.lax.cond(
-        to_scalar(in_rsa_regime(
+    do_rsa = jnp.logical_and(
+        jnp.asarray(use_rsa),
+        in_rsa_regime(
             tau=tau,
             kmode=kmode,
             tau_c=tau_c,
             tau_c_over_tau_trigger=tau_c_over_tau_trigger,
             tau_over_tau_k_trigger=tau_over_tau_k_trigger,
-        )) > 0,
+        ),
+    )
+
+    return jax.lax.cond(
+        do_rsa,
         lambda _: y_rsa,
         lambda _: y,
         operand=None,

@@ -12,7 +12,14 @@ import jax.flatten_util as fu
 
 from .ode_integrators_stiff import Rodas5, Rodas5Transformed, Rodas5Batched
 from diffrax import Kvaerno5
-from .rsa import compute_fields_rsa, in_rsa_regime, apply_rsa_state_projection, get_rsa_settings
+from .approximations import (
+    compute_fields_rsa,
+    in_rsa_regime,
+    in_ur_fluid_regime,
+    compute_shearprime_ufa,
+    apply_rsa_state_projection,
+    get_approximation_settings,
+)
 
 # Import background functions
 from .background import get_aprimeoa, get_neutrino_momentum_bins
@@ -108,10 +115,12 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     """
     def to_scalar(x):
         return jnp.ravel(x)[0]
-    rsa_settings = get_rsa_settings(param)
+    rsa_settings = get_approximation_settings(param)
     use_rsa = rsa_settings['use_rsa']
     tau_c_over_tau_trigger = rsa_settings['tau_c_over_tau_trigger']
     tau_over_tau_k_trigger = rsa_settings['tau_over_tau_k_trigger']
+    use_ur_fluid = rsa_settings['use_ur_fluid']
+    ur_fluid_tau_over_tau_k_trigger = rsa_settings['ur_fluid_tau_over_tau_k_trigger']
 
     y = jnp.ravel(y)
     tau = to_scalar(tau)
@@ -225,14 +234,26 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     opac    = to_scalar(xe * akthom / a**2)
     tauc    = to_scalar(1. / jnp.maximum(opac, 1e-30))
     taucprime = to_scalar(tauc * (2 * aprimeoa - xeprime / jnp.maximum(xe, 1e-30)))
-    do_relativistic_sa = use_rsa and (
-        to_scalar(in_rsa_regime(
+    do_relativistic_sa = jnp.logical_and(
+        jnp.asarray(use_rsa),
+        in_rsa_regime(
             tau=tau,
             kmode=kmode,
             tau_c=tauc,
             tau_c_over_tau_trigger=tau_c_over_tau_trigger,
             tau_over_tau_k_trigger=tau_over_tau_k_trigger,
-        )) > 0
+        ),
+    )
+    do_ur_fluid = jnp.logical_and(
+        jnp.logical_not(do_relativistic_sa),
+        jnp.logical_and(
+            jnp.asarray(use_ur_fluid),
+            in_ur_fluid_regime(
+                tau=tau,
+                kmode=kmode,
+                tau_over_tau_k_trigger=ur_fluid_tau_over_tau_k_trigger,
+            ),
+        ),
     )
     #tauc    = 1. / opac
     #taucprime = tauc * (2*aprimeoa - xeprime/xe)
@@ -327,59 +348,77 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     # --- photon equations of motion, MB95 eqs. (63) ---------------------------------------------
     idxg  = 7
     idxgp = 7 + (lmaxg+1)
-    # ... polarization term
-    polter = y[idxg+2] + y[idxgp+0] + y[idxgp+2]
-    # ... photon density, BLT11 eq. (2.4a)
-    deltagprime = 4.0 / 3.0 * (-thetag_eff - 0.5 * hprime)
-    f = f.at[idxg+0].set( deltagprime )
-    # ... photon velocity, BLT11 eq. (2.4b)
-    thetagprime = kmode**2 * (0.25 * deltag_eff - s2_squared * shearg_eff) \
-                - opac * (thetag_eff - thetab)
-    f = f.at[idxg+1].set( thetagprime )
-    # ... photon shear, BLT11 eq. (2.4c)
-    sheargprime = 8./15. * (thetag_eff+kmode**2*alpha) -3/5*kmode*s_l3/s_l2*y[idxg+3] \
-                - opac*(y[idxg+2]-0.1*s_l2*polter)
-    f = f.at[idxg+2].set( sheargprime )
 
-    #... photon temperature l>=3, BLT11 eq. (2.4d)
-    ell  = jnp.arange(3, lmaxg )
-    f = f.at[idxg+ell].set( kmode  / (2 * ell + 1) * (ell * y[idxg+ell-1] - (ell + 1) * y[idxg+ell+1]) - opac * y[idxg+ell] )
-    # photon temperature hierarchy truncation, BLT11 eq. (2.5)
-    f = f.at[idxg+lmaxg].set( kmode * y[idxg+lmaxg-1] - (lmaxg + 1) / tau * y[idxg+lmaxg] - opac * y[idxg+lmaxg] )
+    def _photon_hierarchy(f_in):
+        # ... polarization term
+        polter = y[idxg+2] + y[idxgp+0] + y[idxgp+2]
+        # ... photon density, BLT11 eq. (2.4a)
+        deltagprime = 4.0 / 3.0 * (-thetag_eff - 0.5 * hprime)
+        f_in = f_in.at[idxg+0].set( deltagprime )
+        # ... photon velocity, BLT11 eq. (2.4b)
+        thetagprime = kmode**2 * (0.25 * deltag_eff - s2_squared * shearg_eff) \
+                    - opac * (thetag_eff - thetab)
+        f_in = f_in.at[idxg+1].set( thetagprime )
+        # ... photon shear, BLT11 eq. (2.4c)
+        sheargprime = 8./15. * (thetag_eff+kmode**2*alpha) -3/5*kmode*s_l3/s_l2*y[idxg+3] \
+                    - opac*(y[idxg+2]-0.1*s_l2*polter)
+        f_in = f_in.at[idxg+2].set( sheargprime )
 
-    #... polarization equations, BLT11 eq. (2.4e)
-    ell  = jnp.arange(0, lmaxgp) # l=0...lmaxgp-1
-    f = f.at[idxgp+ell].set( kmode  / (2 * ell + 1) * (ell * y[idxgp+ell-1] - (ell + 1) * y[idxgp+ell+1]) - opac * y[idxgp+ell] )
-    f = f.at[idxgp+0].add( opac * polter / 2 )  # photon polarization l=0
-    f = f.at[idxgp+2].add( opac * polter / 10 ) # photon polarization l=2
-    
-    # photon polarization hierarchy truncation
-    f = f.at[idxgp+lmaxgp].set( kmode * y[idxgp+lmaxgp-1] - (lmaxgp + 1) / tau * y[idxgp+lmaxgp] - opac * y[idxgp+lmaxgp] )
-    
-    
+        #... photon temperature l>=3, BLT11 eq. (2.4d)
+        ell  = jnp.arange(3, lmaxg )
+        f_in = f_in.at[idxg+ell].set( kmode  / (2 * ell + 1) * (ell * y[idxg+ell-1] - (ell + 1) * y[idxg+ell+1]) - opac * y[idxg+ell] )
+        # photon temperature hierarchy truncation, BLT11 eq. (2.5)
+        f_in = f_in.at[idxg+lmaxg].set( kmode * y[idxg+lmaxg-1] - (lmaxg + 1) / tau * y[idxg+lmaxg] - opac * y[idxg+lmaxg] )
+
+        #... polarization equations, BLT11 eq. (2.4e)
+        ell  = jnp.arange(0, lmaxgp) # l=0...lmaxgp-1
+        f_in = f_in.at[idxgp+ell].set( kmode  / (2 * ell + 1) * (ell * y[idxgp+ell-1] - (ell + 1) * y[idxgp+ell+1]) - opac * y[idxgp+ell] )
+        f_in = f_in.at[idxgp+0].add( opac * polter / 2 )  # photon polarization l=0
+        f_in = f_in.at[idxgp+2].add( opac * polter / 10 ) # photon polarization l=2
+
+        # photon polarization hierarchy truncation
+        f_in = f_in.at[idxgp+lmaxgp].set( kmode * y[idxgp+lmaxgp-1] - (lmaxgp + 1) / tau * y[idxgp+lmaxgp] - opac * y[idxgp+lmaxgp] )
+        return f_in
+
+    def _photon_rsa(f_in):
+        return f_in.at[idxg:idxg + lmaxg + 1].set(0.0).at[idxgp:idxgp + lmaxgp + 1].set(0.0)
+
+    f = jax.lax.cond(do_relativistic_sa, _photon_rsa, _photon_hierarchy, f)
+
     # --- Massless neutrino equations of motion -------------------------------------------------------
     idxr = 9 + lmaxg + lmaxgp
     deltarprime = 4.0 / 3.0 * (-thetar_eff - 0.5 * hprime)
     f = f.at[idxr+0].set( deltarprime )
     thetarprime = kmode**2 * (0.25 * deltar_eff - shearr_eff)
     f = f.at[idxr+1].set( thetarprime )
-    shearrprime = 8./15. * (thetar_eff + kmode**2 * alpha) - 0.6 * kmode * y[idxr+3]
-    f = f.at[idxr+2].set( shearrprime )
-    ell = jnp.arange(3, lmaxr)
-    f = f.at[idxr+ell].set( kmode / (2 * ell + 1) * (ell * y[idxr+ell-1] - (ell + 1) * y[idxr+ell+1]) )
-    
-    # ... truncate moment expansion
-    f = f.at[idxr+lmaxr].set( kmode * y[idxr+lmaxr-1] - (lmaxr + 1) / tau * y[idxr+lmaxr] )
 
-    # Freeze photon/massless-neutrino hierarchies in RSA regime
+    def _massless_nu_hierarchy(f_in):
+        shearrprime = 8./15. * (thetar_eff + kmode**2 * alpha) - 0.6 * kmode * y[idxr+3]
+        f_in = f_in.at[idxr+2].set( shearrprime )
+        ell = jnp.arange(3, lmaxr)
+        f_in = f_in.at[idxr+ell].set( kmode / (2 * ell + 1) * (ell * y[idxr+ell-1] - (ell + 1) * y[idxr+ell+1]) )
+
+        # ... truncate moment expansion
+        f_in = f_in.at[idxr+lmaxr].set( kmode * y[idxr+lmaxr-1] - (lmaxr + 1) / tau * y[idxr+lmaxr] )
+        return f_in
+
+    def _massless_nu_ufa(f_in):
+        shearrprime = compute_shearprime_ufa(
+            tau=tau,
+            shearr=shearr_eff,
+            thetar=thetar_eff,
+            hprime=hprime,
+        )
+        f_in = f_in.at[idxr+2].set( shearrprime )
+        return f_in.at[idxr+3:idxr + lmaxr + 1].set(0.0)
+
+    def _massless_nu_rsa(f_in):
+        return f_in.at[idxr:idxr + lmaxr + 1].set(0.0)
+
     f = jax.lax.cond(
         do_relativistic_sa,
-        lambda f_in: (
-            f_in.at[idxg:idxg + lmaxg + 1].set(0.0)
-                .at[idxgp:idxgp + lmaxgp + 1].set(0.0)
-                .at[idxr:idxr + lmaxr + 1].set(0.0)
-        ),
-        lambda f_in: f_in,
+        _massless_nu_rsa,
+        lambda f_in: jax.lax.cond(do_ur_fluid, _massless_nu_ufa, _massless_nu_hierarchy, f_in),
         f,
     )
 
@@ -886,6 +925,20 @@ def calculate_ics(tau_start_batched, kmode_batches, param, nvar, lmaxg, lmaxgp, 
 
     return calc_ics_all_batches(jnp.array(tau_start_batched), jnp.array(kmode_batches))
 
+
+def reduce_state_ur_fluid(*, y, lmaxg, lmaxgp, lmaxr):
+    """Remove massless-neutrino moments l>=3 from the state vector."""
+    idxr = 9 + lmaxg + lmaxgp
+    return jnp.concatenate((y[:idxr + 3], y[idxr + lmaxr + 1:]))
+
+
+def expand_state_ur_fluid(*, y_reduced, lmaxg, lmaxgp, lmaxr):
+    """Expand reduced UFA state back to full layout by padding zeroed moments."""
+    idxr = 9 + lmaxg + lmaxgp
+    n_removed = lmaxr - 2
+    zeros = jnp.zeros((n_removed,), dtype=y_reduced.dtype)
+    return jnp.concatenate((y_reduced[:idxr + 3], zeros, y_reduced[idxr + 3:]))
+
 # @partial(jax.jit, static_argnames=('lmaxg', 'lmaxgp', 'lmaxr', 'lmaxnu', 'nqmax', 'max_steps', 'batch_size', 'return_full'))
 def evolve_modes_batched( *, tau_max, tau_out, param, kmodes, 
                         lmaxg : int, lmaxgp : int, lmaxr : int, lmaxnu : int,
@@ -943,16 +996,14 @@ def evolve_modes_batched( *, tau_max, tau_out, param, kmodes,
     # ... set adiabatic ICs for each kmode an batch together
     y0_batches = calculate_ics(tau_start_batched, kmode_batches, param, nvar, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax)
 
-    # solve before neutrinos become fluid
-    saveat = drx.SaveAt(ts=tau_out)
-
     # create solver wrapper
     def DEsolve_implicit(t0, y0, kmodes_batch):
 
         # This function now only returns the solution.ys and nothing else, since the other info is not used
         # at the moment. Might save some memory after compilation?
 
-        filters = jax.vmap(lambda kmode: jnp.array([1,kmode**2,1,1,1/kmode**2,1]))(kmodes_batch)
+        filters_full = jax.vmap(lambda kmode: jnp.array([1,kmode**2,1,1,1/kmode**2,1]))(kmodes_batch)
+
         sol =  drx.diffeqsolve(
             terms=modelX_term,
             solver=Rodas5Batched(),
@@ -960,20 +1011,16 @@ def evolve_modes_batched( *, tau_max, tau_out, param, kmodes,
             t1=tau_max,
             dt0=jnp.minimum(t0/4, 0.5*(tau_max-t0)),
             y0=y0,
-            saveat=saveat,  
-            stepsize_controller = drx.PIDController(rtol=rtol, atol=atol, 
-                                                    norm=lambda t:rms_norm_filtered_batched(t, jnp.array([0,2,3,5,6,7]), filters),
+            saveat=drx.SaveAt(ts=tau_out),
+            stepsize_controller = drx.PIDController(rtol=rtol, atol=atol,
+                                                    norm=lambda t:rms_norm_filtered_batched(t, jnp.array([0,2,3,5,6,7]), filters_full),
                                                     pcoeff=pcoeff, icoeff=icoeff, dcoeff=dcoeff, factormax=factormax, factormin=factormin),
-            # default controller has icoeff=1, pcoeff=0, dcoeff=0
             max_steps=max_steps,
             args=(F, kmodes_batch),
-            # adjoint=drx.RecursiveCheckpointAdjoint(), # for backward differentiation
-            adjoint=drx.DirectAdjoint(),  #for forward differentiation
-            # adjoint=drx.BacksolveAdjoint(), # for backward differentiation
+            adjoint=drx.DirectAdjoint(),
         )
-        
+
         return sol.ys
-      
 
 
     DEsolve_implicit_vmap = jax.vmap(DEsolve_implicit, (0,0,0))
@@ -1030,6 +1077,8 @@ def evolve_perturbations( *, param, aexp_out, kmin : float, kmax : float, num_k 
         - use_rsa (bool): enable/disable radiation streaming approximation (default: True)
         - rsa_tau_c_over_tau_trigger (float): trigger threshold for tau_c/tau (default: 10.0)
         - rsa_tau_over_tau_k_trigger (float): trigger threshold for tau/tau_k = k*tau (default: 80.0)
+        - use_ur_fluid (bool): enable/disable ultra-relativistic fluid approximation (default: True)
+        - ur_fluid_tau_over_tau_k_trigger (float): trigger threshold for UFA k*tau (default: 120.0)
     aexp_out : jnp.ndarray
         array of scale factors at which to output
     kmin : float
@@ -1131,6 +1180,8 @@ def evolve_perturbations_batched( *, param, aexp_out, kmin : float, kmax : float
         - use_rsa (bool): enable/disable radiation streaming approximation (default: True)
         - rsa_tau_c_over_tau_trigger (float): trigger threshold for tau_c/tau (default: 10.0)
         - rsa_tau_over_tau_k_trigger (float): trigger threshold for tau/tau_k = k*tau (default: 80.0)
+        - use_ur_fluid (bool): enable/disable ultra-relativistic fluid approximation (default: True)
+        - ur_fluid_tau_over_tau_k_trigger (float): trigger threshold for UFA k*tau (default: 120.0)
     aexp_out : jnp.ndarray
         array of scale factors at which to output
     kmin : float
