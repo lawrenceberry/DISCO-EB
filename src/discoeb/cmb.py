@@ -814,13 +814,22 @@ def compute_theta_ell(ellmax, kmodes, tau, S, tau0, n_fftlog=16384, n_k_dense=0)
         ck_nyq = ck[:, -1]
         M_nyq = M_ell_p[:, -1]
 
-        theta_ell_pos = 2.0 * jnp.real(jnp.einsum('kn,ln->kl', ck_pos, M_pos))
+        # Split complex GEMM into two real GEMMs for 2x less arithmetic:
+        # Re(sum_n ck[k,n]*M[l,n]) = sum_n (Re(ck)*Re(M) - Im(ck)*Im(M))
+        theta_ell_pos = 2.0 * (
+            jnp.einsum('kn,ln->kl', ck_pos.real, M_pos.real)
+            - jnp.einsum('kn,ln->kl', ck_pos.imag, M_pos.imag)
+        )
         theta_ell_nyq = jnp.real(jnp.einsum('k,l->kl', ck_nyq, M_nyq))
         theta_ell = theta_ell_0 + theta_ell_pos + theta_ell_nyq
     else:
         ck_pos = ck[:, 1:]
         M_pos = M_ell_p[:, 1:]
-        theta_ell_pos = 2.0 * jnp.real(jnp.einsum('kn,ln->kl', ck_pos, M_pos))
+        # Split complex GEMM into two real GEMMs
+        theta_ell_pos = 2.0 * (
+            jnp.einsum('kn,ln->kl', ck_pos.real, M_pos.real)
+            - jnp.einsum('kn,ln->kl', ck_pos.imag, M_pos.imag)
+        )
         theta_ell = theta_ell_0 + theta_ell_pos
 
     return theta_ell, kmodes
