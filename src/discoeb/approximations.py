@@ -9,11 +9,14 @@ from .background import get_aprimeoa
 def get_approximation_settings(param):
     """Return approximation configuration with defaults from parameter dictionary."""
     return {
+        'use_tca': param.get('use_tca', False),
+        'tca_tau_c_over_tau_h_trigger': param.get('tca_tau_c_over_tau_h_trigger', 0.015),
+        'tca_tau_c_over_tau_k_trigger': param.get('tca_tau_c_over_tau_k_trigger', 0.010),
         'use_rsa': param.get('use_rsa', True),
-        'tau_c_over_tau_trigger': float(param.get('rsa_tau_c_over_tau_trigger', 10.0)),
-        'tau_over_tau_k_trigger': float(param.get('rsa_tau_over_tau_k_trigger', 80.0)),
+        'tau_c_over_tau_trigger': param.get('rsa_tau_c_over_tau_trigger', 10.0),
+        'tau_over_tau_k_trigger': param.get('rsa_tau_over_tau_k_trigger', 80.0),
         'use_ur_fluid': param.get('use_ur_fluid', True),
-        'ur_fluid_tau_over_tau_k_trigger': float(param.get('ur_fluid_tau_over_tau_k_trigger', 120.0)),
+        'ur_fluid_tau_over_tau_k_trigger': param.get('ur_fluid_tau_over_tau_k_trigger', 120.0),
     }
 
 
@@ -42,6 +45,19 @@ def compute_fields_rsa(*, kmode, aprimeoa, hprime, eta, deltab, thetab, cs2_b, t
     shearr = 0.0
 
     return deltag, thetag, shearg, deltar, thetar, shearr
+
+
+@partial(jax.jit, inline=True)
+def in_tca_regime(*, tau_h, tau_k, tau_c, tau_c_over_tau_h_trigger, tau_c_over_tau_k_trigger):
+    """CLASS-inspired tight-coupling trigger (True means use TCA equations)."""
+    uncoupled = jnp.logical_or(
+        tau_c / jnp.maximum(tau_k, 1e-30) > tau_c_over_tau_k_trigger,
+        jnp.logical_and(
+            tau_c / jnp.maximum(tau_h, 1e-30) > tau_c_over_tau_h_trigger,
+            tau_c / jnp.maximum(tau_k, 1e-30) > 0.1 * tau_c_over_tau_k_trigger,
+        ),
+    )
+    return jnp.logical_not(uncoupled)
 
 
 @partial(jax.jit, inline=True)

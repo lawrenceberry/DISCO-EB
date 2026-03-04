@@ -14,6 +14,7 @@ from .ode_integrators_stiff import Rodas5, Rodas5Transformed, Rodas5Batched
 from diffrax import Kvaerno5
 from .approximations import (
     compute_fields_rsa,
+    in_tca_regime,
     in_rsa_regime,
     in_ur_fluid_regime,
     compute_shearprime_ufa,
@@ -116,6 +117,9 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     def to_scalar(x):
         return jnp.ravel(x)[0]
     rsa_settings = get_approximation_settings(param)
+    use_tca = rsa_settings['use_tca']
+    tca_tau_c_over_tau_h_trigger = rsa_settings['tca_tau_c_over_tau_h_trigger']
+    tca_tau_c_over_tau_k_trigger = rsa_settings['tca_tau_c_over_tau_k_trigger']
     use_rsa = rsa_settings['use_rsa']
     tau_c_over_tau_trigger = rsa_settings['tau_c_over_tau_trigger']
     tau_over_tau_k_trigger = rsa_settings['tau_over_tau_k_trigger']
@@ -197,7 +201,7 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
 
     # massive neutrinos
     rhonu = jnp.exp(param['logrhonu_of_loga_spline'].evaluate(loga))
-    # pnu = jnp.exp(param['logpnu_of_loga_spline'].evaluate( jnp.log(a) ) )
+    pnu = jnp.exp(param['logpnu_of_loga_spline'].evaluate(loga))
 
     # ... quintessence
     cs2_Q              = param['cs2_DE'] 
@@ -220,6 +224,10 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     # ... compute expansion rate
     aprimeoa = to_scalar(get_aprimeoa( param=param, aexp=a ))
     xeprime = to_scalar(param['xe_of_loga_spline'].derivative( loga ) * aprimeoa)
+    gpres = (
+        (param['grhog'] + param['grhor'] * param['Neff']) / 3.0 + param['grhor'] * param['Nmnu'] * pnu
+    ) / a**2 + w_Q * param['grhom'] * param['OmegaDE'] * rho_Q * a**2
+    aprimeprimeoa = to_scalar(0.5 * (aprimeoa**2 - gpres))
     # aprimeoa = jnp.sqrt(grho / 3.0)                # Friedmann I
     # aprimeprimeoa = 0.5 * (aprimeoa**2 - gpres)    # Friedmann II
 
@@ -234,6 +242,9 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     opac    = to_scalar(xe * akthom / a**2)
     tauc    = to_scalar(1. / jnp.maximum(opac, 1e-30))
     taucprime = to_scalar(tauc * (2 * aprimeoa - xeprime / jnp.maximum(xe, 1e-30)))
+    tauh = to_scalar(1.0 / jnp.maximum(aprimeoa, 1e-30))
+    tauk = to_scalar(1.0 / jnp.maximum(kmode, 1e-30))
+
     do_relativistic_sa = jnp.logical_and(
         jnp.asarray(use_rsa),
         in_rsa_regime(
@@ -252,6 +263,19 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
                 tau=tau,
                 kmode=kmode,
                 tau_over_tau_k_trigger=ur_fluid_tau_over_tau_k_trigger,
+            ),
+        ),
+    )
+    do_tca = jnp.logical_and(
+        jnp.logical_not(do_relativistic_sa),
+        jnp.logical_and(
+            jnp.asarray(use_tca),
+            in_tca_regime(
+                tau_h=tauh,
+                tau_k=tauk,
+                tau_c=tauc,
+                tau_c_over_tau_h_trigger=tca_tau_c_over_tau_h_trigger,
+                tau_c_over_tau_k_trigger=tca_tau_c_over_tau_k_trigger,
             ),
         ),
     )
@@ -380,10 +404,45 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
         f_in = f_in.at[idxgp+lmaxgp].set( kmode * y[idxgp+lmaxgp-1] - (lmaxgp + 1) / tau * y[idxgp+lmaxgp] - opac * y[idxgp+lmaxgp] )
         return f_in
 
+    def _photon_tca(f_in):
+        deltabprime_tca = -thetab - 0.5 * hprime
+        thetabprime_tca = (
+            -aprimeoa * thetab + kmode**2 * cs2 * deltab + kmode**2 * pb43 * (0.25 * deltag - s2_squared * shearg)
+        ) / (1.0 + pb43)
+
+        deltagprime_tca = 4.0 / 3.0 * (-thetag - 0.5 * hprime)
+        slip = (
+            2.0 * pb43 / (1.0 + pb43) * aprimeoa * (thetab - thetag)
+            + tauc
+            * (
+                -aprimeprimeoa * thetab
+                - 0.5 * aprimeoa * kmode**2 * deltag
+                + kmode**2 * (cs2 * deltabprime_tca - 0.25 * deltagprime_tca)
+            )
+            / (1.0 + pb43)
+        )
+        thetabprime_tca = thetabprime_tca + pb43 / (1.0 + pb43) * slip
+        thetagprime_tca = (-thetabprime_tca - aprimeoa * thetab + kmode**2 * cs2 * deltab) / jnp.maximum(pb43, 1e-30) + kmode**2 * (
+            0.25 * deltag - s2_squared * shearg
+        )
+
+        f_in = f_in.at[idxb + 0].set(deltabprime_tca)
+        f_in = f_in.at[idxb + 1].set(thetabprime_tca)
+        f_in = f_in.at[idxg + 0].set(deltagprime_tca)
+        f_in = f_in.at[idxg + 1].set(thetagprime_tca)
+        f_in = f_in.at[idxg + 2:idxg + lmaxg + 1].set(0.0)
+        f_in = f_in.at[idxgp:idxgp + lmaxgp + 1].set(0.0)
+        return f_in
+
     def _photon_rsa(f_in):
         return f_in.at[idxg:idxg + lmaxg + 1].set(0.0).at[idxgp:idxgp + lmaxgp + 1].set(0.0)
 
-    f = jax.lax.cond(do_relativistic_sa, _photon_rsa, _photon_hierarchy, f)
+    f = jax.lax.cond(
+        do_relativistic_sa,
+        _photon_rsa,
+        lambda f_in: jax.lax.cond(do_tca, _photon_tca, _photon_hierarchy, f_in),
+        f,
+    )
 
     # --- Massless neutrino equations of motion -------------------------------------------------------
     idxr = 9 + lmaxg + lmaxgp
@@ -1073,6 +1132,10 @@ def evolve_perturbations( *, param, aexp_out, kmin : float, kmax : float, num_k 
     ----------
     param : dict
         dictionary of parameters and interpolated functions
+        Optional TCA controls:
+        - use_tca (bool): enable/disable tight-coupling approximation (default: False)
+        - tca_tau_c_over_tau_h_trigger (float): TCA-to-full trigger threshold for tau_c/tau_h (default: 0.015)
+        - tca_tau_c_over_tau_k_trigger (float): TCA-to-full trigger threshold for tau_c/tau_k (default: 0.010)
         Optional RSA controls:
         - use_rsa (bool): enable/disable radiation streaming approximation (default: True)
         - rsa_tau_c_over_tau_trigger (float): trigger threshold for tau_c/tau (default: 10.0)
@@ -1176,6 +1239,10 @@ def evolve_perturbations_batched( *, param, aexp_out, kmin : float, kmax : float
     ----------
     param : dict
         dictionary of parameters and interpolated functions
+        Optional TCA controls:
+        - use_tca (bool): enable/disable tight-coupling approximation (default: False)
+        - tca_tau_c_over_tau_h_trigger (float): TCA-to-full trigger threshold for tau_c/tau_h (default: 0.015)
+        - tca_tau_c_over_tau_k_trigger (float): TCA-to-full trigger threshold for tau_c/tau_k (default: 0.010)
         Optional RSA controls:
         - use_rsa (bool): enable/disable radiation streaming approximation (default: True)
         - rsa_tau_c_over_tau_trigger (float): trigger threshold for tau_c/tau (default: 10.0)
