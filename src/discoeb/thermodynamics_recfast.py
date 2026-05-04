@@ -122,7 +122,8 @@ a_trip = 10.**(-16.306)
 b_trip = 0.761
   
 def ionization(a, y, params):
-  param = params[0]
+  a = jnp.where(a==0, -1, a)
+  param = params[0] ### !! Undo the packaging of the dict into a tuple
   z = 1/a - 1
   # Pre-compute derived constants
   H = param['H0']/100.0
@@ -133,10 +134,10 @@ def ionization(a, y, params):
   fHe = param['YHe']/(const_mHe_mH*(1.0-param['YHe']))
   Nnow = const_dens_fac * H * H * param['Omegab'] / mu_H
 
-  x_H = y[0]
-  x_He = y[1]
+  x_H = y[:, 0]
+  x_He = y[:, 1]
   x = x_H + fHe * x_He
-  Tmat = jnp.abs(y[2])
+  Tmat = jnp.abs(y[:, 2])
 
   # Calculate common terms once
   n = Nnow * (1 + z)**3
@@ -147,7 +148,7 @@ def ionization(a, y, params):
   # Hubble parameter calculation
   # Hprime = a'/a, dtau = dt/a -> da/dtau/a = da/dt = Ha
   from .background import get_aprimeoa
-  Hz = (1e-5*get_aprimeoa(param=param, aexp=a)) / a * const_c * bigH
+  Hz = (1e-5*get_aprimeoa(param=param, aexp=a)[0]) / a * const_c * bigH
   
   # Temperature and rate calculations
   Tmat_1e4 = Tmat / 1e4
@@ -278,7 +279,7 @@ def ionization(a, y, params):
   f2 = jnp.where(timeTh < H_frac * timeH, f2_case1, f2_case2)
   
   dzda = -1/a**2
-  return jnp.array([f0, f1, f2]) * dzda
+  return jnp.column_stack(jnp.broadcast_arrays(f0, f1, f2)) * dzda
 
 def solve_ionization( *, astart : float, aend : float, ystart : jnp.ndarray, rtol : float = 1e-6, atol : float = 1e-8, max_steps : int = 128, param : dict ) -> jnp.ndarray:
   sol =drx.diffeqsolve(
@@ -292,8 +293,8 @@ def solve_ionization( *, astart : float, aend : float, ystart : jnp.ndarray, rto
         max_steps=max_steps,
         args=(param,),
         # adjoint=drx.RecursiveCheckpointAdjoint(),
-        adjoint=drx.ForwardMode(),
-        # adjoint=drx.ImplicitAdjoint(),
+        #adjoint=drx.ForwardMode(),
+        adjoint=drx.ImplicitAdjoint(),
         throw=False,
     )
   y_end = sol.ys[-1, :]
@@ -301,6 +302,9 @@ def solve_ionization( *, astart : float, aend : float, ystart : jnp.ndarray, rto
   return jnp.array([y_end[0], y_end[1], y_end[2], dyda[0], dyda[1], dyda[2]])
 
 def Saha_HeII( a, param ):
+    a = a[:, None]
+    Tcmb = param['Tcmb'][None, :]
+    fHe = param['fHe'][None, :]
     """
     Saha equation for HeII recombination
     """
@@ -309,16 +313,15 @@ def Saha_HeII( a, param ):
       mu_H = 1/(1-YHe) 
       rho_c = 3 * (H0*const_Hfac)**2 / (8 * jnp.pi * const_G) 
       return rho_c * Omegab / (const_mH * mu_H) / a**3
-    T = param['Tcmb'] / a
+    T = Tcmb / a
     betaE = const_EionHe12s / T
-    A = 1 + param['fHe']
-    B = 1 + 2*param['fHe']
-    R = (2*jnp.pi* const_me * const_kB / const_h**2 * T )**1.5 / NHnow( a, param['YHe'], param['H0'], param['Omegab'] ) * jnp.exp( - betaE )
+    A = 1 + fHe
+    B = 1 + 2*fHe
+    NHnow_val = NHnow( a, param['YHe'][None, :], param['H0'][None, :], param['Omegab'][None, :] )
+    R = (2*jnp.pi* const_me * const_kB / const_h**2 * T )**1.5 / NHnow_val * jnp.exp( - betaE )
 
-    xe = jax.lax.cond( R>1e5, 
-                      lambda x: param['fHe'] * (1 - B/R + (1 + 5*param['fHe'] + 6*param['fHe']**2)/R**2), # asymptotic expansion to prevent truncation errors
-                      lambda x:  -(R-A)/2 + jnp.sqrt( (R-A)**2/4 + R*B ) - A, None )
-    
+    xe = (R * B)/(jnp.sqrt((R-A)**2 * 0.25 + R * B) + (R - A)*0.5) - A
+
     return xe
 
 
@@ -378,7 +381,8 @@ def compute_thermal_history( *, a0 : float, a1 : float, N : int, rtol : float = 
 
   # Use adaptive sampling that concentrates points around recombination
   a = _get_adaptive_sampling(a0, a1, N+1)
-  y_init= jnp.zeros((6, N))
+  B = max(param[k].shape[0] for k in ['H0','YHe','Omegab']) # Never batch in T_cmb
+  y_init = jnp.zeros((6, N, B))
 
   H = param['H0']/100.0
   HO = H*bigH
@@ -395,19 +399,22 @@ def compute_thermal_history( *, a0 : float, a1 : float, N : int, rtol : float = 
     aend   = a[i+1]
     zend   = 1.0/aend - 1.0
     dzda   = -1.0/aend**2
-    y_prev = jnp.where(i > 0, y_arr[:, i-1], jnp.array([1.0, 1.0, param['Tcmb']*(1.0 + zstart), 0.0, 0.0, -param['Tcmb']*(1.0 + zstart)]))
+    tcmb = param['Tcmb'].squeeze()
+    yinit = jnp.array([1.0, 1.0, tcmb*(1.0 + zstart), 0.0, 0.0, -tcmb*(1.0 + zstart)])
+
+    y_prev = jnp.where(i > 0, y_arr[:, i-1], yinit[:, None])
 
     cond1 = (zend > 3500.0)
     cond2 = jnp.logical_and(i > 0, y_prev[1] > 0.99)
     cond3 = jnp.logical_and(i > 0, y_prev[0] > 0.99)
 
     def f_case1(): # if zend > 3500.0:
-      return jnp.array([1.0, 1.0, param['Tcmb']*(1.0 + zend), 0.0, 0.0, -param['Tcmb']*(1.0 + zend)])
+      return jnp.array([1.0, 1.0, tcmb*(1.0 + zend), 0.0, 0.0, -tcmb*(1.0 + zend)])
     
     def f_case2(): # elif i>0 and x_He0 > 0.99:
       x_H0 = 1.0
-      rhs  = (jnp.exp(1.5 * jnp.log(CR * param['Tcmb']/(1.0+zend))
-          - CB1_He1/(param['Tcmb']*(1.0+zend))) / Nnow) * 4.0
+      rhs  = (jnp.exp(1.5 * jnp.log(CR * tcmb/(1.0+zend))
+          - CB1_He1/(tcmb*(1.0+zend))) / Nnow) * 4.0
       x_He0 = 0.5*(jnp.sqrt((rhs-1.0)**2 + 4.0*(1.0+fHe)*rhs) - (rhs-1.0))
       dxHeIdz =((-3*(-(CB1_He1/Tcmb) + CR*Tcmb)**1.5*(Nnow + 2*fHe*Nnow + 
               4*(-((CB1_He1 - CR*Tcmb**2)/(Tcmb*(1+zend))))**1.5 - 
@@ -415,11 +422,11 @@ def compute_thermal_history( *, a0 : float, a1 : float, N : int, rtol : float = 
                 8*(1 + 2*fHe)*Nnow*(-((CB1_He1 - CR*Tcmb**2)/(Tcmb*(1+zend))))**1.5)))
            /(Nnow*(1 + zend)**2.5*jnp.sqrt(Nnow**2 + (16*(-CB1_He1 + CR*Tcmb**2)**3)/
                (Tcmb**3*(1 + zend)**3) + 8*(1 + 2*fHe)*Nnow*(-((CB1_He1 - CR*Tcmb**2)/(Tcmb + Tcmb*zend)))**1.5)))
-      return jnp.array([x_H0, (x_He0 - 1.0)/fHe, param['Tcmb']*(1.0+zend), 0.0, dxHeIdz*dzda, -param['Tcmb']*(1.0+zend)])
+      return jnp.array([x_H0, (x_He0 - 1.0)/fHe, tcmb*(1.0+zend), 0.0, dxHeIdz*dzda, -tcmb*(1.0+zend)])
     
     def f_case3(): # elif i>0 and x_H > 0.99:
-      rhs   = jnp.exp(1.5*jnp.log(CR*param['Tcmb']/(1.0+zend))
-          - CB1/(param['Tcmb']*(1.0+zend))) / Nnow
+      rhs   = jnp.exp(1.5*jnp.log(CR*tcmb/(1.0+zend))
+          - CB1/(tcmb*(1.0+zend))) / Nnow
       x_H0  = 0.5*(jnp.sqrt(rhs**2 + 4.0*rhs) - rhs)
       dxHdz = ((3*((2*(-((CB1 - CR*Tcmb**2)/(Tcmb*(1+zend))))**1.5)/(1 + zend) + 
                    ((CB1 - CR*Tcmb**2)*(2*CB1**2 - 4*CB1*CR*Tcmb**2 + Tcmb**2*
@@ -449,8 +456,40 @@ def compute_thermal_history( *, a0 : float, a1 : float, N : int, rtol : float = 
 
     return y_arr.at[:, i].set(new_val)
 
-  y_final = jax.lax.fori_loop(0, N, loop_body, y_init)
-  return y_final, a[1:]
+  #y_final = jax.lax.fori_loop(0, N, loop_body, y_init)
+
+  # FIRST POINT OF ORDER : DETERMINE SHAPE!!
+  astart = a0
+  aend = a1
+  zstart = 1.0/astart - 1.0
+  import jax.tree_util as jtu
+  xH_ini = jnp.array([1.0])
+  xHe_ini = jnp.array([1.0])
+  T_ini = Tcmb*(1.0 + zstart)
+  y0 = jnp.stack(jnp.broadcast_arrays(xH_ini, xHe_ini, T_ini), axis=1)
+  
+  dy0 = jax.eval_shape(ionization, astart, y0, (param,))
+  y0 = jnp.broadcast_to(y0, dy0.shape)
+
+  sol =drx.diffeqsolve(
+      terms=drx.ODETerm(ionization),
+      solver=drx.Dopri5(),#GRKT4(),
+      t0=astart,
+      t1=aend,
+      dt0=jnp.abs(astart*1e-3),
+      y0=y0,
+      stepsize_controller = drx.PIDController(rtol=rtol,atol=atol), 
+      #max_steps=max_steps,
+      args=(param,),
+      # adjoint=drx.RecursiveCheckpointAdjoint(),
+      #adjoint=drx.ForwardMode(),
+      #adjoint=drx.ImplicitAdjoint(),
+      adjoint=drx.RecursiveCheckpointAdjoint(),
+      throw=False,
+      saveat=drx.SaveAt(dense=True)
+  )
+
+  return jax.vmap(sol.evaluate)(a), jax.vmap(sol.derivative)(a), a
 
 
 @partial(jax.jit, static_argnames=("num_thermo",))
@@ -458,35 +497,45 @@ def evaluate_thermo( *, param : dict, num_thermo = 2048 ) -> jax.Array:
     
     param['fHe'] = param['YHe']/(const_mHe_mH*(1.0-param['YHe']))
     
-    y, a = compute_thermal_history( a0=param['amin'], a1=param['amax'], N=num_thermo, param=param )
+    y, dy, a = compute_thermal_history( a0=param['amin'], a1=param['amax'], N=num_thermo, param=param )
+    
+    print(y.shape, dy.shape)
 
     # extract the relevant quantities from the solution
-    xeHI      = y[0,:]
-    xeHeI     = y[1,:]
-    xeHeII    = jax.vmap( lambda a_: Saha_HeII( a_, param) )( a )
+    xeHI      = y[:, :, 0]
+    xeHeI     = y[:, :, 1]
+    xeHeII    = Saha_HeII(a, param)
     xe        = xeHI + param['fHe'] * xeHeI + xeHeII
     mu        = 1/(1 + (1/const_mHe_mH-1) * param['YHe'] + (1-param['YHe']) * xe)
-    Tm        = y[2,:]
+    Tm        = y[:, :, 2]
 
     # extract the derivatives that were also computed, which allows to compute cs2 and dxedtau
-    dxeHIda  = y[3,:]
-    dxeHeIda = y[4,:]
-    dxHeIIda = jax.vmap( lambda a_: jax.grad( lambda aa_: Saha_HeII( aa_, param) )( a_ ) )( a )
-    dTmda    = y[5,:]
-    daTmda   = Tm + a * dTmda
+    dxeHIda  = y[:, :, 0]
+    dxeHeIda = y[:, :, 1]
+
+    a_broadcasted = jnp.broadcast_to(a[:, None], (1025, 5))
+    val, vjp_fun = jax.vjp(lambda x: Saha_HeII(x, param), a_broadcasted)
+    dxHeIIda = vjp_fun(jnp.ones_like(val))[0]
+    print(dxHeIIda.shape)
+    dTmda    = y[:, :, 2]
+    print(Tm.shape, a[:, None].shape, dTmda.shape)
+    daTmda   = Tm + a[:, None] * dTmda
     cs2      = const_kB/ const_mH / const_c**2 / mu * Tm * (4 - daTmda / (Tm)) /3
-    from .background import dadtau, dtauda_
-    dxedtau  = (dxeHIda + param['fHe'] * dxeHeIda + dxHeIIda) * dadtau(a=a, param=param)
+    dxeda = (dxeHIda + param['fHe'] * dxeHeIda + dxHeIIda)
+    #from .background import dadtau, dtauda_
+    #dxedtau  = (dxeHIda + param['fHe'] * dxeHeIda + dxHeIIda) * dadtau(a=a, param=param)
 
-    # compute conformal times tau for all entries in a
-    # vmap romb over all intervals in parallel instead of sequentially via scan
-    _dtauda = lambda a_: dtauda_(a_, param['grhom'], param['grhog'], param['grhor'],
-                    param['Omegam'], param['OmegaDE'],
-                    param['w_DE_0'], param['w_DE_a'],
-                    param['Omegak'], param['Neff'], param['Nmnu'],
-                    param['logrhonu_of_loga_spline'])
-    tau_increments = jax.vmap(lambda lo, hi: romb(_dtauda, lo, hi))(a[:-1], a[1:])
-    tau0 = param['taumin']
-    tau = tau0 + jnp.concatenate([jnp.array([0.0]), jnp.cumsum(tau_increments)])
+    ## compute conformal times tau for all entries in a
+    ## vmap romb over all intervals in parallel instead of sequentially via scan
+    #_dtauda = lambda a_: dtauda_(a_, param['grhom'], param['grhog'], param['grhor'],
+    #                param['Omegam'], param['OmegaDE'],
+    #                param['w_DE_0'], param['w_DE_a'],
+    #                param['Omegak'], param['Neff'], param['Nmnu'],
+    #                param['logrhonu_of_loga_spline'])
+    #tau_increments = jax.vmap(lambda lo, hi: romb(_dtauda, lo, hi))(a[:-1], a[1:])
+    #tau0 = param['taumin']
+    #tau = tau0 + jnp.concatenate([jnp.array([0.0]), jnp.cumsum(tau_increments)])
 
-    return param, tau, a, cs2, Tm, mu, xe, xeHI, xeHeI, xeHeII, dxedtau
+    #return param, tau, a, cs2, Tm, mu, xe, xeHI, xeHeI, xeHeII, dxedtau
+    return a, cs2, Tm, mu, xe, dxeda
+

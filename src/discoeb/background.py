@@ -45,26 +45,30 @@ def get_neutrino_momentum_bins(  nqmax : int ) -> tuple[jax.Array, jax.Array]:
     return q, w / fermi_dirac_const
 
 
-def nu_background( a : float, amnu: float, nq : int = 8 ) -> tuple[float, float, float]:
+def nu_background( a, amnu, nq : int = 8 ):
     """ computes the neutrino density and pressure of one flavour of massive neutrinos
         in units of the mean density of one flavour of massless neutrinos
 
     Args:
-        a (float): scale factor
-        amnu (float): neutrino mass in units of neutrino temperature (m_nu*c**2/(k_B*T_nu0).
+        a (N,): scale factor
+        amnu (B,): neutrino mass in units of neutrino temperature (m_nu*c**2/(k_B*T_nu0).
         nq (int, optional): number of integration points. Defaults to 8.
 
     Returns:
         tuple[float, float, float]: rho_nu/rho_nu0, p_nu/p_nu0, pp_nu/pp_nu0
     """
+    a = a[:, None, None]
+    amnu = amnu[None, :, None]
 
     # q is the comoving momentum in units of k_B*T_nu0/c.
     v    = lambda q: 1 / jnp.sqrt(1 + (a * amnu / q)**2)   # = (1/aq) / sqrt(1+1/aq**2)
 
     q, w = get_neutrino_momentum_bins( nq )
-    rhonu = jnp.dot( w, 1. / v(q) )
-    pnu = jnp.dot( w, v(q) / 3 )
-    ppnu = jnp.dot( w, v(q)**3 / 3 )
+    q = q[None, None, :]
+    w = w[None, None, :]
+    rhonu = jnp.sum( w * 1. / v(q) , axis=2)
+    pnu = jnp.sum( w * v(q) / 3 , axis=2)
+    ppnu = jnp.sum( w * v(q)**3 / 3 , axis=2)
 
     return rhonu, pnu, ppnu
 
@@ -78,19 +82,33 @@ def dtauda_(a, grhom, grhog, grhor, Omegam, OmegaDE, w_DE_0, w_DE_a, Omegak, Nef
         + (grhog + grhor*(Neff+Nmnu*rhonu)) \
         + grhom * OmegaDE * rho_DE * a**4 \
         + grhom * Omegak * a**2
-    return jnp.sqrt(3.0 / grho2).reshape( jnp.asarray(a).shape )
+    return jnp.sqrt(3.0 / grho2)
 
 
 def dadtau(a, param ):
     """Derivative of scale factor with respect to conformal time"""
     rhonu = jnp.exp(param['logrhonu_of_loga_spline'].evaluate(jnp.log(a)))
+
+    a = a[:, None]
+    w0 = param['w_DE_0'][None, :]
+    wa = param['w_DE_a'][None, :]
+    grhom = param['grhom'][None, :]
+    grhog = param['grhog'][None, :]
+    grhor = param['grhor'][None, :]
+    Om = param['Omegam'][None, :]
+    Neff = param['Neff'][None, :]
+    Nmnu = param['Nmnu'][None, :]
+    Ode = param['OmegaDE'][None, :]
+    Ok = param['Omegak'][None, :]
+
     # rhonu = jax.vmap( lambda aa: nu_background(aa,param['amnu'])[0] )( jnp.atleast_1d(a) )
-    rho_DE = a**(-3*(1+param['w_DE_0']+param['w_DE_a'])) * jnp.exp(3*(a-1)*param['w_DE_a'])
-    grho2 = param['grhom'] * param['Omegam'] * a \
-        + (param['grhog'] + param['grhor']*(param['Neff']+param['Nmnu']*rhonu)) \
-        + param['grhom'] * param['OmegaDE'] * rho_DE * a**4 \
-        + param['grhom'] * param['Omegak'] * a**2
-    return jnp.sqrt(grho2 / 3.0).reshape( jnp.asarray(a).shape )
+    rho_DE = a**(-3*(1+w0+wa)) * jnp.exp(3*(a-1)*wa)
+
+    grho2 = grhom * Om * a \
+        + (grhog + grhor*(Neff+Nmnu*rhonu)) \
+        + grhom * Ode * rho_DE * a**4 \
+        + grhom * Ok * a**2
+    return jnp.sqrt(grho2 / 3.0)
 
 
 def dtauda(a, param ):
@@ -141,9 +159,10 @@ def compute_angular_diameter_distance( *, aexp, param ):
 def setup_background_evolution( *, amin, amax, param ):
     c2ok = 1.62581581e4 # K / eV
     num_neutrino = 512  # number of neutrino history arrays
-    
+
     param['amin'] = amin
-    param['amax'] = amax   
+    param['amax'] = amax
+    
 
     # mean densities
     Omegak = 0.0 #1.0 - Omegam - OmegaL
@@ -161,7 +180,7 @@ def setup_background_evolution( *, amin, amax, param ):
     param['a'] = a
 
     # Compute the neutrino density and pressure
-    rhonu_, pnu_, ppnu_ = jax.vmap( lambda a_ : nu_background( a_, param['amnu'] ), in_axes=0 )( a )
+    rhonu_, pnu_, ppnu_ = nu_background( a, param['amnu'] )
 
     param['logrhonu_of_loga_spline']     = spline_interpolation( loga, jnp.log(rhonu_), uniform=True )
     param['logpnu_of_loga_spline']       = spline_interpolation( loga, jnp.log(pnu_), uniform=True )
@@ -173,21 +192,25 @@ def setup_background_evolution( *, amin, amax, param ):
     param['Omegamnu'] = Omegamnu
 
     # ensure curvature is correct
-    Omegar = (param['Neff']+param['Nmnu']*jnp.exp(param['logrhonu_of_loga_spline'].evaluate(0.0))) * param['grhor'] / param['grhom']
+    Omegar = (param['Neff']+param['Nmnu']*jnp.exp(param['logrhonu_of_loga_spline'].evaluate(0.0)[0])) * param['grhor'] / param['grhom']
     Omegag = param['grhog'] / param['grhom']
+
     param['OmegaDE'] = 1.0 - param['Omegak'] - Omegar - Omegag - param['Omegam']
+
 
     # Compute the conformal time interval
     param['taumin'] = amin / param['adotrad']
-    param['taumax'] = (param['taumin'] + 
-        romb( lambda a_: dtauda_(a_,param['grhom'], param['grhog'], param['grhor'], 
-                        param['Omegam'], param['OmegaDE'], param['w_DE_0'], param['w_DE_a'],
-                        param['Omegak'], param['Neff'], param['Nmnu'], 
-                        param['logrhonu_of_loga_spline']), amin, amax )
-    )
+    integrator = spline_interpolation(loga, dtauda(a,param) * a[:, None], uniform=True)
+    param['tau'] =  param['taumin'][None, :] + integrator.integral(loga)
+    param['taumax'] = param['tau'][-1]
+    #param['taumax'] = param['taumin'] + integrator.integral(amax)[0] - integrator.integral(amin)[0]
 
     return param
 
+def batch_dimensions(param):
+  for x in param:
+    param[x] = jnp.atleast_1d(param[x])
+  return param
 @partial(jax.jit, static_argnames=('thermo_module', 'num_thermo', 'rtol', 'atol', 'order', 'class_thermo'))
 def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 256, rtol: float = 1e-5, atol: float = 1e-7, order: int = 5, class_thermo = None ):
     """Evolve the cosmological background and thermal history
@@ -230,30 +253,34 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
         amin = jnp.min( class_thermo['scale factor a'] )
         amax = jnp.max( class_thermo['scale factor a'] )
     
+    param = batch_dimensions(param)
+
     param = setup_background_evolution( amin=amin, amax=amax, param=param )
 
     if thermo_module == 'RECFAST':
         # Compute the thermal history
-        param, tau, aexp, cs2, Tm, mu, xe, xeHI, xeHeI, xeHeII, xeprime_recfast = evaluate_thermo_recfast( param=param, num_thermo=num_thermo )
+        #param, tau, aexp, cs2, Tm, mu, xe, xeHI, xeHeI, xeHeII, xeprime_recfast = evaluate_thermo_recfast( param=param, num_thermo=num_thermo )
+        aexp, cs2, Tm, mu, xe, dxeda = evaluate_thermo_recfast( param=param, num_thermo=num_thermo )
 
         param['aexp'] = aexp
-        param['tau'] = tau
+        #param['tau'] = tau
         param['xe'] = xe
-        param['xeHI'] = xeHI
-        param['xeHeI'] = xeHeI
-        param['xeHeII'] = xeHeII
+        #param['xeHI'] = xeHI
+        #param['xeHeI'] = xeHeI
+        #param['xeHeII'] = xeHeII
         param['cs2'] = cs2
         param['Tm'] = Tm
 
+        tau = spline_interpolation(jnp.log(param['a']), param['tau']).evaluate(jnp.log(aexp))
         param['tau_of_a_spline']      = spline_interpolation( aexp, tau )
         param['a_of_tau_spline']      = spline_interpolation( tau, aexp )
         param['xe_of_tau_spline']     = spline_interpolation( tau, xe )
-        param['cs2a_of_tau_spline']   = spline_interpolation( tau, aexp*cs2 )
-        param['tempba_of_tau_spline'] = spline_interpolation( tau, aexp*Tm )
+        param['cs2a_of_tau_spline']   = spline_interpolation( tau, aexp[:,None]*cs2 )
+        param['tempba_of_tau_spline'] = spline_interpolation( tau, aexp[:,None]*Tm )
 
         # Pre-composed splines for direct a-to-quantity lookups (performance optimization)
-        param['xe_of_loga_spline']    = spline_interpolation( jnp.log(aexp), xe )
-        param['cs2a_of_loga_spline']  = spline_interpolation( jnp.log(aexp), aexp*cs2 )
+        param['xe_of_loga_spline']    = spline_interpolation( jnp.log(aexp), xe , uniform = True)
+        param['cs2a_of_loga_spline']  = spline_interpolation( jnp.log(aexp), aexp[:,None]*cs2 , uniform = True)
 
     elif thermo_module == 'MB95':
 
@@ -283,8 +310,8 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
         param['a_of_tau_spline'] = spline_interpolation( tau, aexp )
 
         # Pre-composed splines for direct a-to-quantity lookups (performance optimization)
-        param['xe_of_loga_spline']    = spline_interpolation( jnp.log(aexp), xe )
-        param['cs2a_of_loga_spline']  = spline_interpolation( jnp.log(aexp), aexp*cs2 )
+        param['xe_of_loga_spline']    = spline_interpolation( jnp.log(aexp), xe , uniform = True)
+        param['cs2a_of_loga_spline']  = spline_interpolation( jnp.log(aexp), aexp*cs2 , uniform = True)
 
     elif thermo_module == 'CLASS':
         # use input CLASS thermodynamics
@@ -316,7 +343,7 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
     # xe = param['xe_of_tau_spline'].evaluate( tau )
     # xeprime = param['xe_of_tau_spline'].derivative( tau )
     # xepprime  = param['xe_of_tau_spline'].derivative2( tau )
-    opac       = xe * akthom / aexp**2
+    opac       = xe * akthom / aexp[:,None]**2
     opacspline = spline_interpolation( tau, opac, integrate_from_start=True)
     opacprime, opacpprime = opacspline.derivative12( tau )
 
@@ -337,8 +364,8 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
     param['tau0'] = param['tau_of_a_spline'].evaluate(1.0)
     param['tau_maxvis'] = param['tau'][jnp.argmax(param['gvis'])]
 
-    if thermo_module == 'RECFAST':
-        param['xeprime_recf'] = xeprime_recfast
+    #if thermo_module == 'RECFAST':
+    #    param['xeprime_recf'] = xeprime_recfast
 
     param['xeprime'] = xeprime
 
