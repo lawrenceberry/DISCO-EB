@@ -12,6 +12,7 @@ import jax.flatten_util as fu
 
 from .ode_integrators_stiff import Rodas5, Rodas5Transformed, Rodas5Batched
 from diffrax import Kvaerno5
+from solvers.rodas5jax import solve as rodas5_solve
 from .approximations import (
     compute_fields_rsa,
     in_tca_regime,
@@ -1015,82 +1016,51 @@ def evolve_modes_batched( *, tau_max, tau_out, param, kmodes,
         return model_synchronous( tau=tau, y=y, param=param, kmode=kmode,  
                                                    lmaxg=lmaxg, lmaxgp=lmaxgp, lmaxr=lmaxr, lmaxnu=lmaxnu, nqmax=nqmax)
 
-    # For Rodas5Batched with Diffrax 0.7.0:
-    # Rodas5Batched extracts: f, _args = args
-    # Then calls: terms.vf(t, y, _args)
-    # We need terms.vf to vmap f over batch, but f is not passed to vf
-    # Solution: Create a closure that captures F
-
-    def vf_batched(t, y_batch, args):
-        """
-        Batched vector field for Rodas5Batched.
-
-        Args:
-            t: time scalar
-            y_batch: (batch_size, nvars) batched states
-            args: During compatibility check: tuple (f, batch_params)
-                  During actual solve: just batch_params (kmodes)
-
-        Returns:
-            (batch_size, nvars) batched derivatives
-        """
-        # Handle both compatibility check and actual solve
-        if isinstance(args, tuple) and len(args) == 2:
-            # Compatibility check phase: args = (f, batch_params)
-            # Return zeros for shape inference
-            return jax.tree_util.tree_map(jnp.zeros_like, y_batch)
-        else:
-            # Actual solve phase: args = batch_params (kmodes)
-            # vmap F over batch: F(t, y[i], kmode[i]) for each i
-            return jax.vmap(F, in_axes=(None, 0, 0))(t, y_batch, args)
-
-    modelX_term = drx.ODETerm(vf_batched)
-    
     # ... determine the number of active variables (i.e. the number of equations), absent any optimizations
     nvar   = 7 + (lmaxg + 1) + (lmaxgp + 1) + (lmaxr + 1) + nqmax * (lmaxnu + 1) + 2
 
     # ... determine the starting times for each batch
     tau_start_batched = determine_start_times_per_batch(tau_out, param, kmodes, batch_size)
+    tau_start = jnp.min(tau_start_batched)
 
-    # ... set adiabatic ICs for each kmode an batch together
-    y0_batches = calculate_ics(tau_start_batched, kmode_batches, param, nvar, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax)
-
-    # create solver wrapper
-    def DEsolve_implicit(t0, y0, kmodes_batch):
-
-        # This function now only returns the solution.ys and nothing else, since the other info is not used
-        # at the moment. Might save some memory after compilation?
-
-        filters_full = jax.vmap(lambda kmode: jnp.array([1,kmode**2,1,1,1/kmode**2,1]))(kmodes_batch)
-
-        sol =  drx.diffeqsolve(
-            terms=modelX_term,
-            solver=Rodas5Batched(),
-            t0=t0,
-            t1=tau_max,
-            dt0=jnp.minimum(t0/4, 0.5*(tau_max-t0)),
-            y0=y0,
-            saveat=drx.SaveAt(ts=tau_out),
-            stepsize_controller = drx.PIDController(rtol=rtol, atol=atol,
-                                                    norm=lambda t:rms_norm_filtered_batched(t, jnp.array([0,2,3,5,6,7]), filters_full),
-                                                    pcoeff=pcoeff, icoeff=icoeff, dcoeff=dcoeff, factormax=factormax, factormin=factormin),
-            max_steps=max_steps,
-            args=(F, kmodes_batch),
-            adjoint=drx.DirectAdjoint(),
+    # ... set adiabatic ICs for each kmode at the shared ensemble start time
+    y0 = jax.vmap(
+        lambda kmode: adiabatic_ics_one_mode(
+            tau=tau_start,
+            param=param,
+            kmode=kmode,
+            nvar=nvar,
+            lmaxg=lmaxg,
+            lmaxgp=lmaxgp,
+            lmaxr=lmaxr,
+            lmaxnu=lmaxnu,
+            nqmax=nqmax,
         )
+    )(kmodes)
 
-        return sol.ys
+    error_weights = jnp.zeros_like(y0)
+    error_weights = error_weights.at[:, jnp.array([0, 2, 3, 5, 6, 7])].set(
+        jax.vmap(lambda kmode: jnp.array([1, kmode**2, 1, 1, 1 / kmode**2, 1]))(kmodes)
+    )
 
+    def ode_fn(y, tau, params_one):
+        return F(tau, y, params_one[0])
 
-    DEsolve_implicit_vmap = jax.vmap(DEsolve_implicit, (0,0,0))
+    sol = rodas5_solve(
+        ode_fn,
+        y0,
+        jnp.concatenate([jnp.array([tau_start]), tau_out]),
+        kmodes[:, None],
+        batch_size=n_total,
+        rtol=rtol,
+        atol=atol,
+        lu_precision="fp32",
+        first_step=jnp.minimum(tau_start / 4, 0.5 * (tau_max - tau_start)),
+        max_steps=max_steps,
+        error_weights=error_weights,
+    )
 
-    ys = DEsolve_implicit_vmap(tau_start_batched, y0_batches, kmode_batches)
-
-    n_batches, n_steps, _batch_size, _nvar = ys.shape
-
-    # Transpose to (n_batches, batch_size, n_steps, nvar) then reshape to (n_total, n_steps, nvar)
-    ys_transposed = jnp.transpose(ys, (0, 2, 1, 3))
-    reordered_ys = jnp.reshape(ys_transposed, (n_total, n_steps, _nvar))
+    reordered_ys = sol[:, 1:, :]
 
     projected_ys = jax.vmap(
         lambda _k, _ys: jax.vmap(
@@ -1567,4 +1537,3 @@ def power_multipoles( *, y : jnp.ndarray, kmodes : jnp.ndarray, b : float, param
     P4 = 8/35 * thetam**2
 
     return P0, P2, P4
-
