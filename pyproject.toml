@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "discoeb"
 version = "0.1.0"
 dependencies = [
-    "jax[cuda12]",
+    "jax[cuda12]>=0.9.1,<0.10",
     "diffrax",
     "equinox",
     "jaxtyping",
@@ -21,13 +21,14 @@ dependencies = [
     "camb>=1.6.0",
     "pandas>=2.3.3",
     "matplotlib>=3.9.4",
+    "modax",
 ]
 authors = [{ name = "Oliver Hahn", email = "oliver.hahn@univie.ac.at" }]
 
 description = "..."
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.9"
+requires-python = ">=3.13"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3",
@@ -43,3 +44,9 @@ docs = ["sphinx", "nbsphinx"]
 Homepage = "https://github.com/ohahn/DISCO-EB"
 Issues = "https://github.com/ohahn/DISCO-EB/issues"
 Repository = "https://github.com/ohahn/DISCO-EB.git"
+
+[tool.uv.sources]
+modax = { path = "/home/lawrence/git/modax", editable = true }
+
+[tool.pyright]
+extraPaths = ["/home/lawrence/git/modax"]
