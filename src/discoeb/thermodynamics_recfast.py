@@ -26,10 +26,12 @@
  
 import diffrax as drx
 import jax
+#jax.config.update('jax_disable_jit', True)
 import jax.numpy as jnp
 from jax_cosmo.scipy.integrate import romb
 from functools import partial
 from typing import Tuple
+from .spline_interpolation import spline_interpolation
 
 from .ode_integrators_stiff import GRKT4
 # from diffrax import Tsit5
@@ -121,9 +123,17 @@ T_1 = 10**(5.114)
 a_trip = 10.**(-16.306)
 b_trip = 0.761
   
-def ionization(a, y, params):
-  a = jnp.where(a==0, -1, a)
-  param = params[0] ### !! Undo the packaging of the dict into a tuple
+
+#def ionization(a, y, params, compute_xH_fn, compute_xHe_fn):
+def ionization(loga, y, params, compute_xH_fn, compute_xHe_fn):
+  #jax.lax.cond(a > 1e-8,lambda: jax.debug.print("x={y}, a={a}", y=y, a=a),lambda: None)
+  #a = jnp.where(a==0, -1, a)
+  a = jnp.exp(loga)
+  #jax.debug.print("a={a},y={y}",a=a,y=y)
+  param = params[0]
+  #saha_inputs = params[1]
+  #jax.debug.print("a={a},saha_inputs={b}",a=a,b=saha_inputs)
+
   z = 1/a - 1
   # Pre-compute derived constants
   H = param['H0']/100.0
@@ -135,7 +145,9 @@ def ionization(a, y, params):
   Nnow = const_dens_fac * H * H * param['Omegab'] / mu_H
 
   x_H = y[:, 0]
+  x_H = jnp.where(x_H<0, 0, x_H)
   x_He = y[:, 1]
+  x_He = jnp.where(x_He<0, 0, x_He)
   x = x_H + fHe * x_He
   Tmat = jnp.abs(y[:, 2])
 
@@ -247,7 +259,7 @@ def ionization(a, y, params):
   K_Lambda_n_1_minus_x_H = K * Lambda * n * one_minus_x_H
   denom_term = 1 / fu + K_Lambda_n_1_minus_x_H / fu + K * Rup * n * one_minus_x_H
   
-  f0_case1 = 0.0
+  f0_case1 = compute_xH_fn(1/a-1)#jnp.exp(saha_inputs[1].evaluate(jnp.log(a))[0].T)-1e-9
   f0_case2 = rate_diff / Hz_z_term
   f0_case3 = (rate_diff * (1 + K_Lambda_n_1_minus_x_H)) / (Hz_z_term * denom_term)
   
@@ -269,17 +281,28 @@ def ionization(a, y, params):
   trip_contrib = trip_rate_diff * CfHe_t / Hz_z_term
   trip_cond = jnp.logical_or(x_He < 5e-9, x_He > 0.98)
   
-  f1 = jnp.where(x_He < 1e-8, 0.0, 
-          f1_main + jnp.where(trip_cond, 0.0, trip_contrib))
-  
+  f1_case1= compute_xHe_fn(1/a-1)#jnp.exp(saha_inputs[0].evaluate(jnp.log(a))[0].T)-1e-9
+  f1 = jnp.where(jnp.logical_or(x_He>0.9, a<3e-4),f1_case1,
+                    jnp.where(x_He < 1e-8, 0.0, 
+                      f1_main + jnp.where(trip_cond, 0.0, trip_contrib))
+                )
+
+  #jax.debug.print("at a={a}, saha = {y}, {z}", a=a, y=f0_case1, z=f1_case1)
+
   # f2 calculation
   epsilon = Hz * (1 + x + fHe) / (CT * Trad**3 * x)
   f2_case1 = Tmat / z_term
   f2_case2 = CT * (Trad**4) * x / (1 + x + fHe) * (Tmat - Trad) / Hz_z_term + 2 * Tmat / z_term
   f2 = jnp.where(timeTh < H_frac * timeH, f2_case1, f2_case2)
   
-  dzda = -1/a**2
-  return jnp.column_stack(jnp.broadcast_arrays(f0, f1, f2)) * dzda
+  #dzda = -1/a**2
+  dzdlna = -1/a
+  #jax.lax.cond(a > 1e-9,lambda: jax.debug.print("f0={f0}, f1 = {f1}, f2={f2}, dzda = {dzda}",f0=f0, f1=f1,f2=f2 , dzda=dzda),lambda: None)
+  
+  #print(f0.shape, f1.shape, f2.shape)
+  dy = jnp.stack(jnp.broadcast_arrays(f0, f1, f2), axis=1)
+  #print("returning ",f0.shape, f1.shape, f2.shape, dy.shape)
+  return dy * dzdlna#dzda
 
 def solve_ionization( *, astart : float, aend : float, ystart : jnp.ndarray, rtol : float = 1e-6, atol : float = 1e-8, max_steps : int = 128, param : dict ) -> jnp.ndarray:
   sol =drx.diffeqsolve(
@@ -289,7 +312,7 @@ def solve_ionization( *, astart : float, aend : float, ystart : jnp.ndarray, rto
         t1=aend,
         dt0=jnp.abs(astart*1e-3),
         y0=ystart[:3],
-        stepsize_controller = drx.PIDController(rtol=rtol,atol=atol), 
+        stepsize_controller = drx.PIDController(rtol=rtol,atol=atol,dtmin=1e-16), 
         max_steps=max_steps,
         args=(param,),
         # adjoint=drx.RecursiveCheckpointAdjoint(),
@@ -297,6 +320,8 @@ def solve_ionization( *, astart : float, aend : float, ystart : jnp.ndarray, rto
         adjoint=drx.ImplicitAdjoint(),
         throw=False,
     )
+  if sol.result != dfx.RESULTS.successful:
+    jax.debug.print("Solver failed with code: {r}",r=sol.result)
   y_end = sol.ys[-1, :]
   dyda = ionization( aend, y_end, (param,) )
   return jnp.array([y_end[0], y_end[1], y_end[2], dyda[0], dyda[1], dyda[2]])
@@ -324,6 +349,21 @@ def Saha_HeII( a, param ):
 
     return xe
 
+def Saha(T, z, N_now, E_ion, offset, g_factor, f_factor):
+
+    # Thermal de Broglie factor
+    phi = (CR * T)**1.5 / N_now / (1+z)**3
+    R = g_factor * phi * jnp.exp(-E_ion / T)
+
+    fully_ionized = T > E_ion * 0.1#R>1e8
+    # Quadratic coefficients
+    alpha = jnp.where(fully_ionized, 1.0, R + offset)
+    beta = jnp.where(fully_ionized, f_factor * (1+f_factor), R * f_factor)
+
+    discr = jnp.maximum(alpha**2 + 4.0*beta, 1e-35)
+    
+    # Quadratic formula (stabilized for large alpha/beta
+    return jnp.where(R>1e-20, (2.0 * beta) / (jnp.sqrt(discr) + alpha), 0.0)
 
 def _get_adaptive_sampling(a0: float, a1: float, N: int) -> jax.Array:
   """
@@ -458,29 +498,127 @@ def compute_thermal_history( *, a0 : float, a1 : float, N : int, rtol : float = 
 
   #y_final = jax.lax.fori_loop(0, N, loop_body, y_init)
 
-  # FIRST POINT OF ORDER : DETERMINE SHAPE!!
+
+  # FIRST POINT OF ORDER : DETERMINE SAHA INPUTS
+  Nnow_2d = jnp.atleast_1d(Nnow)[:, jnp.newaxis]
+  fHe_2d = jnp.atleast_1d(fHe)[:, jnp.newaxis]
+  z_2d = (1/a-1)[jnp.newaxis, :]
+  #Saha_inputs = {'HeII':[const_EionHe12s, 1.0 + fHe_2d, 1.0, fHe_2d], 'HeI':[CB1_He1, 1.0, 4.0, fHe_2d], 'HI':[CB1, 0.0, 1.0, 1.0]}
+  Saha_inputs = {'HeII':[const_EionHe12s, 1.0 + fHe, 1.0, fHe], 'HeI':[CB1_He1, 1.0, 4.0, fHe], 'HI':[CB1, 0.0, 1.0, 1.0]}
+
+
+  # --- Hydrogen Logic ---
+  #def compute_xH(z):
+  #    T_z = Tcmb * (1.0 + z)
+  #    return Saha(T_z, z, Nnow_2d, *Saha_inputs['HI'])
+  def compute_xH(z):
+      T_z = Tcmb * (1.0 + z)
+      return Saha(T_z, z, Nnow, *Saha_inputs['HI'])
+
+  #x_H, dxH_dz = jax.jvp(compute_xH, (z_2d,), (jnp.ones_like(z_2d),))
+  dxH_func = jax.jacobian(compute_xH)
+  xH_ini = compute_xH(1/a[0]-1)
+
+  # --- Helium Total Logic ---
+  #def compute_xHe(z):
+  #  T_z = Tcmb * (1.0 + z)
+  #  val_HeI  = Saha(T_z, z, Nnow_2d, *Saha_inputs['HeI'])
+  #  val_HeII = Saha(T_z, z, Nnow_2d, *Saha_inputs['HeII'])
+  #  return (val_HeI + val_HeII) / fHe
+  def compute_xHe(z):
+     T_z = Tcmb * (1.0 + z)
+     val_HeI  = Saha(T_z, z, Nnow, *Saha_inputs['HeI'])
+     val_HeII = Saha(T_z, z, Nnow, *Saha_inputs['HeII'])
+     return (val_HeI + val_HeII) / fHe
+
+  #x_He, dxHe_dz = jax.jvp(compute_xHe, (z_2d,),(jnp.ones_like(z_2d),))
+  dxHe_func = jax.jacobian(compute_xHe)
+  xHe_ini = compute_xHe(1/a[0]-1)
+  
+  #threshold = 1e-9
+  #dxHe_dz = jnp.where(dxHe_dz < threshold, 0.0, dxHe_dz)
+  #dxH_dz = jnp.where(dxH_dz < threshold, 0.0, dxH_dz)
+  jnp.set_printoptions(threshold=jnp.inf)
+  #import numpy as np
+  #print("z = {}".format(np.array(1/a-1)))
+  #print("x_H = {}".format(np.array(x_H)))
+  #print("x_He = {}".format(np.array(x_He)))
+  #print("dx_H = {}".format(np.array(dxH_dz)))
+  #print("dx_He = {}".format(np.array(dxHe_dz)))
+  
+  #def get_f_curve(z, f_prime, f0=0):
+  #  # Calculate the spacing between points
+  #  dz = jnp.diff(z)
+  #  # Trapezoid rule: average height * width
+  #  avg_heights = (f_prime[:-1] + f_prime[1:]) / 2.0
+  #  integrals = avg_heights * dz
+  #  
+  #  # Prefix with 0 and sum to get the curve
+  #  f_values = jnp.concatenate([jnp.array([0.0]), jnp.cumsum(integrals)])
+  #  return f_values + f0
+    
+  #print(get_f_curve(1/a-1, dxH_dz[0]))
+  #print(get_f_curve(1/a-1, dxHe_dz[0]))
+  #quit()
+
+  #saha_inputs = (x_H, dxH_dz, x_He, dxHe_dz)
+  #saha_inputs = [spline_interpolation(jnp.log(a), jnp.log(dxHe_dz+threshold).T), spline_interpolation(jnp.log(a), jnp.log(dxH_dz+threshold).T)]
+  saha_inputs = [dxH_func, dxHe_func]
+  
+  """jax.debug.print("Comparison {a}={b}", a=jnp.log(dxHe_dz+threshold), b=saha_inputs[0]._y_)
+  
+  aidx = jnp.arange(len(a))
+  jax.debug.print("a = {a}, aidx={aidx}, dxHe_dz = {dxHe_dz}",a=a, aidx=aidx, dxHe_dz=dxHe_dz[0])
+  jax.debug.print("stack = {s}",s=jnp.stack([a, aidx,dxHe_dz[0]],axis=1))
+  jax.debug.print("\n\n")
+  def debug_eval(aval):
+
+    x_new = jnp.atleast_1d(jnp.log(aval))
+    x_new = x_new.reshape(x_new.shape[0], -1) # Extend last dimension if not already done
+    idx = saha_inputs[0]._find_index(x_new)
+    xidx = jnp.take_along_axis(saha_inputs[0]._x_, idx, axis=0)
+    yidx = jnp.take_along_axis(saha_inputs[0]._y_, idx, axis=0)
+    dx = jnp.exp(saha_inputs[0].evaluate(jnp.log(aval)))-threshold
+    jax.debug.print("At a={a}, idx={idx}, dx={dx},  xclose={xidx},yclose={yidx}, yclose_traf={ytraf}", a=aval, idx=idx, dx=dx, xidx=xidx, yidx=yidx, ytraf=jnp.exp(yidx)-threshold)
+    return dx
+
+  avals = jnp.geomspace(1e-10, 1, num=1000)
+  results = jax.vmap(debug_eval)(avals)
+  
+  jax.debug.print("\n\n")
+  #a_spec = 1.71506123e-04
+  #jax.debug.print("Final eval at a={a}, dx={dx}",a=a_spec, dx=jnp.exp(saha_inputs[0].evaluate(jnp.log(a_spec)))-threshold)
+  """
+
+  # SECOND POINT OF ORDER : DETERMINE SHAPE!!
   astart = a0
   aend = a1
   zstart = 1.0/astart - 1.0
-  import jax.tree_util as jtu
-  xH_ini = jnp.array([1.0])
-  xHe_ini = jnp.array([1.0])
+
+  #xH_ini = x_H[:, 0]
+  #xHe_ini = x_He[:, 0]
   T_ini = Tcmb*(1.0 + zstart)
+  #print(xH_ini, xHe_ini)
   y0 = jnp.stack(jnp.broadcast_arrays(xH_ini, xHe_ini, T_ini), axis=1)
+  #print(y0.shape, xH_ini.shape, xHe_ini.shape, T_ini.shape)
   
-  dy0 = jax.eval_shape(ionization, astart, y0, (param,))
+  #rint(param, saha_inputs)
+  ionization_partial = partial(ionization, compute_xH_fn=dxH_func, compute_xHe_fn=dxHe_func)
+  dy0 = jax.eval_shape(ionization_partial, astart, y0, (param,))
   y0 = jnp.broadcast_to(y0, dy0.shape)
 
+  #return a.reshape(len(a),1,1), a.reshape(len(a),1,1), a
   sol =drx.diffeqsolve(
-      terms=drx.ODETerm(ionization),
+      terms=drx.ODETerm(ionization_partial),
       solver=drx.Dopri5(),#GRKT4(),
-      t0=astart,
-      t1=aend,
-      dt0=jnp.abs(astart*1e-3),
+      t0=jnp.log(astart),
+      t1=jnp.log(aend),
+      dt0=jnp.log(aend/astart)*1e-3,#jnp.abs(astart*1e-3),
       y0=y0,
-      stepsize_controller = drx.PIDController(rtol=rtol,atol=atol), 
+      #stepsize_controller = drx.PIDController(rtol=rtol,atol=atol, dtmax=0.01), 
+      stepsize_controller = drx.PIDController(rtol=rtol,atol=atol, dtmax=0.1), 
       #max_steps=max_steps,
-      args=(param,),
+      args=(param,saha_inputs),
       # adjoint=drx.RecursiveCheckpointAdjoint(),
       #adjoint=drx.ForwardMode(),
       #adjoint=drx.ImplicitAdjoint(),
@@ -489,7 +627,9 @@ def compute_thermal_history( *, a0 : float, a1 : float, N : int, rtol : float = 
       saveat=drx.SaveAt(dense=True)
   )
 
-  return jax.vmap(sol.evaluate)(a), jax.vmap(sol.derivative)(a), a
+
+  #jax.debug.print("ys = {v} \n , dys = {dv}",v=jax.vmap(sol.evaluate)(jnp.log(a)), dv=jax.vmap(sol.derivative)(jnp.log(a)))
+  return jax.vmap(sol.evaluate)(jnp.log(a)), jax.vmap(sol.derivative)(jnp.log(a)), a
 
 
 @partial(jax.jit, static_argnames=("num_thermo",))
@@ -516,9 +656,9 @@ def evaluate_thermo( *, param : dict, num_thermo = 2048 ) -> jax.Array:
     a_broadcasted = jnp.broadcast_to(a[:, None], (1025, 5))
     val, vjp_fun = jax.vjp(lambda x: Saha_HeII(x, param), a_broadcasted)
     dxHeIIda = vjp_fun(jnp.ones_like(val))[0]
-    print(dxHeIIda.shape)
+
     dTmda    = y[:, :, 2]
-    print(Tm.shape, a[:, None].shape, dTmda.shape)
+
     daTmda   = Tm + a[:, None] * dTmda
     cs2      = const_kB/ const_mH / const_c**2 / mu * Tm * (4 - daTmda / (Tm)) /3
     dxeda = (dxeHIda + param['fHe'] * dxeHeIda + dxHeIIda)

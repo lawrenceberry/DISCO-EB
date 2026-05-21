@@ -25,7 +25,7 @@ class spline_interpolation(object):
         """
         # If xin or yin is passed as 1d, promote to 2d with dummy index
         xin = xin.reshape(xin.shape[0], -1)
-        yin = yin.reshape(xin.shape[0], -1)
+        yin = yin.reshape(yin.shape[0], -1)
 
         # filter out NaNs at end of arrays
         def _fill_forward( last_observed_yi, yi, fac ):
@@ -36,7 +36,6 @@ class spline_interpolation(object):
         n = yin.shape[0]
         _, y = jax.lax.scan(lambda c,v: _fill_forward(c,v,1.0), yin[0], yin)
         _, x = jax.lax.scan(lambda c,v: _fill_forward(c,v,1.01), xin[0], xin)
-
         
         if n < 2:
             raise ValueError("There must be at least two data points.")
@@ -47,7 +46,7 @@ class spline_interpolation(object):
         # Compute the second derivatives S at the knots using a Thomas algorithm.
         m = n - 2  # number of interior points
         #B = jnp.maximum(y.shape[1], x.shape[1]) # number of batch dimensions
-        y = y + x[0:1, :] * 0.0 # Broadcast shapes without explicitly finding out shapes
+        y = y + jnp.zeros((1, x.shape[1])) # Broadcast shapes without explicitly finding out shapes
         B = y.shape[1]
         Bx = x.shape[1]
         if m > 0:
