@@ -245,6 +245,31 @@ def spherical_bessel(lmax, x, niterfrac=8):
     
     return jnp.stack([sj, dj], axis=1)
 
+def root_find_bisect_nocond(*, func, xleft, xright, numit, param):
+    """
+    Vectorized bisection routine optimized for GPU execution.
+    Accepts arrays for xleft, xright, and param.
+    """
+    for i in range(numit):
+        xmid = 0.5 * (xleft + xright)
+        
+        # Evaluate the function at the midpoints and left bounds
+        f_mid = func(xmid, param)
+        f_left = func(xleft, param)
+        
+        # Vectorized condition check (produces a boolean array of shape (1, 5))
+        condition = (f_mid * f_left) > 0.0
+        
+        # Element-wise updating using jnp.where
+        # If true: replace xleft with xmid. If false: keep xleft.
+        xleft_next = jnp.where(condition, xmid, xleft)
+        # If true: keep xright. If false: replace xright with xmid.
+        xright_next = jnp.where(condition, xright, xmid)
+        
+        xleft, xright = xleft_next, xright_next
+
+    return 0.5 * (xleft + xright)
+ 
 
 def root_find_bisect( *, func, xleft, xright, numit, param ):
   """
