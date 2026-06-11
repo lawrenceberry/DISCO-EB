@@ -643,25 +643,30 @@ def evaluate_thermo( *, param : dict, num_thermo = 2048 ) -> jax.Array:
 
     # extract the relevant quantities from the solution
     xeHI      = y[:, :, 0]
-    xeHeI     = y[:, :, 1]
-    xeHeII    = Saha_HeII(a, param)
-    xe        = xeHI + param['fHe'] * xeHeI + xeHeII
+    xHe       = y[:, :, 1]
+    #xeHeI     = y[:, :, 1]
+    #xeHeII    = Saha_HeII(a, param)
+    # val_HeII = Saha(T_z, z, Nnow, *Saha_inputs['HeII'])
+    #xe        = xeHI + param['fHe'] * xeHeI + xeHeII
+    xe        = xeHI + param['fHe'] * xHe
     mu        = 1/(1 + (1/const_mHe_mH-1) * param['YHe'] + (1-param['YHe']) * xe)
     Tm        = y[:, :, 2]
 
     # extract the derivatives that were also computed, which allows to compute cs2 and dxedtau
-    dxeHIda  = y[:, :, 0]
-    dxeHeIda = y[:, :, 1]
+    dxeHIda  = dy[:, :, 0]
+    #dxeHeIda = y[:, :, 1]
+    dxeHeda = dy[:, :, 1]
 
-    a_broadcasted = jnp.broadcast_to(a[:, None], (1025, 5))
-    val, vjp_fun = jax.vjp(lambda x: Saha_HeII(x, param), a_broadcasted)
-    dxHeIIda = vjp_fun(jnp.ones_like(val))[0]
+    #a_broadcasted = jnp.broadcast_to(a[:, None], (1025, 5))
+    #val, vjp_fun = jax.vjp(lambda x: Saha_HeII(x, param), a_broadcasted)
+    #dxHeIIda = vjp_fun(jnp.ones_like(val))[0]
 
-    dTmda    = y[:, :, 2]
+    dTmda    = dy[:, :, 2]
 
     daTmda   = Tm + a[:, None] * dTmda
     cs2      = const_kB/ const_mH / const_c**2 / mu * Tm * (4 - daTmda / (Tm)) /3
-    dxeda = (dxeHIda + param['fHe'] * dxeHeIda + dxHeIIda)
+    #dxeda = (dxeHIda + param['fHe'] * dxeHeIda + dxHeIIda)
+    dxeda = (dxeHIda + param['fHe'] * dxeHeda)
     #from .background import dadtau, dtauda_
     #dxedtau  = (dxeHIda + param['fHe'] * dxeHeIda + dxHeIIda) * dadtau(a=a, param=param)
 
