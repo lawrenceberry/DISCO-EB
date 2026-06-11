@@ -124,15 +124,17 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
         return jnp.ravel(x)[0]
     def take_idx(x):
       return jnp.take(x, idx, mode="wrap")
+
     rsa_settings = get_approximation_settings(param)
-    use_tca = rsa_settings['use_tca']
-    tca_tau_c_over_tau_h_trigger = rsa_settings['tca_tau_c_over_tau_h_trigger']
-    tca_tau_c_over_tau_k_trigger = rsa_settings['tca_tau_c_over_tau_k_trigger']
-    use_rsa = rsa_settings['use_rsa']
-    tau_c_over_tau_trigger = rsa_settings['tau_c_over_tau_trigger']
-    tau_over_tau_k_trigger = rsa_settings['tau_over_tau_k_trigger']
-    use_ur_fluid = rsa_settings['use_ur_fluid']
-    ur_fluid_tau_over_tau_k_trigger = rsa_settings['ur_fluid_tau_over_tau_k_trigger']
+    use_tca = to_scalar(rsa_settings['use_tca'])
+    tca_tau_c_over_tau_h_trigger = to_scalar(rsa_settings['tca_tau_c_over_tau_h_trigger'])
+    tca_tau_c_over_tau_k_trigger = to_scalar(rsa_settings['tca_tau_c_over_tau_k_trigger'])
+    use_rsa = to_scalar(rsa_settings['use_rsa'])
+    tau_c_over_tau_trigger = to_scalar(rsa_settings['tau_c_over_tau_trigger'])
+    tau_over_tau_k_trigger = to_scalar(rsa_settings['tau_over_tau_k_trigger'])
+    use_ur_fluid = to_scalar(rsa_settings['use_ur_fluid'])
+    ur_fluid_tau_over_tau_k_trigger = to_scalar(rsa_settings['ur_fluid_tau_over_tau_k_trigger'])
+    #jax.debug.print("TCA = {tca}. RSA = {rsa}, UR = {ur}", tca=use_tca, rsa=use_rsa, ur=use_ur_fluid)
 
     y = jnp.ravel(y)
     tau = to_scalar(tau)
@@ -288,6 +290,7 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
             ),
         ),
     )
+
     #tauc    = 1. / opac
     #taucprime = tauc * (2*aprimeoa - xeprime/xe)
     #F       = tauc / (1+pb43) #CLASS perturbations.c:10072
@@ -332,6 +335,7 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     deltar_eff = jnp.where(do_relativistic_sa, deltar_rsa, deltar)
     thetar_eff = jnp.where(do_relativistic_sa, thetar_rsa, thetar)
     shearr_eff = jnp.where(do_relativistic_sa, shearr_rsa, shearr)
+
     dgpres = take_idx(
         (param['grhog'] * deltag_eff + param['grhor'] * param['Neff'] * deltar_eff) / a**2 / 3.0 
         + param['grhor'] * param['Nmnu'] * dpnu / a**2 
@@ -352,6 +356,7 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     
 
     f = f.at[1].set( dahprimedtau )
+    
 
     # ... force energy conservation
     hprime_full = to_scalar((2.0 * kmode**2 * eta + dgrho) / aprimeoa)
@@ -376,6 +381,7 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     deltabprime = -thetab - 0.5 * hprime
     f = f.at[idxb+0].set( deltabprime )
     # ... baryon velocity, BLT11 eq. (2.1b)
+
     thetabprime = -aprimeoa * thetab + kmode**2 * cs2 * deltab \
                 + pb43 * opac * (thetag_eff - thetab)
     f = f.at[idxb+1].set( thetabprime )
@@ -541,6 +547,13 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
         -(1-3*cs2_Q)*aprimeoa*thetaq + cs2_Q/(1+w_Q) * kmode**2 * deltaq
     )
 
+    #f_norm = jnp.linalg.norm(f)
+    #jax.lax.cond(
+    #   f_norm > 1e5,
+    #   lambda: jax.debug.callback(lambda t,norm, y:print(f"⚠️ Crisis at t={t} | dy norm: {norm} | y: {y}"), a, f_norm, y),
+    #   lambda: None
+    #)
+    #jax.debug.print("a={a} -> in = {y}, out = {f}", a=a, y=y, f=f)
     #print("Inside ODE:",y.shape, f.shape)
     return f.flatten()
     #return f
@@ -1152,7 +1165,8 @@ def convert_to_output_variables(*, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu
         deltanu, thetanu / aprimeoa,        # 16-17
         deltaq,  thetaq  / aprimeoa,        # 18-19
     ])
-            
+    
+                
     return yout
 
 
@@ -1171,11 +1185,26 @@ def adiabatic_ics_one_mode( *, tau: float|Array, param, kmode, nvar, lmaxg, lmax
     # .. isentropic ("adiabatic") initial conditions
     rhom  = param['grhom'] * param['Omegam'] / a**3
     rhor  = (param['grhog'] + param['grhor'] * (param['Neff'] + param['Nmnu']*jnp.exp(param['logrhonu_of_loga_spline'].evaluate(jnp.log(a))))) / a**4
+
+    ##jax.debug.print("rhor = {rhor} ! {grhog}, {grhor}", rhor=rhor, grhog=param['grhog'], grhor=param['grhor'])
     rhonu = param['grhor'] * (param['Neff'] + param['Nmnu']*jnp.exp(param['logrhonu_of_loga_spline'].evaluate(jnp.log(a)))) / a**4
+
+    ##jax.debug.print("nu = {rhonu} ! {grhor}, {Neff}, {Nmnu}, {logrhonu_spline}, {a}", rhonu=rhonu, grhor=param['grhor'], Neff=param['Neff'], Nmnu=param['Nmnu'], logrhonu_spline=param['logrhonu_of_loga_spline'].evaluate(jnp.log(a)), a=a)
 
     fracb  = param['Omegab'] / param['Omegam']
     fracg  = param['grhog'] / rhor
     fracnu = rhonu / rhor
+    
+    #jax.debug.print("fracnu = {fracnu} ! {rhor}, {rhonu}", fracnu=fracnu, rhonu=rhonu, rhor=rhor)
+    
+    #def print_callback(arg):
+    #  fracnu, rhor, rhonu = arg
+    #  print(f"ACTUAL VALUES:\nfracnu={fracnu}\nrhor={rhor}\nrhonu={rhonu}\n")
+    #  print(f"TYPES: fracnu={fracnu.dtype}, rhor={rhor.dtype}")
+
+    # This safely hooks into JAX's execution pipeline, ignoring tracers
+    #jax.debug.callback(print_callback, (fracnu, rhor, rhonu))
+
 
     om    = a * rhom / jnp.sqrt(rhor)
     
@@ -1212,6 +1241,7 @@ def adiabatic_ics_one_mode( *, tau: float|Array, param, kmode, nvar, lmaxg, lmax
 
     # metric
     eta = curvature_ini * (1-(kmode*tau)**2/12/(15+4*fracnu)*(5+4*s2_squared*fracnu - (16*fracnu*fracnu+280*fracnu+325)/10/(2*fracnu+15)*tau*om))
+    #jax.debug.print("initial condition eta = {eta} ! -> {kmode}, {curvature_ini}, {tau}, {fracnu}, {s2_squared}, {om}", eta=eta, kmode=kmode, curvature_ini=curvature_ini, tau=tau, fracnu=fracnu, s2_squared=s2_squared, om=om)
 
     ahprime = jnp.zeros(deltag.shape) # will not be evolved, only constraint
 
@@ -1266,7 +1296,7 @@ def adiabatic_ics_one_mode( *, tau: float|Array, param, kmode, nvar, lmaxg, lmax
     #print((-dlfdlq * thetan / v / kmode / 3.0).shape)
     #print((-0.5 * dlfdlq * shearn).shape)
     #print([(x.shape if hasattr(x,'shape') else None) for x in [deltaq, thetaq] ])
-    
+
     block1 = jnp.vstack([a, ahprime, eta, deltac, thetac, deltab, thetab, deltag, thetag])
     block2 = jnp.zeros((1+lmaxg+lmaxgp,1))
     block3 = jnp.vstack([deltar, thetar, shearr * 2.0])
@@ -1284,6 +1314,9 @@ def adiabatic_ics_one_mode( *, tau: float|Array, param, kmode, nvar, lmaxg, lmax
     blocks_aligned = [jnp.broadcast_to(b, (b.shape[0], ymax)) if b.shape[1]!=ymax else b for b in blocks]
 
     y = jnp.concatenate(blocks_aligned, axis=0)
+    
+    
+    #jax.debug.print("initial condition = {y} !", y=y)
     
     return y
 
@@ -1414,13 +1447,16 @@ def evolve_one_mode( *, tau_max, tau_out, param, kmode,
         print(t0.shape, t1.shape, y0.shape, kmode.shape, idx.shape)
         return drx.diffeqsolve(
             terms=model,
-            solver=Rodas5Transformed(),
+            #solver=Rodas5Transformed(),
+            solver=drx.Kvaerno5(),
             t0=t0.squeeze(),
             t1=t1.squeeze(),
             dt0=jnp.minimum(t0/4, 0.5*(t1-t0)).squeeze(),
             y0=y0,
             #saveat=saveat,
-            saveat = drx.SaveAt(dense=True),
+            throw=False,
+            saveat = drx.SaveAt(steps=True, dense=True),
+            #saveat = drx.SaveAt(dense=True),
             stepsize_controller = drx.PIDController(rtol=rtol, atol=atol, norm=lambda t:rms_norm_filtered(t,jnp.array([0,2,3,5,6,7]), jnp.array([1,kmode**2,1,1,1/kmode**2,1])),
                                                     pcoeff=pcoeff, icoeff=icoeff, dcoeff=dcoeff, factormax=factormax, factormin=factormin),
             # default controller has icoeff=1, pcoeff=0, dcoeff=0
@@ -1436,12 +1472,17 @@ def evolve_one_mode( *, tau_max, tau_out, param, kmode,
     # 2. Stack them into a unified PyTree layout
     #saveat = jax.tree_util.tree_stack(saveat_list)
     #sol = DEsolve_implicit( model=modelX, t0=jnp.min(tau_start), t1=jnp.max(tau_max), y0=y0, saveat=saveat, kmode=kmode )
+    print("Y0 shape = ",y0.shape)
     sol_fn = jax.vmap(DEsolve_implicit, in_axes=(None, 1, 0, 1, None, 0))
     #print(tau_start.shape, tau_max.shape, y0.shape,  kmode.shape, jnp.arange(y0.shape[1]).shape)
     sol = sol_fn(modelX, tau_start, tau_max, y0, kmode, jnp.arange(y0.shape[1]))
 
     print(sol)
-    
+    first_nan_idx = jnp.argmax(jnp.isinf(sol.ts))
+    last_valid_idx = first_nan_idx - 1
+    jax.debug.print("Stalled at time t = {t}", t=sol.ts[last_valid_idx])
+    jax.debug.print("State right before failure: {y}", y=jax.tree_util.tree_leaves(sol.ys)[0][last_valid_idx])
+
     print(tau_out.shape)
     extracted_ys = jax.vmap(
       lambda s, t_grid: jax.vmap(s.evaluate)(t_grid), 
