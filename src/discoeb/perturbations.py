@@ -169,6 +169,8 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
 
     # ... metric
     a = y[0]
+    a = jnp.where(a<1e-8,1e-8,a)
+    a = jnp.where(a>1.1,1.1,a)
     loga = jnp.log(a)
 
     #ahprime = y[1]
@@ -204,7 +206,10 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
 
     # Use pre-composed splines for direct log(a) lookup (performance optimization)
     cs2     = take_idx(param['cs2a_of_loga_spline'].evaluate( loga )) / a
-    xe      = take_idx(param['xe_of_loga_spline'].evaluate( loga ))
+    #xe      = take_idx(param['xe_of_loga_spline'].evaluate( loga ))
+    xe      = take_idx(param['xe_of_tau_spline'].evaluate( tau ))
+    
+    #jax.debug.print("XE = {xe} | {xe2} (tau={tau},a={a})",xe=param['xe_of_loga_spline'].evaluate( loga ), xe2=param['xe_of_tau_spline'].evaluate( tau ), tau=tau, a=a)
     
     # ... Photon mass density over baryon mass density
     photbar = take_idx( param['grhog'] / (param['grhom'] * param['Omegab'] * a))
@@ -251,6 +256,11 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
 
     # ... Thomson opacity
     opac    = take_idx(xe * akthom / a**2)
+    opac = jnp.clip(opac, 0, 1e3)
+    #jax.lax.cond(kmode>0.001548,
+    #  lambda :jax.debug.print("OPAC = {opac} (a={a}, xe={xe}, akthom={akthom})", a=a, xe=take_idx(xe), akthom=akthom, opac=opac),
+    #  lambda:None
+    #  )
     tauc    = take_idx(1. / jnp.maximum(opac, 1e-30))
     taucprime = take_idx(tauc * (2 * aprimeoa - xeprime / jnp.maximum(xe, 1e-30)))
     tauh = take_idx(1.0 / jnp.maximum(aprimeoa, 1e-30))
@@ -384,6 +394,7 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
 
     thetabprime = -aprimeoa * thetab + kmode**2 * cs2 * deltab \
                 + pb43 * opac * (thetag_eff - thetab)
+    thetabprime = jnp.where(thetabprime > 1e10, 1e10, thetabprime)
     f = f.at[idxb+1].set( thetabprime )
 
     # --- photon equations of motion, MB95 eqs. (63) ---------------------------------------------
@@ -404,11 +415,14 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
         # ... photon shear, BLT11 eq. (2.4c)
         sheargprime = 8./15. * (thetag_eff+kmode**2*alpha) -3/5*kmode*s_l3/s_l2*y[idxg+3] \
                     - opac*(y[idxg+2]-0.1*s_l2*polter)
+        sheargprime = jnp.where(jnp.abs(sheargprime)>1e10, 1e10, sheargprime)
         f_in = f_in.at[idxg+2].set( sheargprime )
 
         #... photon temperature l>=3, BLT11 eq. (2.4d)
         ell  = jnp.arange(3, lmaxg )
-        f_in = f_in.at[idxg+ell].set( kmode  / (2 * ell + 1) * (ell * y[idxg+ell-1] - (ell + 1) * y[idxg+ell+1]) - opac * y[idxg+ell] )
+        res = kmode  / (2 * ell + 1) * (ell * y[idxg+ell-1] - (ell + 1) * y[idxg+ell+1]) - opac * y[idxg+ell]
+        res = jnp.where(jnp.abs(res) > 1e10, 1e10, res)
+        f_in = f_in.at[idxg+ell].set( res )
         # photon temperature hierarchy truncation, BLT11 eq. (2.5)
         f_in = f_in.at[idxg+lmaxg].set( kmode * y[idxg+lmaxg-1] - (lmaxg + 1) / tau * y[idxg+lmaxg] - opac * y[idxg+lmaxg] )
 
@@ -547,7 +561,6 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
         -(1-3*cs2_Q)*aprimeoa*thetaq + cs2_Q/(1+w_Q) * kmode**2 * deltaq
     )
 
-    #f_norm = jnp.linalg.norm(f)
     #jax.lax.cond(
     #   f_norm > 1e5,
     #   lambda: jax.debug.callback(lambda t,norm, y:print(f"⚠️ Crisis at t={t} | dy norm: {norm} | y: {y}"), a, f_norm, y),
@@ -555,6 +568,9 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     #)
     #jax.debug.print("a={a} -> in = {y}, out = {f}", a=a, y=y, f=f)
     #print("Inside ODE:",y.shape, f.shape)
+    #worst_index = jnp.argmax(jnp.abs(f))
+    #worst_value = f[worst_index]
+    #jax.debug.print("a={a:.2e} , tau = {tau:.2e}, -> norm={m}  < worst = {i}, w={w}", tau=tau,a=a,m=jnp.linalg.norm(f), i=worst_index, w=worst_value)
     return f.flatten()
     #return f
 
@@ -1454,8 +1470,10 @@ def evolve_one_mode( *, tau_max, tau_out, param, kmode,
             dt0=jnp.minimum(t0/4, 0.5*(t1-t0)).squeeze(),
             y0=y0,
             #saveat=saveat,
-            throw=False,
-            saveat = drx.SaveAt(steps=True, dense=True),
+
+            ##########throw=False, ## HERE HERE HERE
+            
+            saveat = drx.SaveAt(dense=True),
             #saveat = drx.SaveAt(dense=True),
             stepsize_controller = drx.PIDController(rtol=rtol, atol=atol, norm=lambda t:rms_norm_filtered(t,jnp.array([0,2,3,5,6,7]), jnp.array([1,kmode**2,1,1,1/kmode**2,1])),
                                                     pcoeff=pcoeff, icoeff=icoeff, dcoeff=dcoeff, factormax=factormax, factormin=factormin),
@@ -1473,15 +1491,16 @@ def evolve_one_mode( *, tau_max, tau_out, param, kmode,
     #saveat = jax.tree_util.tree_stack(saveat_list)
     #sol = DEsolve_implicit( model=modelX, t0=jnp.min(tau_start), t1=jnp.max(tau_max), y0=y0, saveat=saveat, kmode=kmode )
     print("Y0 shape = ",y0.shape)
+
     sol_fn = jax.vmap(DEsolve_implicit, in_axes=(None, 1, 0, 1, None, 0))
     #print(tau_start.shape, tau_max.shape, y0.shape,  kmode.shape, jnp.arange(y0.shape[1]).shape)
     sol = sol_fn(modelX, tau_start, tau_max, y0, kmode, jnp.arange(y0.shape[1]))
 
-    print(sol)
-    first_nan_idx = jnp.argmax(jnp.isinf(sol.ts))
-    last_valid_idx = first_nan_idx - 1
-    jax.debug.print("Stalled at time t = {t}", t=sol.ts[last_valid_idx])
-    jax.debug.print("State right before failure: {y}", y=jax.tree_util.tree_leaves(sol.ys)[0][last_valid_idx])
+    #print(sol)
+    #first_nan_idx = jnp.argmax(jnp.isinf(sol.ts))
+    #last_valid_idx = first_nan_idx - 1
+    #jax.debug.print("Stalled at time t = {t}", t=sol.ts[last_valid_idx])
+    #jax.debug.print("State right before failure: {y}", y=jax.tree_util.tree_leaves(sol.ys)[0][last_valid_idx])
 
     print(tau_out.shape)
     extracted_ys = jax.vmap(

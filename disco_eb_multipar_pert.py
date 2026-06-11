@@ -32,6 +32,8 @@ from discoeb.perturbations import evolve_perturbations
 
 from discoeb.background import evolve_background
 
+from discoeb.perturbations import model_synchronous
+
 
 # In[4]:
 
@@ -59,7 +61,8 @@ param['mnu']     = 0.06              # Sum of neutrino masses in eV
 param['k_p']     = 0.05              # Pivot scale in 1/Mpc
 
 # modes to sample
-nmodes = 512                         # number of modes to sample
+#nmodes = 512                         # number of modes to sample
+nmodes=20
 kmin   = 1e-4                        # minimum k in 1/Mpc
 kmax   = 1.0                          # maximum k in 1/Mpc
 
@@ -94,11 +97,12 @@ yout, kmodes, param = evolve_perturbations(
     return_full=True,
     k_sampling_method='log', # use log spacing
     lmaxnu=12,
-    #max_steps = 8196
-    max_steps = 1024
+    max_steps = 8196
+    #max_steps = 1024
 )
 
 
+quit()
 # # Full mode debugging  
 
 # In[25]:
@@ -142,8 +146,25 @@ def get_perturbations( param, kmin, kmax, nmodes ):
 
 # In[26]:
 
-
-nmodes = 512                         # number of modes to sample
+param = {}
+# OmegaDE is inferred since flatness is assumed currently
+param['Omegam']  = jnp.linspace(0.3, 0.3099, num=Npar)            # Total matter density parameter
+param['Omegab']  = jnp.linspace(0.04, 0.0488911, num=Npar)         # Baryon density parameter
+param['w_DE_0']  = -0.99             # Dark energy equation of state parameter today
+param['w_DE_a']  = 0.0               # Dark energy equation of state parameter time derivative
+param['cs2_DE']  = 1.0               # Dark energy sound speed squared
+param['Omegak']  = 0.0
+param['A_s']     = 2.1064e-09        # Scalar amplitude of the primordial power spectrum
+param['n_s']     = 0.96822           # Scalar spectral index
+param['H0']      = 67.742            # Hubble constant today in units of 100 km/s/Mpc
+param['Tcmb']    = 2.7255            # CMB temperature today in K
+param['YHe']     = 0.248             # Helium mass fraction
+param['Neff']    = 2.046             # Effective number of ultrarelativistic neutrinos
+                                      # -1 if massive neutrino present
+param['Nmnu']    = 1                 # Number of massive neutrinos (must be 1 currently)
+param['mnu']     = 0.06              # Sum of neutrino masses in eV 
+param['k_p']     = 0.05              # Pivot scale in 1/Mpc
+nmodes = 20#512                         # number of modes to sample
 kmin   = 1e-4                        # minimum k in 1/Mpc
 kmax   = 1.0                          # maximum k in 1/Mpc
 
