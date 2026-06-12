@@ -279,8 +279,8 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
         param['tempba_of_tau_spline'] = spline_interpolation( tau, aexp[:,None]*Tm )
 
         # Pre-composed splines for direct a-to-quantity lookups (performance optimization)
-        param['xe_of_loga_spline']    = spline_interpolation( jnp.log(aexp), xe , uniform = True)
-        param['cs2a_of_loga_spline']  = spline_interpolation( jnp.log(aexp), aexp[:,None]*cs2 , uniform = True)
+        param['xe_of_loga_spline']    = spline_interpolation( jnp.log(aexp), xe , uniform = False)
+        param['cs2a_of_loga_spline']  = spline_interpolation( jnp.log(aexp), aexp[:,None]*cs2 , uniform = False)
 
     elif thermo_module == 'MB95':
 
