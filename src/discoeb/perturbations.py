@@ -205,7 +205,7 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     # xe      = param['xe_of_tau_spline'].evaluate( tau )
 
     # Use pre-composed splines for direct log(a) lookup (performance optimization)
-    cs2     = take_idx(param['cs2a_of_loga_spline'].evaluate( loga )) / a
+    cs2     = take_idx(param['cs2a_of_tau_spline'].evaluate( tau )) / a
     #xe      = take_idx(param['xe_of_loga_spline'].evaluate( loga ))
     xe      = take_idx(param['xe_of_tau_spline'].evaluate( tau ))
     
@@ -1493,7 +1493,7 @@ def evolve_one_mode( *, tau_max, tau_out, param, kmode,
     print("Y0 shape = ",y0.shape)
 
     sol_fn = jax.vmap(DEsolve_implicit, in_axes=(None, 1, 0, 1, None, 0))
-    #print(tau_start.shape, tau_max.shape, y0.shape,  kmode.shape, jnp.arange(y0.shape[1]).shape)
+    print(tau_start.shape, tau_max.shape, y0.shape,  kmode.shape, jnp.arange(y0.shape[1]).shape)
     sol = sol_fn(modelX, tau_start, tau_max, y0, kmode, jnp.arange(y0.shape[1]))
 
     #print(sol)
@@ -1772,6 +1772,7 @@ def evolve_perturbations( *, param, aexp_out, kmin : float, kmax : float, num_k 
         if 'tau_maxvis' not in param:
             raise ValueError("param dictionary must contain 'tau_maxvis' for 'camb' k-sampling.")
         taurst = param['tau_maxvis']
+        taurst = taurst.mean()
         
         # Simplified CAMB-like sampling
         q_switch1 = 8.0 / taurst
@@ -1933,8 +1934,8 @@ def evolve_perturbations_batched( *, param, aexp_out, kmin : float, kmax : float
     
     return y1, kmodes, param
 
-@partial(jax.jit, static_argnames=('lmaxg', 'lmaxgp', 'lmaxr', 'lmaxnu', 'nqmax'))
-def compute_time_derivatives(yout, tau, kmodes, param, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax):
+@partial(jax.jit, static_argnames=('lmaxg', 'lmaxgp', 'lmaxr', 'lmaxnu', 'nqmax', 'idxcosmo'))
+def compute_time_derivatives(yout, tau, kmodes, param, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax, idxcosmo):
     """Compute time derivatives by re-evaluating the ODE system.
 
     This function computes dy/dτ by re-evaluating the synchronous gauge
@@ -1995,7 +1996,8 @@ def compute_time_derivatives(yout, tau, kmodes, param, lmaxg, lmaxgp, lmaxr, lma
                 lmaxgp=lmaxgp,
                 lmaxr=lmaxr,
                 lmaxnu=lmaxnu,
-                nqmax=nqmax
+                nqmax=nqmax,
+                idx=idxcosmo
             )
         )(idxtau)
     )(idxk)

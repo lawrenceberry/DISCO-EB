@@ -272,6 +272,7 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
         param['Tm'] = Tm
 
         tau = spline_interpolation(jnp.log(param['a']), param['tau']).evaluate(jnp.log(aexp))
+        param['tau_th'] = tau
         param['tau_of_a_spline']      = spline_interpolation( aexp, tau )
         param['a_of_tau_spline']      = spline_interpolation( tau, aexp )
         param['xe_of_tau_spline']     = spline_interpolation( tau, xe )
@@ -344,6 +345,7 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
     # xeprime = param['xe_of_tau_spline'].derivative( tau )
     # xepprime  = param['xe_of_tau_spline'].derivative2( tau )
     opac       = xe * akthom / aexp[:,None]**2
+
     opacspline = spline_interpolation( tau, opac, integrate_from_start=True)
     opacprime, opacpprime = opacspline.derivative12( tau )
 

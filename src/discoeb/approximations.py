@@ -8,6 +8,7 @@ from .background import get_aprimeoa
 
 def get_approximation_settings(param):
     """Return approximation configuration with defaults from parameter dictionary."""
+    
     return {
         'use_tca': param.get('use_tca', False),
         'tca_tau_c_over_tau_h_trigger': param.get('tca_tau_c_over_tau_h_trigger', 0.015),
@@ -88,7 +89,7 @@ def apply_rsa_state_projection(*, y, tau, kmode, param, lmaxg, lmaxgp, lmaxr, nq
         return jnp.ravel(x)[0]
 
     rsa_settings = get_approximation_settings(param)
-    use_rsa = rsa_settings['use_rsa']
+    use_rsa = to_scalar(rsa_settings['use_rsa'])
     tau_c_over_tau_trigger = rsa_settings['tau_c_over_tau_trigger']
     tau_over_tau_k_trigger = rsa_settings['tau_over_tau_k_trigger']
 
