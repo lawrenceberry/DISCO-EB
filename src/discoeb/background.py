@@ -18,23 +18,27 @@ Conventions
 
 Structure
 ---------
-The module is split into three layers:
+The module is split into two layers:
 
-1. **Scalar background primitives** -- small, dependency-free functions for LCDM cosmologies that
-   take explicit, well-defined arguments and are individually unit-tested against CLASS.
+1. **General background model** -- small, dependency-free *standard-Python*
+   functions (no JAX) that take explicit, well-defined arguments and cover the
+   full DISCO-EB model: radiation, matter, dynamical dark energy
+   (``w_0``/``w_a``), spatial curvature, and massive neutrinos. The
+   flat-LambdaCDM limit is recovered with the default keyword arguments, and is
+   unit-tested against CLASS. These functions use only Python operators and the
+   :mod:`math` module, so they are readable, portable, and easy to reason about.
 
-2. **Scalar model extensions** -- primitives for the additional physics that
-   DISCO-EB supports beyond flat LCDM: dynamical dark energy
-   (``w_0``/``w_a``), spatial curvature, and massive neutrinos.
-
-3. **Compatibility layer** -- the historical ``param``-dictionary API
-   (``evolve_background``, ``get_aprimeoa``, ``nu_background``, ...) used by the
-   thermodynamics, perturbation, and CMB modules. These functions are thin
-   wrappers that assemble the ``grho`` coefficients and call the scalar
-   primitives under the hood.
+2. **Compatibility layer** -- the historical ``param``-dictionary API
+   (``evolve_background``, ``get_aprimeoa``, ``nu_background``, ...) built on
+   JAX for the differentiable pipeline used by the thermodynamics, perturbation,
+   and CMB modules. It assembles the ``grho`` coefficients from ``param`` and
+   evaluates the general-model functions; because those use only Python
+   operators, they are equally valid on JAX arrays under ``jit``/``vmap``/``grad``.
 """
 
+import math
 from functools import partial
+
 import jax
 import jax.numpy as jnp
 
@@ -58,7 +62,13 @@ from .util import generalized_gauss_laguerre_weights, integrate_trapz
 
 
 # =============================================================================
-# 1. Scalar background primitives (flat LCDM w/ explicit arguments)
+# 1. General background model (standard Python, no JAX)
+#
+# A self-contained scalar description of the homogeneous background covering
+# radiation, matter, dynamical dark energy, spatial curvature, and massive
+# neutrinos. The flat-LambdaCDM limit is recovered by leaving the optional
+# keyword arguments (``grhok``, ``grhomnu``, ``rhonu``, ``rho_de``) at their
+# defaults. Everything here is plain Python (operators + :mod:`math`).
 # =============================================================================
 
 
@@ -97,6 +107,24 @@ def radiation_neutrino_factor(N_eff: float) -> float:
     return 7.0 / 8.0 * (4.0 / 11.0) ** (4.0 / 3.0) * N_eff
 
 
+# --- Density coefficients in CAMB ``grho`` units (1/Mpc^2) -------------------
+
+
+def critical_density_grho(H0: float) -> float:
+    """Return the critical-density coefficient ``grhom`` in CAMB ``grho`` units.
+
+    This normalizes the matter, dark-energy, and curvature contributions to the
+    Friedmann equation. With ``H0 = 100*h km/s/Mpc``,
+
+    ``grhom = 8*pi*G*rho_crit,0 / c^2 = 3*(H0/c)^2 = GRHO_CRITICAL_H2 * h^2``.
+
+    Numerically it reproduces the historical DISCO-EB literal
+    ``3.33795017e-11 * H0^2`` to ~1e-9 relative.
+    """
+
+    return GRHO_CRITICAL_H2 * (H0 / 100.0) ** 2
+
+
 def grhog(T_cmb: float) -> float:
     """Return the photon density coefficient in CAMB ``grho`` units.
 
@@ -123,6 +151,18 @@ def grhornomass(grhog: float, N_eff: float) -> float:
     """
 
     return grhog * radiation_neutrino_factor(N_eff)
+
+
+def neutrino_density_grho(T_cmb: float) -> float:
+    """Return the per-flavour neutrino density coefficient ``grhor``.
+
+    A single relativistic neutrino flavour contributes ``(7/8)*(4/11)^(4/3)``
+    times the photon density, so
+
+    ``grhor = grhog * (7/8) * (4/11)^(4/3) = grhornomass(grhog, N_eff=1)``.
+    """
+
+    return grhog(T_cmb) * radiation_neutrino_factor(1.0)
 
 
 def grhoc(omega_c_h2: float) -> float:
@@ -159,6 +199,9 @@ def grhov(
     ``Omega_Lambda = 1 - Omega_m - Omega_r``.
 
     Since ``rho_Lambda ~ a^0``, its contribution to ``grhoa4`` is ``grhov*a^4``.
+    For dynamical dark energy this coefficient is instead scaled by the density
+    ratio :func:`dark_energy_density_ratio` (see the ``rho_de`` argument of
+    :func:`grhoa4`).
     """
 
     omega_gamma = omega_gamma_h2(T_cmb)
@@ -167,102 +210,259 @@ def grhov(
     return GRHO_CRITICAL_H2 * (1.0 - omega_m - omega_r) * h**2
 
 
+def radiation_hubble_rate(
+    grhog: float, grhor: float, N_eff: float, N_mnu: float
+) -> float:
+    """Return the conformal Hubble rate ``a'/a`` deep in radiation domination.
+
+    In the radiation era all species are relativistic and ``grhoa4`` is
+    dominated by the constant photon + neutrino term ``grhog + grhor*(N_eff +
+    N_mnu)``. The scale factor then grows as ``a ~ adotrad * tau`` with
+
+    ``adotrad = sqrt((grhog + grhor*(N_eff + N_mnu)) / 3)``.
+    """
+
+    return ((grhog + grhor * (N_eff + N_mnu)) / 3.0) ** 0.5
+
+
+# --- Dark energy (CPL parametrization) --------------------------------------
+
+
+def dark_energy_density_ratio(a, w_DE_0, w_DE_a):
+    """Return the dark-energy density normalized to its present value.
+
+    For the CPL parametrization ``w(a) = w_0 + w_a (1 - a)`` the continuity
+    equation integrates to
+
+    ``rho_Q(a) / rho_Q(1) = a^{-3(1 + w_0 + w_a)} exp[3(a - 1) w_a]``.
+
+    For a cosmological constant (``w_0 = -1``, ``w_a = 0``) this reduces to
+    ``1``.
+    """
+
+    return a ** (-3.0 * (1.0 + w_DE_0 + w_DE_a)) * math.exp(3.0 * (a - 1.0) * w_DE_a)
+
+
+def dark_energy_equation_of_state(a, w_DE_0, w_DE_a):
+    """Return the dark-energy equation of state ``w(a) = w_0 + w_a (1 - a)``."""
+
+    return w_DE_0 + w_DE_a * (1.0 - a)
+
+
+# --- Massive neutrinos ------------------------------------------------------
+
+
+def massive_neutrino_density(a, amnu, q, w):
+    """Return the density and pressure ratios of one massive-neutrino flavour.
+
+    Evaluates, for a single scale factor ``a`` and mass parameter ``amnu``, the
+    momentum integrals of one massive-neutrino flavour in units of the mean
+    density of one massless flavour. With the dimensionless velocity
+
+    ``v(q) = 1 / sqrt(1 + (a amnu / q)^2)``,
+
+    the density, pressure, and pseudo-pressure ratios are
+
+    ``rho = sum_i w_i / v(q_i)``, ``p = sum_i w_i v(q_i) / 3``,
+    ``pp = sum_i w_i v(q_i)^3 / 3``.
+
+    Args:
+        a: scale factor (scalar).
+        amnu: neutrino mass in units of the neutrino temperature (scalar).
+        q, w: sequences of momentum bins and weights (e.g. from
+            :func:`get_neutrino_momentum_bins`).
+
+    Returns:
+        tuple[float, float, float]: ``rho_nu/rho_nu0``, ``p_nu/p_nu0``,
+        ``pp_nu/pp_nu0``.
+    """
+
+    rhonu = 0.0
+    pnu = 0.0
+    ppnu = 0.0
+    for qi, wi in zip(q, w):
+        v = 1.0 / (1.0 + (a * amnu / qi) ** 2) ** 0.5  # = (1/aq)/sqrt(1+1/aq**2)
+        rhonu += wi / v
+        pnu += wi * v / 3.0
+        ppnu += wi * v**3 / 3.0
+    return rhonu, pnu, ppnu
+
+
+# --- Friedmann quantities (full model) --------------------------------------
+
+
 def grhoa4(
-    a: float,
-    grhog: float,
-    grhornomass: float,
-    grhoc: float,
-    grhob: float,
-    grhov: float,
-) -> float:
-    """Return ``8*pi*G*rho_total(a) a^4`` for flat LCDM.
+    a,
+    grhog,
+    grhornomass,
+    grhoc,
+    grhob,
+    grhov,
+    *,
+    grhok=0.0,
+    grhomnu=0.0,
+    rhonu=1.0,
+    rho_de=1.0,
+):
+    """Return ``8*pi*G*rho_total(a) a^4`` for the general DISCO-EB model.
 
-    The flat-LCDM density terms are
+    Grouping species by their scaling with ``a`` (after the overall ``a^4``
+    factor),
 
-    ``rho_gamma ~ a^-4``, ``rho_nu ~ a^-4``, ``rho_matter ~ a^-3``, and
-    ``rho_Lambda ~ a^0``.
+    ``grhoa4 = grhog + grhornomass + grhomnu * rhonu   (radiation + neutrinos)``
+    ``       + (grhoc + grhob) a                        (matter,  rho ~ a^-3)``
+    ``       + grhok a^2                                (curvature, rho ~ a^-2)``
+    ``       + grhov rho_de a^4                         (dark energy)``.
 
-    Multiplying by ``a^4`` gives the polynomial
+    The required positional arguments reproduce the flat-``LambdaCDM``
+    polynomial ``grhog + grhornomass + (grhoc + grhob) a + grhov a^4``. The full
+    model is switched on through the keyword arguments:
 
-    ``grhoa4 = grhog + grhornomass + (grhoc + grhob) a + grhov a^4``.
+    * ``grhok = grhom * Omega_k`` -- spatial curvature.
+    * ``grhomnu = grhor * N_mnu`` with ``rhonu = rho_massive_nu(a) /
+      rho_massless_nu(a)`` from :func:`massive_neutrino_density` -- massive
+      neutrinos. Their relativistic contribution is already carried by
+      ``grhornomass``; ``grhomnu * rhonu`` adds the massive flavours.
+    * ``rho_de = rho_Q(a) / rho_Q(1)`` from :func:`dark_energy_density_ratio` --
+      dynamical dark energy (``rho_de = 1`` for a cosmological constant).
 
-    This is the quantity used by the Friedmann equation in the rest of this
-    module. The full DISCO-EB model (massive neutrinos, dynamical dark energy,
-    curvature) is handled by :func:`friedmann_grhoa4`.
+    The conformal expansion factor obeys ``a' = da/dtau = sqrt(grhoa4 / 3)``.
     """
 
-    return grhog + grhornomass + (grhoc + grhob) * a + grhov * a**4
-
-
-def dtau_da(
-    a: float,
-    grhog: float,
-    grhornomass: float,
-    grhoc: float,
-    grhob: float,
-    grhov: float,
-) -> float:
-    """Return the conformal-time derivative ``dtau/da`` for flat LCDM.
-
-    With ``c = 1``, conformal time obeys
-
-    ``dtau/da = 1 / (a^2 H(a))``.
-
-    Since ``H(a) = sqrt(grhoa4 / 3) / a^2``, the derivative simplifies to
-
-    ``dtau/da = sqrt(3 / grhoa4)``.
-    """
-
-    return (3.0 / grhoa4(a, grhog, grhornomass, grhoc, grhob, grhov)) ** 0.5
+    return (
+        grhog + grhornomass + grhomnu * rhonu
+        + (grhoc + grhob) * a
+        + grhok * a**2
+        + grhov * rho_de * a**4
+    )
 
 
 def hubble_a(
-    a: float,
-    grhog: float,
-    grhornomass: float,
-    grhoc: float,
-    grhob: float,
-    grhov: float,
-) -> float:
-    """Return the physical Hubble rate ``H(a)`` in Mpc^-1 for flat LCDM.
+    a,
+    grhog,
+    grhornomass,
+    grhoc,
+    grhob,
+    grhov,
+    *,
+    grhok=0.0,
+    grhomnu=0.0,
+    rhonu=1.0,
+    rho_de=1.0,
+):
+    """Return the physical Hubble rate ``H(a)`` in Mpc^-1.
 
-    The Friedmann equation is
-
-    ``H(a)^2 = 8*pi*G*rho_total / 3``.
-
-    Because ``grhoa4 = 8*pi*G*rho_total a^4``, this becomes
+    The Friedmann equation is ``H(a)^2 = 8*pi*G*rho_total / 3``. Because
+    ``grhoa4 = 8*pi*G*rho_total a^4``, this becomes
 
     ``H(a) = sqrt(grhoa4 / 3) / a^2``.
+
+    Accepts the same arguments as :func:`grhoa4`.
     """
 
-    return (grhoa4(a, grhog, grhornomass, grhoc, grhob, grhov) / 3.0) ** 0.5 / a**2
+    return (
+        grhoa4(a, grhog, grhornomass, grhoc, grhob, grhov,
+               grhok=grhok, grhomnu=grhomnu, rhonu=rhonu, rho_de=rho_de) / 3.0
+    ) ** 0.5 / a**2
+
+
+def conformal_hubble(
+    a,
+    grhog,
+    grhornomass,
+    grhoc,
+    grhob,
+    grhov,
+    *,
+    grhok=0.0,
+    grhomnu=0.0,
+    rhonu=1.0,
+    rho_de=1.0,
+):
+    """Return the conformal Hubble rate ``a'/a = a H(a)`` in Mpc^-1.
+
+    With ``grhoa2 = grhoa4 / a^2 = 8*pi*G*rho_total a^2`` the Friedmann equation
+    is ``(a'/a)^2 = grhoa2 / 3``, so
+
+    ``a'/a = sqrt(grhoa4 / 3) / a``.
+
+    Accepts the same arguments as :func:`grhoa4`.
+    """
+
+    return (
+        grhoa4(a, grhog, grhornomass, grhoc, grhob, grhov,
+               grhok=grhok, grhomnu=grhomnu, rhonu=rhonu, rho_de=rho_de) / 3.0
+    ) ** 0.5 / a
+
+
+def dtau_da(
+    a,
+    grhog,
+    grhornomass,
+    grhoc,
+    grhob,
+    grhov,
+    *,
+    grhok=0.0,
+    grhomnu=0.0,
+    rhonu=1.0,
+    rho_de=1.0,
+):
+    """Return the conformal-time derivative ``dtau/da``.
+
+    With ``c = 1``, conformal time obeys ``dtau/da = 1 / (a^2 H(a))``. Since
+    ``H(a) = sqrt(grhoa4 / 3) / a^2``, the derivative simplifies to
+
+    ``dtau/da = sqrt(3 / grhoa4)``.
+
+    Accepts the same arguments as :func:`grhoa4`.
+    """
+
+    return (
+        3.0
+        / grhoa4(a, grhog, grhornomass, grhoc, grhob, grhov,
+                 grhok=grhok, grhomnu=grhomnu, rhonu=rhonu, rho_de=rho_de)
+    ) ** 0.5
 
 
 def hubble_z(
-    z: float,
-    grhog: float,
-    grhornomass: float,
-    grhoc: float,
-    grhob: float,
-    grhov: float,
-) -> float:
-    """Return the physical Hubble rate ``H(z)`` in Mpc^-1 for flat LCDM.
+    z,
+    grhog,
+    grhornomass,
+    grhoc,
+    grhob,
+    grhov,
+    *,
+    grhok=0.0,
+    grhomnu=0.0,
+    rhonu=1.0,
+    rho_de=1.0,
+):
+    """Return the physical Hubble rate ``H(z)`` in Mpc^-1.
 
-    This evaluates ``H(a)`` at ``a = 1 / (1 + z)``.
+    This evaluates :func:`hubble_a` at ``a = 1 / (1 + z)``.
     """
 
-    return hubble_a(1.0 / (1.0 + z), grhog, grhornomass, grhoc, grhob, grhov)
+    return hubble_a(
+        1.0 / (1.0 + z), grhog, grhornomass, grhoc, grhob, grhov,
+        grhok=grhok, grhomnu=grhomnu, rhonu=rhonu, rho_de=rho_de,
+    )
 
 
 def dtau_dz(
-    z: float,
-    grhog: float,
-    grhornomass: float,
-    grhoc: float,
-    grhob: float,
-    grhov: float,
-) -> float:
-    """Return the conformal-time derivative ``dtau/dz`` for flat LCDM.
+    z,
+    grhog,
+    grhornomass,
+    grhoc,
+    grhob,
+    grhov,
+    *,
+    grhok=0.0,
+    grhomnu=0.0,
+    rhonu=1.0,
+    rho_de=1.0,
+):
+    """Return the conformal-time derivative ``dtau/dz``.
 
     We already have ``dtau/da`` from :func:`dtau_da`; the redshift derivative
     follows from the chain rule ``dtau/dz = (dtau/da) (da/dz)``.
@@ -284,7 +484,25 @@ def dtau_dz(
     """
 
     a = 1.0 / (1.0 + z)
-    return -dtau_da(a, grhog, grhornomass, grhoc, grhob, grhov) / (1.0 + z) ** 2
+    return -dtau_da(
+        a, grhog, grhornomass, grhoc, grhob, grhov,
+        grhok=grhok, grhomnu=grhomnu, rhonu=rhonu, rho_de=rho_de,
+    ) / (1.0 + z) ** 2
+
+
+# --- Recombination-related normalizations -----------------------------------
+
+
+def neutrino_mass_parameter(mnu: float, T_cmb: float) -> float:
+    """Return the dimensionless neutrino mass parameter ``amnu``.
+
+    ``amnu = m_nu c^2 / (k_B T_nu0)`` with ``T_nu0 = (4/11)^(1/3) T_cmb`` the
+    neutrino temperature today. Using the packaged conversion constant,
+
+    ``amnu = m_nu[eV] * NEUTRINO_MASS_KELVIN_PER_EV / T_cmb[K]``.
+    """
+
+    return mnu * NEUTRINO_MASS_KELVIN_PER_EV / T_cmb
 
 
 def thomson_normalization(omega_b_h2: float, Y_He: float) -> float:
@@ -314,86 +532,21 @@ def helium_number_fraction(Y_He: float) -> float:
 
 
 # =============================================================================
-# 2. Scalar model extensions (dark energy, curvature, massive neutrinos)
+# 2. Compatibility layer (JAX pipeline, historical ``param``-dictionary API)
+#
+# These functions carry the differentiable (jit/vmap/grad) pipeline used by the
+# thermodynamics, perturbation, and CMB modules. They assemble the ``grho``
+# coefficients from ``param`` and evaluate the general-model functions above
+# (which, using only Python operators, are equally valid on JAX arrays). The
+# only genuinely JAX-specific pieces are the neutrino momentum quadrature and
+# the dynamical-dark-energy exponential, provided here as JAX helpers.
 # =============================================================================
 
 
-def critical_density_grho(H0: float) -> float:
-    """Return the critical-density coefficient ``grhom`` in CAMB ``grho`` units.
-
-    This normalizes the matter, dark-energy, and curvature contributions to the
-    Friedmann equation. With ``H0 = 100*h km/s/Mpc``,
-
-    ``grhom = 8*pi*G*rho_crit,0 / c^2 = 3*(H0/c)^2 = GRHO_CRITICAL_H2 * h^2``.
-    """
-
-    return GRHO_CRITICAL_H2 * (H0 / 100.0) ** 2
-
-
-def photon_density_grho(T_cmb: float) -> float:
-    """Return the photon density coefficient ``grhog``. See :func:`grhog`."""
-
-    return grhog(T_cmb)
-
-
-def neutrino_density_grho(T_cmb: float) -> float:
-    """Return the per-flavour neutrino density coefficient ``grhor``.
-
-    A single relativistic neutrino flavour contributes ``(7/8)*(4/11)^(4/3)``
-    times the photon density, so
-
-    ``grhor = grhog * (7/8) * (4/11)^(4/3) = grhornomass(grhog, N_eff=1)``.
-    """
-
-    return grhog(T_cmb) * radiation_neutrino_factor(1.0)
-
-
-def radiation_hubble_rate(
-    grhog: float, grhor: float, N_eff: float, N_mnu: float
-) -> float:
-    """Return the conformal Hubble rate ``a'/a`` deep in radiation domination.
-
-    In the radiation era all species are relativistic and ``grhoa4`` is
-    dominated by the constant photon + neutrino term ``grhog + grhor*(N_eff +
-    N_mnu)``. The scale factor then grows as ``a ~ adotrad * tau`` with
-
-    ``adotrad = sqrt((grhog + grhor*(N_eff + N_mnu)) / 3)``.
-    """
-
-    return jnp.sqrt((grhog + grhor * (N_eff + N_mnu)) / 3.0)
-
-
-def neutrino_mass_parameter(mnu: float, T_cmb: float) -> float:
-    """Return the dimensionless neutrino mass parameter ``amnu``.
-
-    ``amnu = m_nu c^2 / (k_B T_nu0)`` with ``T_nu0 = (4/11)^(1/3) T_cmb`` the
-    neutrino temperature today. Using the packaged conversion constant,
-
-    ``amnu = m_nu[eV] * NEUTRINO_MASS_KELVIN_PER_EV / T_cmb[K]``.
-    """
-
-    return mnu * NEUTRINO_MASS_KELVIN_PER_EV / T_cmb
-
-
-def dark_energy_density_ratio(a, w_DE_0, w_DE_a):
-    """Return the dark-energy density normalized to its present value.
-
-    For the CPL parametrization ``w(a) = w_0 + w_a (1 - a)`` the continuity
-    equation integrates to
-
-    ``rho_Q(a) / rho_Q(1) = a^{-3(1 + w_0 + w_a)} exp[3(a - 1) w_a]``.
-
-    For a cosmological constant (``w_0 = -1``, ``w_a = 0``) this reduces to
-    ``1``.
-    """
+def _dark_energy_density_ratio_jax(a, w_DE_0, w_DE_a):
+    """JAX/array version of :func:`dark_energy_density_ratio` (uses ``jnp.exp``)."""
 
     return a ** (-3.0 * (1.0 + w_DE_0 + w_DE_a)) * jnp.exp(3.0 * (a - 1.0) * w_DE_a)
-
-
-def dark_energy_equation_of_state(a, w_DE_0, w_DE_a):
-    """Return the dark-energy equation of state ``w(a) = w_0 + w_a (1 - a)``."""
-
-    return w_DE_0 + w_DE_a * (1.0 - a)
 
 
 def get_neutrino_momentum_bins(nqmax: int) -> tuple[jax.Array, jax.Array]:
@@ -435,123 +588,12 @@ def get_neutrino_momentum_bins(nqmax: int) -> tuple[jax.Array, jax.Array]:
     return q, w / FERMI_DIRAC_CONST
 
 
-def massive_neutrino_density(a, amnu, q, w):
-    """Return the density and pressure ratios of one massive-neutrino flavour.
-
-    Evaluates, for a single scale factor ``a`` and mass parameter ``amnu``, the
-    momentum integrals of one massive-neutrino flavour in units of the mean
-    density of one massless flavour. With the dimensionless velocity
-
-    ``v(q) = 1 / sqrt(1 + (a amnu / q)^2)``,
-
-    the density, pressure, and pseudo-pressure ratios are
-
-    ``rho = sum_i w_i / v(q_i)``, ``p = sum_i w_i v(q_i) / 3``,
-    ``pp = sum_i w_i v(q_i)^3 / 3``.
-
-    Args:
-        a: scale factor (scalar).
-        amnu: neutrino mass in units of the neutrino temperature (scalar).
-        q, w: momentum bins and weights from :func:`get_neutrino_momentum_bins`.
-
-    Returns:
-        tuple[float, float, float]: ``rho_nu/rho_nu0``, ``p_nu/p_nu0``,
-        ``pp_nu/pp_nu0``.
-    """
-
-    v = 1.0 / jnp.sqrt(1.0 + (a * amnu / q) ** 2)  # = (1/aq)/sqrt(1+1/aq**2)
-    rhonu = jnp.sum(w / v)
-    pnu = jnp.sum(w * v / 3.0)
-    ppnu = jnp.sum(w * v**3 / 3.0)
-    return rhonu, pnu, ppnu
-
-
-def friedmann_grhoa4(
-    a,
-    *,
-    grhom,
-    grhog,
-    grhor,
-    Omegam,
-    OmegaDE,
-    Omegak,
-    Neff,
-    Nmnu,
-    rhonu,
-    rho_de,
-):
-    """Return ``8*pi*G*rho_total(a) a^4`` for the full DISCO-EB model.
-
-    Generalizes :func:`grhoa4` to include dynamical dark energy, spatial
-    curvature, and massive neutrinos. Grouping species by their scaling with
-    ``a`` (after the overall ``a^4`` factor),
-
-    ``grhoa4 = grhom Omegam a                         (matter,  rho ~ a^-3)``
-    ``       + grhog + grhor (Neff + Nmnu rhonu)       (radiation + neutrinos)``
-    ``       + grhom OmegaDE rho_de a^4                (dark energy)``
-    ``       + grhom Omegak a^2                        (curvature, rho ~ a^-2)``.
-
-    Here ``rhonu = rho_massive_nu(a)/rho_massless_nu(a)`` is the density ratio
-    of :func:`massive_neutrino_density` and ``rho_de = rho_Q(a)/rho_Q(1)`` from
-    :func:`dark_energy_density_ratio`; both are passed in already evaluated at
-    ``a`` so that this function is purely algebraic.
-
-    The scalar factor ``a' = da/dtau`` obeys ``a' = sqrt(grhoa4 / 3)``.
-    """
-
-    return (
-        grhom * Omegam * a
-        + (grhog + grhor * (Neff + Nmnu * rhonu))
-        + grhom * OmegaDE * rho_de * a**4
-        + grhom * Omegak * a**2
-    )
-
-
-def conformal_hubble(
-    a,
-    *,
-    grhom,
-    grhog,
-    grhor,
-    Omegam,
-    OmegaDE,
-    Omegak,
-    Neff,
-    Nmnu,
-    rhonu,
-    rho_de,
-):
-    """Return the conformal Hubble rate ``a'/a = a H(a)`` for the full model.
-
-    In the ``grhoa2 = 8*pi*G*rho_total a^2`` convention the Friedmann equation is
-    ``(a'/a)^2 = grhoa2 / 3``, so
-
-    ``a'/a = sqrt(grhoa2 / 3)`` with ``grhoa2 = grhoa4 / a^2``.
-
-    Same arguments and physics as :func:`friedmann_grhoa4`; this returns the
-    conformal Hubble rate rather than the ``a^4``-scaled density.
-    """
-
-    grhoa2 = (
-        grhom * Omegam / a
-        + (grhog + grhor * (Neff + Nmnu * rhonu)) / a**2
-        + grhom * OmegaDE * rho_de * a**2
-        + grhom * Omegak
-    )
-    return jnp.sqrt(grhoa2 / 3.0)
-
-
-# =============================================================================
-# 3. Compatibility layer (historical ``param``-dictionary API)
-# =============================================================================
-
-
 def nu_background(a, amnu, nq: int = 8):
     """Compute the neutrino density and pressure of one massive flavour.
 
-    Vectorized wrapper around :func:`massive_neutrino_density`: broadcasts over
-    a batch of scale factors and neutrino masses. Results are in units of the
-    mean density of one flavour of massless neutrinos.
+    JAX-vectorized counterpart of :func:`massive_neutrino_density`: broadcasts
+    over a batch of scale factors and neutrino masses. Results are in units of
+    the mean density of one flavour of massless neutrinos.
 
     Args:
         a (N,): scale factor.
@@ -566,12 +608,15 @@ def nu_background(a, amnu, nq: int = 8):
 
     q, w = get_neutrino_momentum_bins(nq)
 
-    # vmap the scalar primitive over the mass batch (inner) and scale factor (outer)
-    over_amnu = jax.vmap(
-        lambda aa, am: massive_neutrino_density(aa, am, q, w), in_axes=(None, 0)
-    )
-    over_a = jax.vmap(over_amnu, in_axes=(0, None))
-    rhonu, pnu, ppnu = over_a(a, amnu)
+    a = a[:, None, None]
+    amnu = amnu[None, :, None]
+    q = q[None, None, :]
+    w = w[None, None, :]
+
+    v = 1.0 / jnp.sqrt(1.0 + (a * amnu / q) ** 2)  # = (1/aq)/sqrt(1+1/aq**2)
+    rhonu = jnp.sum(w / v, axis=2)
+    pnu = jnp.sum(w * v / 3.0, axis=2)
+    ppnu = jnp.sum(w * v**3 / 3.0, axis=2)
     return rhonu, pnu, ppnu
 
 
@@ -589,58 +634,58 @@ def dtauda_(
     Nmnu,
     logrhonu_spline,
 ):
-    """Derivative of conformal time with respect to scale factor.
+    """Derivative of conformal time with respect to scale factor, ``dtau/da``.
 
     Scalar convenience wrapper: evaluates the massive-neutrino and dark-energy
-    density ratios from the supplied spline / equation-of-state parameters and
-    returns ``dtau/da = 1 / a' = sqrt(3 / grhoa4)`` via :func:`friedmann_grhoa4`.
+    density ratios from the supplied spline / equation-of-state parameters, then
+    returns ``dtau/da = sqrt(3 / grhoa4)`` via :func:`grhoa4`.
     """
 
     rhonu = jnp.exp(logrhonu_spline.evaluate(jnp.log(a)))
-    rho_de = dark_energy_density_ratio(a, w_DE_0, w_DE_a)
-    grhoa4 = friedmann_grhoa4(
+    rho_de = _dark_energy_density_ratio_jax(a, w_DE_0, w_DE_a)
+    g4 = grhoa4(
         a,
-        grhom=grhom,
-        grhog=grhog,
-        grhor=grhor,
-        Omegam=Omegam,
-        OmegaDE=OmegaDE,
-        Omegak=Omegak,
-        Neff=Neff,
-        Nmnu=Nmnu,
+        grhog,
+        grhor * Neff,
+        grhom * Omegam,
+        0.0,
+        grhom * OmegaDE,
+        grhok=grhom * Omegak,
+        grhomnu=grhor * Nmnu,
         rhonu=rhonu,
         rho_de=rho_de,
     )
-    return jnp.sqrt(3.0 / grhoa4)
+    return (3.0 / g4) ** 0.5
 
 
 def dadtau(a, param):
     """Derivative of scale factor with respect to conformal time, ``a' = da/dtau``.
 
     Batched over the cosmology dimension stored in ``param``; assembles the
-    ``grho`` coefficients from ``param`` and calls :func:`friedmann_grhoa4`.
+    ``grho`` coefficients from ``param`` and evaluates ``sqrt(grhoa4 / 3)`` via
+    :func:`grhoa4`.
     """
 
     rhonu = jnp.exp(param["logrhonu_of_loga_spline"].evaluate(jnp.log(a)))
 
     a = a[:, None]
-    rho_de = dark_energy_density_ratio(
+    rho_de = _dark_energy_density_ratio_jax(
         a, param["w_DE_0"][None, :], param["w_DE_a"][None, :]
     )
-    grhoa4 = friedmann_grhoa4(
+    grhom = param["grhom"][None, :]
+    g4 = grhoa4(
         a,
-        grhom=param["grhom"][None, :],
-        grhog=param["grhog"][None, :],
-        grhor=param["grhor"][None, :],
-        Omegam=param["Omegam"][None, :],
-        OmegaDE=param["OmegaDE"][None, :],
-        Omegak=param["Omegak"][None, :],
-        Neff=param["Neff"][None, :],
-        Nmnu=param["Nmnu"][None, :],
+        param["grhog"][None, :],
+        param["grhor"][None, :] * param["Neff"][None, :],
+        grhom * param["Omegam"][None, :],
+        0.0,
+        grhom * param["OmegaDE"][None, :],
+        grhok=grhom * param["Omegak"][None, :],
+        grhomnu=param["grhor"][None, :] * param["Nmnu"][None, :],
         rhonu=rhonu,
         rho_de=rho_de,
     )
-    return jnp.sqrt(grhoa4 / 3.0)
+    return (g4 / 3.0) ** 0.5
 
 
 def dtauda(a, param):
@@ -663,18 +708,18 @@ def get_aprimeoa(*, param, aexp):
     """
 
     rhonu = jnp.exp(param["logrhonu_of_loga_spline"].evaluate(jnp.log(aexp)))
-    rho_de = dark_energy_density_ratio(aexp, param["w_DE_0"], param["w_DE_a"])
+    rho_de = _dark_energy_density_ratio_jax(aexp, param["w_DE_0"], param["w_DE_a"])
+    grhom = param["grhom"]
 
     return conformal_hubble(
         aexp,
-        grhom=param["grhom"],
-        grhog=param["grhog"],
-        grhor=param["grhor"],
-        Omegam=param["Omegam"],
-        OmegaDE=param["OmegaDE"],
-        Omegak=param["Omegak"],
-        Neff=param["Neff"],
-        Nmnu=param["Nmnu"],
+        param["grhog"],
+        param["grhor"] * param["Neff"],
+        grhom * param["Omegam"],
+        0.0,
+        grhom * param["OmegaDE"],
+        grhok=grhom * param["Omegak"],
+        grhomnu=param["grhor"] * param["Nmnu"],
         rhonu=rhonu,
         rho_de=rho_de,
     )
@@ -704,10 +749,8 @@ def setup_background_evolution(*, amin, amax, param):
 
     # mean densities (CAMB grho convention, 1/Mpc^2)
     param["grhom"] = critical_density_grho(param["H0"])  # 8 pi G rho_crit / c^2
-    param["grhog"] = photon_density_grho(param["Tcmb"])  # photon density
-    param["grhor"] = neutrino_density_grho(
-        param["Tcmb"]
-    )  # neutrino density per flavour
+    param["grhog"] = grhog(param["Tcmb"])  # photon density
+    param["grhor"] = neutrino_density_grho(param["Tcmb"])  # neutrino density per flavour
     param["adotrad"] = radiation_hubble_rate(
         param["grhog"], param["grhor"], param["Neff"], param["Nmnu"]
     )
@@ -1013,7 +1056,7 @@ def compute_background_quantities(aexp, param):
     rhonu = jnp.exp(param["logrhonu_of_loga_spline"].evaluate(jnp.log(a)))
 
     # Dark energy density (normalized to value at a=1) and equation of state
-    rho_Q = dark_energy_density_ratio(a, param["w_DE_0"], param["w_DE_a"])
+    rho_Q = _dark_energy_density_ratio_jax(a, param["w_DE_0"], param["w_DE_a"])
     w_Q = dark_energy_equation_of_state(a, param["w_DE_0"], param["w_DE_a"])
 
     return {
