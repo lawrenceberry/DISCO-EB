@@ -211,6 +211,45 @@ def test_boltzmann_rhs_metric_and_matter_wiring(cosmology):
     assert dy[P.IX_G] == pytest.approx(-k * (4.0 / 3.0 * z + y[P.IX_G + 1]))
 
 
+def test_dark_energy_equation_of_state_and_sound_speed():
+    """Check the CPL equation of state and adiabatic sound speed helpers."""
+
+    a, w0, wa, adotoa = 0.5, -0.8, 0.5, 1.0e-3
+    w_Q = P.dark_energy_equation_of_state(a, w0, wa)
+    assert w_Q == pytest.approx(w0 + wa * (1.0 - a))
+    w_Q_prime = -wa * adotoa * a
+    ca2 = P.dark_energy_adiabatic_sound_speed(w_Q, w_Q_prime, adotoa)
+    assert ca2 == pytest.approx(w_Q - w_Q_prime / (3.0 * (1.0 + w_Q) * adotoa))
+
+
+def test_dark_energy_fluid_derivatives_metric_sourcing():
+    """Check the DE fluid derivatives against their defining algebra and limits."""
+
+    k, z, adotoa, a = 0.1, 0.5, 1.0e-3, 0.5
+    w0, wa, cs2 = -0.9, 0.0, 1.0
+
+    # At rest (clxq = thetaq = 0) only the metric drives the density contrast.
+    clxq_prime, thetaq_prime = P.dark_energy_fluid_derivatives(
+        0.0, 0.0, z, adotoa, k, a, w0, wa, cs2
+    )
+    assert clxq_prime == pytest.approx(-(1.0 + w0) * k * z)
+    assert thetaq_prime == 0.0
+
+    # General state: re-derive from the closed-form equations.
+    clxq, thetaq = 2.0e-3, 1.0e-3
+    w_Q = w0 + wa * (1.0 - a)
+    w_Q_prime = -wa * adotoa * a
+    ca2 = w_Q - w_Q_prime / (3.0 * (1.0 + w_Q) * adotoa)
+    exp_clxq = (
+        -(1.0 + w_Q) * (thetaq + k * z)
+        - 3.0 * (cs2 - w_Q) * adotoa * clxq
+        - 9.0 * (1.0 + w_Q) * (cs2 - ca2) * adotoa**2 / k**2 * thetaq
+    )
+    exp_thetaq = -(1.0 - 3.0 * cs2) * adotoa * thetaq + cs2 / (1.0 + w_Q) * k**2 * clxq
+    got = P.dark_energy_fluid_derivatives(clxq, thetaq, z, adotoa, k, a, w0, wa, cs2)
+    assert got == pytest.approx((exp_clxq, exp_thetaq))
+
+
 @pytest.mark.parametrize("cosmology", COSMOLOGY_CASES)
 def test_boltzmann_rhs_evolves_full_photon_hierarchy(cosmology):
     """Check that the full photon/polarization hierarchy evolves at high opacity.

@@ -496,6 +496,81 @@ def neutrino_truncation(
 
 
 # ============================================================
+# DYNAMICAL DARK ENERGY (CPL fluid perturbations)
+#
+# Optional extension (enabled when w_0 != -1 or w_a != 0). The DE fluid is a
+# clustering fluid with rest-frame sound speed cs2_DE, carrying two extra state
+# variables clxq (density contrast) and thetaq (velocity divergence) that join
+# the densely-coupled metric core. Synchronous-gauge equations follow Ballesteros
+# & Lesgourgues 2010; the metric enters through ``0.5 h' = k z`` (see
+# :func:`cdm_density_derivative`, where ``clxc' = -k z = -h'/2``).
+# ============================================================
+
+
+def dark_energy_equation_of_state(a: float, w_DE_0: float, w_DE_a: float) -> float:
+    """Return the CPL equation of state ``w_Q(a) = w_0 + w_a (1 - a)``."""
+
+    return w_DE_0 + w_DE_a * (1.0 - a)
+
+
+def dark_energy_adiabatic_sound_speed(
+    w_Q: float, w_Q_prime: float, adotoa: float
+) -> float:
+    """Return the adiabatic sound speed ``c_a^2 = w - w'/(3(1+w) aH)``."""
+
+    return w_Q - w_Q_prime / (3.0 * (1.0 + w_Q) * adotoa)
+
+
+def dark_energy_density_coefficient(grhov: float, rho_Q: float, a: float) -> float:
+    """Return the comoving DE density coefficient ``8*pi*G*rho_Q a^2``.
+
+    ``grhov = grhom * OmegaDE`` is the present DE density coefficient and
+    ``rho_Q = rho_Q(a)/rho_Q(1)`` its normalized evolution, so the comoving
+    coefficient is ``grhov * rho_Q * a^2`` (reducing to the flat ``grhov a^2``
+    when ``rho_Q = 1``).
+    """
+
+    return grhov * rho_Q * a * a
+
+
+def dark_energy_fluid_derivatives(
+    clxq: float,
+    thetaq: float,
+    z: float,
+    adotoa: float,
+    k: float,
+    a: float,
+    w_DE_0: float,
+    w_DE_a: float,
+    cs2_Q: float,
+) -> tuple[float, float]:
+    """Return the DE fluid derivatives ``(clxq', thetaq')`` in synchronous gauge.
+
+    ``clxq' = -(1+w)(thetaq + k z) - 3(cs2 - w) aH clxq
+              - 9(1+w)(cs2 - c_a^2)(aH)^2 thetaq / k^2``,
+    ``thetaq' = -(1 - 3 cs2) aH thetaq + cs2 k^2 clxq / (1+w)``,
+
+    with ``w = w(a)``, ``w' = -w_a aH a``, and ``c_a^2`` the adiabatic sound
+    speed. Valid only for ``w != -1`` (a cosmological constant carries no fluid
+    perturbations and is excluded from the state layout).
+    """
+
+    w_Q = dark_energy_equation_of_state(a, w_DE_0, w_DE_a)
+    w_Q_prime = -w_DE_a * adotoa * a
+    ca2_Q = dark_energy_adiabatic_sound_speed(w_Q, w_Q_prime, adotoa)
+
+    clxq_prime = (
+        -(1.0 + w_Q) * (thetaq + k * z)
+        - 3.0 * (cs2_Q - w_Q) * adotoa * clxq
+        - 9.0 * (1.0 + w_Q) * (cs2_Q - ca2_Q) * adotoa**2 / k**2 * thetaq
+    )
+    thetaq_prime = (
+        -(1.0 - 3.0 * cs2_Q) * adotoa * thetaq + cs2_Q / (1.0 + w_Q) * k**2 * clxq
+    )
+    return clxq_prime, thetaq_prime
+
+
+# ============================================================
 # FULL RIGHT-HAND SIDE
 # ============================================================
 
