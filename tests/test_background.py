@@ -1,5 +1,3 @@
-from dataclasses import dataclass
-
 import numpy as np
 import pytest
 
@@ -25,6 +23,7 @@ from discoeb.background import (
 from discoeb.constants import GRHO_CRITICAL_H2
 
 from conftest import a_RECFAST, xe_RECFAST
+from cosmologies import BENCHMARK_COSMOLOGIES, cosmology_to_class_params
 
 ## Cosmological Parameters
 Tcmb    = 2.7255
@@ -114,54 +113,28 @@ class TestEvolveBackground:
 # =============================================================================
 
 
-@dataclass(frozen=True)
-class Cosmology:
-    """Flat-LambdaCDM cosmology described by physical densities ``Omega_i h^2``."""
-
-    omega_b_h2: float
-    omega_c_h2: float
-    h: float
-    A_s: float
-    n_s: float
-    T_cmb: float
-    Y_He: float
-    N_eff: float
-    k_pivot: float
-
-
-PLANCK_2018_FLAT_LCDM = Cosmology(
-    omega_b_h2=0.02238280,
-    omega_c_h2=0.1201075,
-    h=0.6732117,
-    A_s=2.100549e-9,
-    n_s=0.9660499,
-    T_cmb=2.7255,
-    Y_He=0.2454006,
-    N_eff=3.046,
-    k_pivot=0.05,
-)
-
-STANDARD_COSMOLOGIES = {"planck_2018_flat_lcdm": PLANCK_2018_FLAT_LCDM}
-
 COSMOLOGY_CASES = [
-    pytest.param(cosmology, id=name) for name, cosmology in STANDARD_COSMOLOGIES.items()
+    pytest.param(
+        BENCHMARK_COSMOLOGIES["planck_2018_flat_lcdm"],
+        id="planck_2018_flat_lcdm",
+    )
 ]
 
 
-def density_args(cosmology: Cosmology):
+def density_args(cosmology):
     """Return the flat-LambdaCDM ``grho`` coefficients for a cosmology."""
 
     grhog_value = grhog(cosmology.T_cmb)
     return (
         grhog_value,
-        grhornomass(grhog_value, cosmology.N_eff),
+        grhornomass(grhog_value, cosmology.Neff_massless),
         grhoc(cosmology.omega_c_h2),
         grhob(cosmology.omega_b_h2),
         grhov(
             cosmology.omega_b_h2,
             cosmology.omega_c_h2,
             cosmology.h,
-            cosmology.N_eff,
+            cosmology.Neff_massless,
             cosmology.T_cmb,
         ),
     )
@@ -225,21 +198,7 @@ def class_background(request):
     Class = pytest.importorskip("classy").Class
 
     cosmo = Class()
-    cosmo.set(
-        {
-            "h": cosmology.h,
-            "omega_b": cosmology.omega_b_h2,
-            "omega_cdm": cosmology.omega_c_h2,
-            "T_cmb": cosmology.T_cmb,
-            "YHe": cosmology.Y_He,
-            "N_ur": cosmology.N_eff,
-            "N_ncdm": 0,
-            "Omega_k": 0.0,
-            "output": "tCl",
-            "background_verbose": 0,
-            "thermodynamics_verbose": 0,
-        }
-    )
+    cosmo.set(cosmology_to_class_params(cosmology, output="tCl"))
     cosmo.compute()
     try:
         yield cosmology, ClassBackground(cosmo)
@@ -305,8 +264,8 @@ def test_algebraic_background_identities(cosmology):
     assert grhob(cosmology.omega_b_h2) == pytest.approx(
         GRHO_CRITICAL_H2 * cosmology.omega_b_h2, rel=1.0e-15
     )
-    assert grhornomass(grhog_value, cosmology.N_eff) == pytest.approx(
-        grhog_value * radiation_neutrino_factor(cosmology.N_eff), rel=1.0e-15
+    assert grhornomass(grhog_value, cosmology.Neff_massless) == pytest.approx(
+        grhog_value * radiation_neutrino_factor(cosmology.Neff_massless), rel=1.0e-15
     )
     assert hubble_z(z, *args) == pytest.approx(hubble_a(a, *args), rel=1.0e-15)
     assert dtau_dz(z, *args) == pytest.approx(
@@ -325,7 +284,7 @@ def test_class_background_coefficients_match_scalar_functions(class_background):
     assert grhog_value == pytest.approx(
         np.mean(3.0 * bg.rho("(.)rho_g", a_values) * a_values**4), rel=1.0e-4
     )
-    assert grhornomass(grhog_value, cosmology.N_eff) == pytest.approx(
+    assert grhornomass(grhog_value, cosmology.Neff_massless) == pytest.approx(
         np.mean(3.0 * bg.rho("(.)rho_ur", a_values) * a_values**4), rel=1.0e-4
     )
     assert grhoc(cosmology.omega_c_h2) == pytest.approx(
@@ -338,7 +297,7 @@ def test_class_background_coefficients_match_scalar_functions(class_background):
         cosmology.omega_b_h2,
         cosmology.omega_c_h2,
         cosmology.h,
-        cosmology.N_eff,
+        cosmology.Neff_massless,
         cosmology.T_cmb,
     ) == pytest.approx(np.mean(3.0 * bg.rho("(.)rho_lambda", a_values)), rel=1.0e-4)
     assert thomson_normalization(cosmology.omega_b_h2, cosmology.Y_He) == pytest.approx(
@@ -386,4 +345,3 @@ def test_dtau_da_matches_hubble_identity_with_class_hubble(class_background):
     ours = np.array([dtau_da(float(a), *args) for a in a_values])
 
     assert ours == pytest.approx(class_dtau_da, rel=1.0e-4)
-
