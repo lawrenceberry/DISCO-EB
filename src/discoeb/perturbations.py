@@ -1,2169 +1,611 @@
-import jax
-import jax.numpy as jnp
+"""Scalar Einstein-Boltzmann perturbation equations (synchronous gauge).
 
-from .util import lngamma_complex_e, root_find_bisect, root_find_bisect_nocond, savgol_filter
+Ported from the DISCO2 prototype. This module defines the linear cosmological
+perturbation right-hand side, adiabatic initial conditions, and the Einstein
+constraint terms only. Like :mod:`discoeb.recfast`, it deliberately avoids solver
+wrappers, grid construction, and line-of-sight integration so the hot equations
+can be compiled to numba-cuda with scalar arguments. The matter power-spectrum
+mapping lives in :mod:`discoeb.matter_power_spectrum`; the ODE solve lives in
+:mod:`discoeb.perturbations_system`.
 
-import diffrax as drx
-from jaxtyping import Array, PyTree, Scalar
-import equinox as eqx
+Conventions follow CAMB and :mod:`discoeb.background`:
 
-from functools import partial
-import jax.flatten_util as fu
+    * Distances and conformal time are in Mpc with ``c = 1``.
+    * Wavenumbers ``k`` are in Mpc^-1.
+    * Densities use the CAMB ``grho`` convention. The functions here work with
+      ``grho_i a^2 = 8*pi*G*rho_i a^2`` ("comoving" density coefficients), because
+      the synchronous-gauge Einstein equations naturally pair ``8*pi*G*rho_i a^2``
+      with the dimensionless density contrasts.
+    * The state evolves in conformal time ``tau``; ``adotoa = a'/a = aH`` is the
+      conformal Hubble rate.
 
-from .ode_integrators_stiff import Rodas5, Rodas5Transformed, Rodas5Batched
-from diffrax import Kvaerno5
-from .approximations import (
-    compute_fields_rsa,
-    in_tca_regime,
-    in_rsa_regime,
-    in_ur_fluid_regime,
-    compute_shearprime_ufa,
-    apply_rsa_state_projection,
-    get_approximation_settings,
-)
+The perturbation variables follow Ma & Bertschinger / CAMB:
 
-# Import background functions
-from .background import get_aprimeoa, get_neutrino_momentum_bins
+    * ``etak = k eta`` -- synchronous-gauge metric perturbation,
+    * ``clxc``, ``clxb`` -- CDM and baryon density contrasts,
+    * ``vb`` -- baryon velocity,
+    * ``Theta_l`` -- photon temperature multipoles (``clxg = Theta_0``,
+      ``qg = Theta_1``, ``pig = Theta_2``),
+    * ``E_l`` -- photon E-mode polarization multipoles,
+    * ``N_l`` -- massless-neutrino multipoles (``clxr = N_0``, ``qr = N_1``,
+      ``pir = N_2``).
+
+The state-vector layout is fixed at import time from the truncation constants
+:data:`LMAX_G`, :data:`LMAX_POL`, :data:`LMAX_NR` below, so the index helpers are
+compile-time constants. These are the knobs that a numba-cuda kernel specializes
+on; changing them re-specializes the layout and the (matching) block-LU solver.
+"""
+
+import numpy as np
+
+# Hierarchy truncations. These are module-level integers (not runtime arguments)
+# so the state-vector layout and the accelerator-compiled right-hand side treat
+# them as compile-time constants. The current flat-LambdaCDM + massless-neutrino
+# layout has NVAR == 50 (11-var dense core + 3x13 free-streaming hierarchies),
+# matching the hand-tuned Schur-EB LU solver in :mod:`discoeb.schur_eb`.
+LMAX_G = 15
+"""Photon temperature hierarchy truncation (``Theta_0 ... Theta_LMAX_G``)."""
+
+LMAX_POL = 15
+"""Photon E-mode polarization hierarchy truncation (``E_2 ... E_LMAX_POL``)."""
+
+LMAX_NR = 15
+"""Massless-neutrino hierarchy truncation (``N_0 ... N_LMAX_NR``)."""
+
+IX_ETAK = 0
+"""State-vector index of the metric perturbation ``etak = k eta``."""
+
+IX_CLXC = 1
+"""State-vector index of the CDM density contrast ``clxc``."""
+
+IX_CLXB = 2
+"""State-vector index of the baryon density contrast ``clxb``."""
+
+IX_VB = 3
+"""State-vector index of the baryon velocity ``vb``."""
+
+IX_G = 4
+"""Base index of the photon temperature hierarchy (``Theta_l`` at ``IX_G + l``)."""
+
+IX_POL = IX_G + LMAX_G + 1
+"""Base index of the photon polarization hierarchy (``E_l`` at ``IX_POL + (l-2)``)."""
+
+IX_R = IX_POL + LMAX_POL - 1
+"""Base index of the massless-neutrino hierarchy (``N_l`` at ``IX_R + l``)."""
+
+NVAR = IX_R + LMAX_NR + 1
+"""Total length of the perturbation state vector."""
 
 
+# ============================================================
+# EINSTEIN CONSTRAINTS AND BACKGROUND TERMS
+# ============================================================
 
-def nu_perturb( a : float, amnu: float, psi0: jax.Array, psi1 : jax.Array, psi2 : jax.Array, nqmax : int ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """ Compute the perturbations of density, energy flux, pressure, and
-        shear stress of one flavor of massive neutrinos, in units of the mean
-        density of one flavor of massless neutrinos, by integrating over 
-        momentum.
 
-    Args:
-        a (float): scale factor
-        amnu (float): neutrino mass in units of neutrino temperature (m_nu*c**2/(k_B*T_nu0).
-        psi0 (jax.Array): l=0 neutrino perturbations for all momentum bins
-        psi1 (jax.Array): l=1 neutrino perturbations for all momentum bins
-        psi2 (jax.Array): l=2 neutrino perturbations for all momentum bins
-        nq (int, optional): _description_. Defaults to 1000.
-        nqmax (int): number of momentum bins
+def comoving_densities(
+    a: float,
+    grhog: float,
+    grhornomass: float,
+    grhoc: float,
+    grhob: float,
+    grhov: float,
+) -> tuple[float, float, float, float, float]:
+    """Return the ``8*pi*G*rho_i a^2`` density coefficients at scale factor ``a``.
 
-    Returns:
-        _type_: drhonu, dpnu, fnu, shearnu
+    The CAMB ``grho`` coefficients satisfy ``grhoa4 = 8*pi*G*rho_i a^4``. Dividing
+    by ``a^2`` gives the combinations that appear in the synchronous-gauge
+    Einstein equations:
+
+    ``rho_gamma, rho_nu ~ a^-4`` give ``grho_i a^2 = grho_i / a^2``;
+    ``rho_c, rho_b ~ a^-3`` give ``grho_i a^2 = grho_i / a``;
+    ``rho_Lambda ~ a^0`` gives ``grhov a^2 = grhov * a^2``.
+
+    Returns ``(grhog_t, grhor_t, grhoc_t, grhob_t, grhov_t)``.
     """
-    
-    q, w = get_neutrino_momentum_bins( nqmax )
-    #q = q[:, None]
-    #w = w[:, None]
-    aq   = a * amnu / q
-    v    = 1 / jnp.sqrt(1 + aq**2)
 
-    drhonu  = jnp.sum(w * psi0 / v)
-    dpnu    = jnp.sum(w * psi0 * v) / 3
-    fnu     = jnp.sum(w * psi1) 
-    shearnu = jnp.sum(w * psi2 * v) * 2 / 3
+    a2 = a * a
+    return (grhog / a2, grhornomass / a2, grhoc / a, grhob / a, grhov * a2)
 
-    return drhonu, dpnu, fnu, shearnu
 
-def nu_perturb_prime( *, a : float, amnu : float, aprimeoa : float, psi0: jax.Array, psi2: jax.Array, psi0prime : jax.Array, psi2prime : jax.Array, nqmax : int ) -> tuple[jax.Array, jax.Array]:
-    """ Compute the time derivative of the mean density in massive neutrinos 
-          and the shear perturbation.
+def expansion_rate(
+    grhog_t: float,
+    grhor_t: float,
+    grhoc_t: float,
+    grhob_t: float,
+    grhov_t: float,
+) -> float:
+    """Return the conformal Hubble rate ``adotoa = a'/a = aH``.
 
-    Args:
-        a (float): scale factor
-        aprimeoa (float): conformal Hubble rate
-        amnu (float): neutrino mass in units of neutrino temperature (m_nu*c**2/(k_B*T_nu0).
-        psi0 (jax.Array): l=0 neutrino perturbations for all momentum bins
-        psi2 (jax.Array): l=2 neutrino perturbations for all momentum bins
-        psi0prime (jax.Array): time derivative of l=0 neutrino perturbations for all momentum bins
-        psi2prime (jax.Array): time derivative of l=2 neutrino perturbations for all momentum bins
-        nqmax (int): number of momentum bins
-
-    Returns:
-        _type_: rho_nu_prime, shear_nu_prime
+    ``adotoa = sqrt((Sum grho_i a^2) / 3)``. Written as ``** 0.5`` so the helper
+    traces unchanged on Python floats and CUDA device values.
     """
-    
-    q, w   = get_neutrino_momentum_bins( nqmax )
-    #q = q[:, None]
-    #w = w[:, None]
-    aq     = a * amnu / q
-    v      = 1 / jnp.sqrt(1 + aq**2)
-    vprime = -0.5*aq*aprimeoa * v**3
 
-    rho_nu_prime   = jnp.sum(w * (psi0prime / v - psi0 / v**2 * vprime))
-    shear_nu_prime = jnp.sum(w * (psi2prime*v + psi2*vprime)) * 2 / 3
-
-    return rho_nu_prime, shear_nu_prime
+    return ((grhog_t + grhor_t + grhoc_t + grhob_t + grhov_t) / 3.0) ** 0.5
 
 
-def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax, idx):     
-    """Solve the synchronous gauge perturbation equations for a single mode.
+def density_perturbation(
+    grhob_t: float,
+    clxb: float,
+    grhoc_t: float,
+    clxc: float,
+    grhog_t: float,
+    clxg: float,
+    grhor_t: float,
+    clxr: float,
+) -> float:
+    """Return the total density perturbation ``dgrho = Sum grho_i a^2 delta_i``."""
 
-    Parameters
-    ----------
-    tau : float
-        conformal time
-    yin : array_like
-        input vector of perturbations
-    param : array_like
-        dictionary of parameters and interpolated background functions
-    kmode : float
-        wavenumber of modef
-    lmaxg : int
-        maximum photon temperature hierarchy multipole
-    lmaxgp : int
-        maximum photon polarization hierarchy multipole
-    lmaxr : int
-        maximum massless neutrino hierarchy multipole
-    lmaxnu : int
-        maximum neutrino hierarchy multipole
-    nqmax : int
-        maximum number of momentum bins for massive neutrinos
+    return grhob_t * clxb + grhoc_t * clxc + grhog_t * clxg + grhor_t * clxr
 
-    Returns
-    -------
-    f : array_like
-        RHS of perturbation equations
+
+def momentum_perturbation(
+    grhob_t: float,
+    vb: float,
+    grhog_t: float,
+    qg: float,
+    grhor_t: float,
+    qr: float,
+) -> float:
+    """Return the total momentum-density source ``dgq = Sum grho_i a^2 (rho+p) v_i``."""
+
+    return grhob_t * vb + grhog_t * qg + grhor_t * qr
+
+
+def anisotropic_stress(
+    grhog_t: float,
+    pig: float,
+    grhor_t: float,
+    pir: float,
+) -> float:
+    """Return the total anisotropic-stress source ``dgpi``."""
+
+    return grhog_t * pig + grhor_t * pir
+
+
+def metric_z(dgrho: float, etak: float, adotoa: float, k: float) -> float:
+    """Return the synchronous-gauge metric variable ``z = (dgrho/(2k) + k eta)/aH``."""
+
+    return (0.5 * dgrho / k + etak) / adotoa
+
+
+def shear_sigma(z: float, dgq: float, k: float) -> float:
+    """Return the metric shear ``sigma = z + (3/2) dgq / k^2``."""
+
+    return z + 1.5 * dgq / (k * k)
+
+
+def newtonian_potential(
+    dgrho: float,
+    dgq: float,
+    dgpi: float,
+    adotoa: float,
+    k: float,
+) -> float:
+    """Return the Newtonian-gauge curvature potential ``Phi`` (diagnostic).
+
+    ``Phi = -[(dgrho + 3 aH dgq / k) + dgpi] / (2 k^2)``.
     """
-    #print("ODE input", y.shape, idx)
-    def to_scalar(x):
-        return jnp.ravel(x)[0]
-    def take_idx(x):
-      return jnp.take(x, idx, mode="wrap")
 
-    rsa_settings = get_approximation_settings(param)
-    use_tca = to_scalar(rsa_settings['use_tca'])
-    tca_tau_c_over_tau_h_trigger = to_scalar(rsa_settings['tca_tau_c_over_tau_h_trigger'])
-    tca_tau_c_over_tau_k_trigger = to_scalar(rsa_settings['tca_tau_c_over_tau_k_trigger'])
-    use_rsa = to_scalar(rsa_settings['use_rsa'])
-    tau_c_over_tau_trigger = to_scalar(rsa_settings['tau_c_over_tau_trigger'])
-    tau_over_tau_k_trigger = to_scalar(rsa_settings['tau_over_tau_k_trigger'])
-    use_ur_fluid = to_scalar(rsa_settings['use_ur_fluid'])
-    ur_fluid_tau_over_tau_k_trigger = to_scalar(rsa_settings['ur_fluid_tau_over_tau_k_trigger'])
-    #jax.debug.print("TCA = {tca}. RSA = {rsa}, UR = {ur}", tca=use_tca, rsa=use_rsa, ur=use_ur_fluid)
+    return -((dgrho + 3.0 * dgq * adotoa / k) + dgpi) / (2.0 * k * k)
 
-    y = jnp.ravel(y)
-    tau = to_scalar(tau)
-    kmode = to_scalar(kmode)
-    Omegac = take_idx(param['Omegam'] - param['Omegab'])
 
-    iq0 = 10 + lmaxg + lmaxgp + lmaxr
-    iq1 = iq0 + nqmax
-    iq2 = iq1 + nqmax
-    iq3 = iq2 + nqmax
-    iq4 = iq3 + nqmax
+# ============================================================
+# ADIABATIC INITIAL CONDITIONS
+# Deep in radiation domination (k tau << 1), following CAMB's initial().
+# ============================================================
 
-    # y = jnp.copy(yin)
-    f = jnp.zeros_like( y )
 
-    #TODO: add curvature
-    # ... curvature
-    K = 0
-    tau = tau + 1e-50
-    
-    # def cotKgen_zero_curv():
-    #     return 1.0/(kmode*tau)
-    # def cotKgen_pos_curv():
-    #     return jnp.sqrt(K)/kmode/jnp.tan(jnp.sqrt(K)*tau)
-    # def cotKgen_neg_curv():
-    #     return jnp.sqrt(-K)/kmode/jnp.tanh(jnp.sqrt(-K)*tau)
-    
-    # cotKgen = jax.lax.switch(int(1+jax.lax.sign(K)), [cotKgen_neg_curv, cotKgen_zero_curv, cotKgen_pos_curv])
-    s2_squared = 1.-3.*K/kmode**2
-    s_l2 = 1.0
-    s_l3 = 1.0
+def neutrino_radiation_fraction(grhog: float, grhornomass: float) -> float:
+    """Return the neutrino fraction of the radiation density ``R_nu``."""
 
-    # ... metric
-    a = y[0]
-    a = jnp.where(a<1e-8,1e-8,a)
-    a = jnp.where(a>1.1,1.1,a)
-    loga = jnp.log(a)
+    return grhornomass / (grhog + grhornomass)
 
-    #ahprime = y[1]
-    eta = y[2]
 
-    # ... cdm
-    deltac = y[3]
-    thetac = y[4]
+def matter_radiation_parameter(
+    grhob: float,
+    grhoc: float,
+    grhog: float,
+    grhornomass: float,
+) -> float:
+    """Return the matter-to-radiation initial-condition parameter ``om``."""
 
-    # ... baryons
-    deltab = y[5]
-    thetab = y[6]
+    return (grhob + grhoc) / (3.0 * (grhog + grhornomass)) ** 0.5
 
-    # ... photons
-    deltag = y[7]
-    thetag = y[8]
-    shearg = y[9] / 2.0
 
-    # ... massless neutrinos
-    deltar = y[ 9 + lmaxg + lmaxgp]
-    thetar = y[10 + lmaxg + lmaxgp]
-    shearr = y[11 + lmaxg + lmaxgp] / 2.0
+def adiabatic_photon_density(k: float, tau: float, om: float) -> float:
+    """Return the initial photon density contrast ``delta_gamma``."""
 
-    # ... quintessence field
-    deltaq = y[-2]
-    thetaq = y[-1]
+    x2 = (k * tau) ** 2
+    return x2 / 3.0 * (1.0 - om * tau / 5.0)
 
-    # ... evaluate thermodynamics
-    # tempb   = param['tempba_of_tau_spline'].evaluate( tau ) / a
-    # xeprime = param['xe_of_tau_spline'].derivative( tau )
-    # cs2     = param['cs2a_of_tau_spline'].evaluate( tau ) / a
-    # xe      = param['xe_of_tau_spline'].evaluate( tau )
 
-    # Use pre-composed splines for direct log(a) lookup (performance optimization)
-    cs2     = take_idx(param['cs2a_of_tau_spline'].evaluate( tau )) / a
-    #xe      = take_idx(param['xe_of_loga_spline'].evaluate( loga ))
-    xe      = take_idx(param['xe_of_tau_spline'].evaluate( tau ))
-    
-    #jax.debug.print("XE = {xe} | {xe2} (tau={tau},a={a})",xe=param['xe_of_loga_spline'].evaluate( loga ), xe2=param['xe_of_tau_spline'].evaluate( tau ), tau=tau, a=a)
-    
-    # ... Photon mass density over baryon mass density
-    photbar = take_idx( param['grhog'] / (param['grhom'] * param['Omegab'] * a))
+def adiabatic_photon_velocity(k: float, tau: float, om: float) -> float:
+    """Return the initial photon dipole ``q_gamma``."""
+
+    x = k * tau
+    return x**3 / 27.0 * (1.0 - om * tau / 5.0)
+
+
+def adiabatic_initial_conditions(
+    k: float,
+    tau: float,
+    grhog: float,
+    grhornomass: float,
+    grhoc: float,
+    grhob: float,
+) -> tuple[float, ...]:
+    """Return the adiabatic initial state vector deep in radiation domination.
+
+    Implements CAMB's ``initial()`` series for the adiabatic growing mode at
+    ``k tau << 1``, normalized so the comoving curvature perturbation is unity.
+    The returned tuple has length :data:`NVAR`; all multipoles above those set
+    explicitly start at zero.
+    """
+
+    x = k * tau
+    x2 = x * x
+
+    Rv = neutrino_radiation_fraction(grhog, grhornomass)
+    Rp15 = 4.0 * Rv + 15.0
+    om = matter_radiation_parameter(grhob, grhoc, grhog, grhornomass)
+    omtau = om * tau
+
+    clxg = adiabatic_photon_density(k, tau, om)
+    qg = adiabatic_photon_velocity(k, tau, om)
+
+    y0 = [0.0] * NVAR
+
+    # Metric perturbation: etak = k eta ~ -k at leading order.
+    y0[IX_ETAK] = -k * (1.0 - x2 / 12.0 * (-10.0 / Rp15 + 1.0))
+
+    # Photon monopole and dipole.
+    y0[IX_G] = clxg
+    y0[IX_G + 1] = qg
+
+    # CDM and baryons share the photon density (3/4 factor for adiabatic mode).
+    y0[IX_CLXC] = 0.75 * clxg
+    y0[IX_CLXB] = 0.75 * clxg
+    y0[IX_VB] = 0.75 * qg
+
+    # Massless neutrinos.
+    y0[IX_R] = clxg
+    y0[IX_R + 1] = (4.0 * Rv + 23.0) / Rp15 * x2 * x / 27.0
+    y0[IX_R + 2] = (
+        -4.0
+        / 3.0
+        * x2
+        / Rp15
+        * (1.0 + omtau / 4.0 * (4.0 * Rv - 5.0) / (2.0 * Rv + 15.0))
+    )
+    if LMAX_NR >= 3:
+        y0[IX_R + 3] = -4.0 / 21.0 / Rp15 * x2 * x
+
+    return tuple(y0)
+
+
+# ============================================================
+# FLUID AND METRIC DERIVATIVES
+# ============================================================
+
+
+def metric_etak_derivative(dgq: float) -> float:
+    """Return ``etak' = (1/2) dgq`` from the momentum Einstein constraint."""
+
+    return 0.5 * dgq
+
+
+def cdm_density_derivative(z: float, k: float) -> float:
+    """Return ``clxc' = -k z`` (CDM is pressureless, at rest in synchronous gauge)."""
+
+    return -k * z
+
+
+def baryon_density_derivative(z: float, vb: float, k: float) -> float:
+    """Return ``clxb' = -k (z + v_b)`` from baryon number conservation."""
+
+    return -k * (z + vb)
+
+
+def baryon_velocity_derivative(
+    adotoa: float,
+    vb: float,
+    k: float,
+    delta_p_b: float,
+    photbar: float,
+    opacity: float,
+    qg: float,
+) -> float:
+    """Return ``v_b'`` from the full (non-tight-coupling) baryon Euler equation.
+
+    ``v_b' = -aH v_b + k delta_p_b - (rho_gamma/rho_b) kappa' (4/3 v_b - q_gamma)``.
+    """
+
+    return -adotoa * vb + k * delta_p_b - photbar * opacity * (4.0 / 3.0 * vb - qg)
+
+
+def photon_monopole_derivative(z: float, qg: float, k: float) -> float:
+    """Return ``Theta_0' = -k (4/3 z + q_gamma)`` (photon continuity)."""
+
+    return -k * (4.0 / 3.0 * z + qg)
+
+
+def photon_dipole_derivative(
+    vbdot: float,
+    adotoa: float,
+    vb: float,
+    k: float,
+    delta_p_b: float,
+    pb43: float,
+    clxg: float,
+    pig: float,
+) -> float:
+    """Return the photon dipole derivative ``Theta_1' = q_gamma'``.
+
+    ``q_gamma' = (4/3)(-v_b' - aH v_b + k delta_p_b)/R_gamma + (k/3) delta_gamma
+    - (2k/3) pi_gamma``, with ``pb43 = R_gamma = (4/3) rho_gamma/rho_b``.
+    """
+
+    return (
+        4.0 / 3.0 * (-vbdot - adotoa * vb + k * delta_p_b) / pb43
+        + k / 3.0 * clxg
+        - 2.0 * k / 3.0 * pig
+    )
+
+
+def polarization_source(pig: float, e2: float) -> float:
+    """Return the polarization source ``Pi = pi_gamma/10 + (9/15) E_2``."""
+
+    return pig / 10.0 + 9.0 / 15.0 * e2
+
+
+def photon_quadrupole_derivative(
+    qg: float,
+    theta3: float,
+    pig: float,
+    polter: float,
+    sigma: float,
+    k: float,
+    opacity: float,
+) -> float:
+    """Return ``Theta_2' = (2k/5) q - (3k/5) Theta_3 - kappa'(pi - Pi) + (8/15) k sigma``."""
+
+    return (
+        2.0 * k / 5.0 * qg
+        - 3.0 * k / 5.0 * theta3
+        - opacity * (pig - polter)
+        + 8.0 / 15.0 * k * sigma
+    )
+
+
+def photon_temperature_multipole_derivative(
+    l: int,
+    theta_lm1: float,
+    theta_l: float,
+    theta_lp1: float,
+    k: float,
+    opacity: float,
+) -> float:
+    """Return ``Theta_l'`` for an interior multipole ``3 <= l < LMAX_G``."""
+
+    return (
+        k * l / (2 * l + 1) * theta_lm1
+        - k * (l + 1) / (2 * l + 1) * theta_lp1
+        - opacity * theta_l
+    )
+
+
+def photon_temperature_truncation(
+    theta_lm1: float,
+    theta_l: float,
+    k: float,
+    opacity: float,
+    tau: float,
+    lmax: int,
+) -> float:
+    """Return the truncated photon temperature derivative at ``l = LMAX_G``."""
+
+    return k * theta_lm1 - (lmax + 1) / tau * theta_l - opacity * theta_l
+
+
+def polarization_quadrupole_derivative(
+    e2: float,
+    e3: float,
+    polter: float,
+    k: float,
+    opacity: float,
+) -> float:
+    """Return ``E_2' = -kappa'(E_2 - Pi) - (k/3) E_3``."""
+
+    return -opacity * (e2 - polter) - k / 3.0 * e3
+
+
+def polarization_multipole_derivative(
+    l: int,
+    e_lm1: float,
+    e_l: float,
+    e_lp1: float,
+    k: float,
+    opacity: float,
+) -> float:
+    """Return ``E_l'`` for an interior multipole ``3 <= l < LMAX_POL``."""
+
+    polfac = (l + 3) * (l - 1) / (l + 1)
+    return (
+        -opacity * e_l + k * l / (2 * l + 1) * e_lm1 - polfac * k / (2 * l + 1) * e_lp1
+    )
+
+
+def polarization_truncation(
+    e_lm1: float,
+    e_l: float,
+    k: float,
+    opacity: float,
+    tau: float,
+    lmax: int,
+) -> float:
+    """Return the truncated E-mode derivative at ``l = LMAX_POL``."""
+
+    return -opacity * e_l + k * lmax / (2 * lmax + 1) * e_lm1 - (lmax + 3) / tau * e_l
+
+
+def neutrino_monopole_derivative(z: float, qr: float, k: float) -> float:
+    """Return ``N_0' = -k (4/3 z + q_nu)`` (neutrino continuity)."""
+
+    return -k * (4.0 / 3.0 * z + qr)
+
+
+def neutrino_dipole_derivative(clxr: float, pir: float, k: float) -> float:
+    """Return ``N_1' = (k/3)(delta_nu - 2 pi_nu)`` (neutrino momentum)."""
+
+    return k / 3.0 * (clxr - 2.0 * pir)
+
+
+def neutrino_quadrupole_derivative(
+    qr: float,
+    n3: float,
+    sigma: float,
+    k: float,
+) -> float:
+    """Return ``N_2' = (2k/5) q_nu - (3k/5) N_3 + (8/15) k sigma``."""
+
+    return 2.0 * k / 5.0 * qr - 3.0 * k / 5.0 * n3 + 8.0 / 15.0 * k * sigma
+
+
+def neutrino_multipole_derivative(
+    l: int,
+    n_lm1: float,
+    n_l: float,
+    n_lp1: float,
+    k: float,
+) -> float:
+    """Return ``N_l'`` for an interior multipole ``3 <= l < LMAX_NR``."""
+
+    return k * l / (2 * l + 1) * n_lm1 - k * (l + 1) / (2 * l + 1) * n_lp1
+
+
+def neutrino_truncation(
+    n_lm1: float,
+    n_l: float,
+    k: float,
+    tau: float,
+    lmax: int,
+) -> float:
+    """Return the truncated neutrino derivative ``N_L' = k N_{L-1} - (L+1) N_L / tau``."""
+
+    return k * n_lm1 - (lmax + 1) / tau * n_l
+
+
+# ============================================================
+# FULL RIGHT-HAND SIDE
+# ============================================================
+
+
+def boltzmann_rhs(
+    tau: float,
+    y,
+    k: float,
+    a: float,
+    opacity: float,
+    cs2_b: float,
+    grhog: float,
+    grhornomass: float,
+    grhoc: float,
+    grhob: float,
+    grhov: float,
+) -> tuple[float, ...]:
+    """Return the Einstein-Boltzmann right-hand side ``dy/dtau``.
+
+    Assembles the synchronous-gauge hierarchy from the scalar helpers above. The
+    background scale factor ``a``, Thomson opacity ``kappa' = opacity``, and
+    baryon sound speed ``cs2_b`` are supplied as scalars evaluated at ``tau`` by
+    the caller (typically from precomputed splines). The full photon,
+    polarization, and neutrino hierarchies are integrated at all times; the
+    early-time photon-baryon scattering enters through the exact Thomson drag
+    terms, so a stiff ODE solver handles the high-opacity regime directly without
+    a tight-coupling approximation.
+
+    ``y`` is indexed positionally; the returned tuple has length :data:`NVAR`.
+    """
+
+    grhog_t, grhor_t, grhoc_t, grhob_t, grhov_t = comoving_densities(
+        a, grhog, grhornomass, grhoc, grhob, grhov
+    )
+    adotoa = expansion_rate(grhog_t, grhor_t, grhoc_t, grhob_t, grhov_t)
+
+    etak = y[IX_ETAK]
+    clxc = y[IX_CLXC]
+    clxb = y[IX_CLXB]
+    vb = y[IX_VB]
+    clxg = y[IX_G]
+    qg = y[IX_G + 1]
+    pig = y[IX_G + 2]
+    clxr = y[IX_R]
+    qr = y[IX_R + 1]
+    pir = y[IX_R + 2]
+    e2 = y[IX_POL] if LMAX_POL >= 2 else 0.0
+
+    dgrho = density_perturbation(
+        grhob_t, clxb, grhoc_t, clxc, grhog_t, clxg, grhor_t, clxr
+    )
+    dgq = momentum_perturbation(grhob_t, vb, grhog_t, qg, grhor_t, qr)
+    z = metric_z(dgrho, etak, adotoa, k)
+    sigma = shear_sigma(z, dgq, k)
+
+    photbar = grhog_t / grhob_t
     pb43 = 4.0 / 3.0 * photbar
+    delta_p_b = cs2_b * clxb
 
-    # massive neutrinos
-    rhonu = jnp.exp(take_idx(param['logrhonu_of_loga_spline'].evaluate(loga)))
-    pnu = jnp.exp(take_idx(param['logpnu_of_loga_spline'].evaluate(loga)))
+    dy = [0.0] * NVAR
 
-    # ... quintessence
-    cs2_Q              = take_idx(param['cs2_DE'])
-    w_Q                = take_idx(param['w_DE_0'] + param['w_DE_a'] * (1.0 - a) )
-    rho_Q              = take_idx(a**(-3*(1+param['w_DE_0']+param['w_DE_a'])) * jnp.exp(3*(a-1)*param['w_DE_a']))
-    rho_plus_p_theta_Q = take_idx((1+w_Q) * rho_Q * param['grhom'] * param['OmegaDE'] * thetaq * a**2)
-    
-    # ... homogeneous background
-    # grho = (
-    #     param['grhom'] * param['Omegam'] / a
-    #     + (param['grhog'] + param['grhor'] * (param['Neff'] + param['Nmnu'] * rhonu)) / a**2
-    #     + param['grhom'] * param['OmegaDE'] * rho_Q * a**2
-    #     + param['grhom'] * param['Omegak']
-    # )
+    # Metric, CDM, baryon density.
+    dy[IX_ETAK] = metric_etak_derivative(dgq)
+    dy[IX_CLXC] = cdm_density_derivative(z, k)
+    dy[IX_CLXB] = baryon_density_derivative(z, vb, k)
 
-    # gpres = (
-    #     (param['grhog'] + param['grhor'] * param['Neff']) / 3.0 + param['grhor'] * param['Nmnu'] * pnu
-    # ) / a**2 + w_Q * param['grhom'] * param['OmegaDE'] * rho_Q * a**2
-
-    # ... compute expansion rate
-    aprimeoa = take_idx(get_aprimeoa( param=param, aexp=a ))
-    xeprime = take_idx(param['xe_of_loga_spline'].derivative( loga ) * aprimeoa)
-    gpres = take_idx((
-        (param['grhog'] + param['grhor'] * param['Neff']) / 3.0 + param['grhor'] * param['Nmnu'] * pnu
-    ) / a**2 + w_Q * param['grhom'] * param['OmegaDE'] * rho_Q * a**2)
-    aprimeprimeoa = take_idx(0.5 * (aprimeoa**2 - gpres))
-    # aprimeoa = jnp.sqrt(grho / 3.0)                # Friedmann I
-    # aprimeprimeoa = 0.5 * (aprimeoa**2 - gpres)    # Friedmann II
-
-    # quintessence EOS time derivatives
-    w_Q_prime = take_idx( -param['w_DE_a'] * aprimeoa * a)
-    ca2_Q     = w_Q - w_Q_prime / 3 / ((1+w_Q)+1e-6) / aprimeoa
-
-    # ... Thomson opacity coefficient
-    akthom = take_idx(2.3038921003709498e-9 * (1.0 - param['YHe']) * param['Omegab'] * param['H0']**2)
-
-    # ... Thomson opacity
-    opac    = take_idx(xe * akthom / a**2)
-    opac = jnp.clip(opac, 0, 1e3)
-    #jax.lax.cond(kmode>0.001548,
-    #  lambda :jax.debug.print("OPAC = {opac} (a={a}, xe={xe}, akthom={akthom})", a=a, xe=take_idx(xe), akthom=akthom, opac=opac),
-    #  lambda:None
-    #  )
-    tauc    = take_idx(1. / jnp.maximum(opac, 1e-30))
-    taucprime = take_idx(tauc * (2 * aprimeoa - xeprime / jnp.maximum(xe, 1e-30)))
-    tauh = take_idx(1.0 / jnp.maximum(aprimeoa, 1e-30))
-    tauk = take_idx(1.0 / jnp.maximum(kmode, 1e-30))
-
-    do_relativistic_sa = jnp.logical_and(
-        jnp.asarray(use_rsa),
-        in_rsa_regime(
-            tau=tau,
-            kmode=kmode,
-            tau_c=tauc,
-            tau_c_over_tau_trigger=tau_c_over_tau_trigger,
-            tau_over_tau_k_trigger=tau_over_tau_k_trigger,
-        ),
-    )
-    do_ur_fluid = jnp.logical_and(
-        jnp.logical_not(do_relativistic_sa),
-        jnp.logical_and(
-            jnp.asarray(use_ur_fluid),
-            in_ur_fluid_regime(
-                tau=tau,
-                kmode=kmode,
-                tau_over_tau_k_trigger=ur_fluid_tau_over_tau_k_trigger,
-            ),
-        ),
-    )
-    do_tca = jnp.logical_and(
-        jnp.logical_not(do_relativistic_sa),
-        jnp.logical_and(
-            jnp.asarray(use_tca),
-            in_tca_regime(
-                tau_h=tauh,
-                tau_k=tauk,
-                tau_c=tauc,
-                tau_c_over_tau_h_trigger=tca_tau_c_over_tau_h_trigger,
-                tau_c_over_tau_k_trigger=tca_tau_c_over_tau_k_trigger,
-            ),
-        ),
+    polter = polarization_source(pig, e2)
+    vbdot = baryon_velocity_derivative(adotoa, vb, k, delta_p_b, photbar, opacity, qg)
+    dy[IX_VB] = vbdot
+    dy[IX_G] = photon_monopole_derivative(z, qg, k)
+    dy[IX_G + 1] = photon_dipole_derivative(
+        vbdot, adotoa, vb, k, delta_p_b, pb43, clxg, pig
     )
 
-    #tauc    = 1. / opac
-    #taucprime = tauc * (2*aprimeoa - xeprime/xe)
-    #F       = tauc / (1+pb43) #CLASS perturbations.c:10072
-    #Fprime  = taucprime/(1+pb43) + tauc*pb43*aprimeoa/(1+pb43)**2 #CLASS perturbations.c:10074
-
-    
-    # ... background scale factor evolution
-    #print(f.shape, (aprimeoa*a).shape)
-    f = f.at[0].set( aprimeoa * a )
-    
-    # ... evaluate metric perturbations
-    drhonu, dpnu, fnu, shearnu = nu_perturb( a, take_idx(param['amnu']), y[iq0:iq1], y[iq1:iq2], y[iq2:iq3], nqmax=nqmax )
-
-    dgrho = (
-        take_idx(param['grhom']) * (Omegac * deltac + take_idx(param['Omegab']) * deltab) / a
-        + (take_idx(param['grhog']) * deltag + take_idx(param['grhor']) * (take_idx(param['Neff']) * deltar + take_idx(param['Nmnu']) * drhonu)) / a**2
-        + take_idx(param['grhom'] * param['OmegaDE']) * deltaq * rho_Q * a**2
+    theta3 = y[IX_G + 3] if LMAX_G >= 3 else 0.0
+    dy[IX_G + 2] = photon_quadrupole_derivative(
+        qg, theta3, pig, polter, sigma, k, opacity
     )
-
-    # RSA metric estimate without relativistic species (BLT11-inspired closure)
-    dgrho_wo_rel = take_idx(
-        param['grhom'] * (Omegac * deltac + param['Omegab'] * deltab) / a
-        + param['grhor'] * param['Nmnu'] * drhonu / a**2
-        + param['grhom'] * param['OmegaDE'] * deltaq * rho_Q * a**2
-    )
-    hprime_rsa = to_scalar((2.0 * kmode**2 * eta + dgrho_wo_rel) / jnp.maximum(aprimeoa, 1e-30))
-    deltag_rsa, thetag_rsa, shearg_rsa, deltar_rsa, thetar_rsa, shearr_rsa = compute_fields_rsa(
-        kmode=kmode,
-        aprimeoa=aprimeoa,
-        hprime=hprime_rsa,
-        eta=eta,
-        deltab=deltab,
-        thetab=thetab,
-        cs2_b=cs2,
-        tau_c=tauc,
-        tau_c_prime=taucprime,
-    )
-
-    deltag_eff = jnp.where(do_relativistic_sa, deltag_rsa, deltag)
-    thetag_eff = jnp.where(do_relativistic_sa, thetag_rsa, thetag)
-    shearg_eff = jnp.where(do_relativistic_sa, shearg_rsa, shearg)
-    deltar_eff = jnp.where(do_relativistic_sa, deltar_rsa, deltar)
-    thetar_eff = jnp.where(do_relativistic_sa, thetar_rsa, thetar)
-    shearr_eff = jnp.where(do_relativistic_sa, shearr_rsa, shearr)
-
-    dgpres = take_idx(
-        (param['grhog'] * deltag_eff + param['grhor'] * param['Neff'] * deltar_eff) / a**2 / 3.0 
-        + param['grhor'] * param['Nmnu'] * dpnu / a**2 
-        + (cs2_Q * param['grhom'] * param['OmegaDE'] * deltaq * rho_Q * a**2 + (cs2_Q-ca2_Q)*(3*aprimeoa * rho_plus_p_theta_Q / kmode**2))
-    )
-    dgtheta = take_idx(
-        param['grhom'] * (Omegac * thetac + param['Omegab'] * thetab) / a
-        + 4.0 / 3.0 * (param['grhog'] * thetag_eff + param['Neff'] * param['grhor'] * thetar_eff) / a**2
-        + param['Nmnu'] * param['grhor'] * kmode * fnu / a**2
-        + rho_plus_p_theta_Q
-    )
-    dgshear = take_idx(
-        4.0 / 3.0 * (param['grhog'] * shearg_eff + param['Neff'] * param['grhor'] * shearr_eff) / a**2
-        + param['Nmnu'] * param['grhor'] * shearnu / a**2
-    )
-
-    dahprimedtau = -(dgrho + 3.0 * dgpres) * a
-    
-
-    f = f.at[1].set( dahprimedtau )
-    
-
-    # ... force energy conservation
-    hprime_full = to_scalar((2.0 * kmode**2 * eta + dgrho) / aprimeoa)
-    hprime = to_scalar(jnp.where(do_relativistic_sa, hprime_rsa, hprime_full))
-
-    etaprime = to_scalar(0.5 * dgtheta / kmode**2)
-    alpha  = to_scalar((hprime + 6.*etaprime)/2./kmode**2)
-    f = f.at[2].set( etaprime )
-    
-    # alphaprime = -3*dgshear/(2*kmode**2) + eta - 2*aprimeoa*alpha
-    # alphaprime -=  9/2 * a**2/kmode**2 * 4/3 * 16/45/opac * (thetag+kmode**2*alpha) * param['grhog']
-
-    # ... cdm equations of motion, MB95 eq. (42)
-    deltacprime = -thetac - 0.5 * hprime
-    f = f.at[3].set( deltacprime )
-    thetacprime = -aprimeoa * thetac  # thetac = 0 in synchronous gauge!
-    f = f.at[4].set( thetacprime )
-
-    idxb = 5
-    # --- baryon equations of motion, MB95 eqs. (66) ---------------------------------------------
-    # ... baryon density, BLT11 eq. (2.1a)
-    deltabprime = -thetab - 0.5 * hprime
-    f = f.at[idxb+0].set( deltabprime )
-    # ... baryon velocity, BLT11 eq. (2.1b)
-
-    thetabprime = -aprimeoa * thetab + kmode**2 * cs2 * deltab \
-                + pb43 * opac * (thetag_eff - thetab)
-    thetabprime = jnp.where(thetabprime > 1e10, 1e10, thetabprime)
-    f = f.at[idxb+1].set( thetabprime )
-
-    # --- photon equations of motion, MB95 eqs. (63) ---------------------------------------------
-    idxg  = 7
-    idxgp = 7 + (lmaxg+1)
-
-
-    def _photon_hierarchy(f_in):
-        # ... polarization term
-        polter = y[idxg+2] + y[idxgp+0] + y[idxgp+2]
-        # ... photon density, BLT11 eq. (2.4a)
-        deltagprime = 4.0 / 3.0 * (-thetag_eff - 0.5 * hprime)
-        f_in = f_in.at[idxg+0].set( deltagprime )
-        # ... photon velocity, BLT11 eq. (2.4b)
-        thetagprime = kmode**2 * (0.25 * deltag_eff - s2_squared * shearg_eff) \
-                    - opac * (thetag_eff - thetab)
-        f_in = f_in.at[idxg+1].set( thetagprime )
-        # ... photon shear, BLT11 eq. (2.4c)
-        sheargprime = 8./15. * (thetag_eff+kmode**2*alpha) -3/5*kmode*s_l3/s_l2*y[idxg+3] \
-                    - opac*(y[idxg+2]-0.1*s_l2*polter)
-        sheargprime = jnp.where(jnp.abs(sheargprime)>1e10, 1e10, sheargprime)
-        f_in = f_in.at[idxg+2].set( sheargprime )
-
-        #... photon temperature l>=3, BLT11 eq. (2.4d)
-        ell  = jnp.arange(3, lmaxg )
-        res = kmode  / (2 * ell + 1) * (ell * y[idxg+ell-1] - (ell + 1) * y[idxg+ell+1]) - opac * y[idxg+ell]
-        res = jnp.where(jnp.abs(res) > 1e10, 1e10, res)
-        f_in = f_in.at[idxg+ell].set( res )
-        # photon temperature hierarchy truncation, BLT11 eq. (2.5)
-        f_in = f_in.at[idxg+lmaxg].set( kmode * y[idxg+lmaxg-1] - (lmaxg + 1) / tau * y[idxg+lmaxg] - opac * y[idxg+lmaxg] )
-
-        #... polarization equations, BLT11 eq. (2.4e)
-        ell  = jnp.arange(0, lmaxgp) # l=0...lmaxgp-1
-        f_in = f_in.at[idxgp+ell].set( kmode  / (2 * ell + 1) * (ell * y[idxgp+ell-1] - (ell + 1) * y[idxgp+ell+1]) - opac * y[idxgp+ell] )
-        f_in = f_in.at[idxgp+0].add( opac * polter / 2 )  # photon polarization l=0
-        f_in = f_in.at[idxgp+2].add( opac * polter / 10 ) # photon polarization l=2
-
-        # photon polarization hierarchy truncation
-        f_in = f_in.at[idxgp+lmaxgp].set( kmode * y[idxgp+lmaxgp-1] - (lmaxgp + 1) / tau * y[idxgp+lmaxgp] - opac * y[idxgp+lmaxgp] )
-        return f_in
-
-    def _photon_tca(f_in):
-        deltabprime_tca = -thetab - 0.5 * hprime
-        thetabprime_tca = (
-            -aprimeoa * thetab + kmode**2 * cs2 * deltab + kmode**2 * pb43 * (0.25 * deltag - s2_squared * shearg)
-        ) / (1.0 + pb43)
-
-        deltagprime_tca = 4.0 / 3.0 * (-thetag - 0.5 * hprime)
-        slip = (
-            2.0 * pb43 / (1.0 + pb43) * aprimeoa * (thetab - thetag)
-            + tauc
-            * (
-                -aprimeprimeoa * thetab
-                - 0.5 * aprimeoa * kmode**2 * deltag
-                + kmode**2 * (cs2 * deltabprime_tca - 0.25 * deltagprime_tca)
-            )
-            / (1.0 + pb43)
+    for l in range(3, LMAX_G):
+        dy[IX_G + l] = photon_temperature_multipole_derivative(
+            l, y[IX_G + l - 1], y[IX_G + l], y[IX_G + l + 1], k, opacity
         )
-        thetabprime_tca = thetabprime_tca + pb43 / (1.0 + pb43) * slip
-        thetagprime_tca = (-thetabprime_tca - aprimeoa * thetab + kmode**2 * cs2 * deltab) / jnp.maximum(pb43, 1e-30) + kmode**2 * (
-            0.25 * deltag - s2_squared * shearg
+    dy[IX_G + LMAX_G] = photon_temperature_truncation(
+        y[IX_G + LMAX_G - 1], y[IX_G + LMAX_G], k, opacity, tau, LMAX_G
+    )
+
+    # Photon polarization.
+    e3 = y[IX_POL + 1] if LMAX_POL >= 3 else 0.0
+    dy[IX_POL] = polarization_quadrupole_derivative(e2, e3, polter, k, opacity)
+    for l in range(3, LMAX_POL):
+        idx = IX_POL + l - 2
+        dy[idx] = polarization_multipole_derivative(
+            l, y[idx - 1], y[idx], y[idx + 1], k, opacity
         )
-
-        f_in = f_in.at[idxb + 0].set(deltabprime_tca)
-        f_in = f_in.at[idxb + 1].set(thetabprime_tca)
-        f_in = f_in.at[idxg + 0].set(deltagprime_tca)
-        f_in = f_in.at[idxg + 1].set(thetagprime_tca)
-        f_in = f_in.at[idxg + 2:idxg + lmaxg + 1].set(0.0)
-        f_in = f_in.at[idxgp:idxgp + lmaxgp + 1].set(0.0)
-        return f_in
-
-    def _photon_rsa(f_in):
-        return f_in.at[idxg:idxg + lmaxg + 1].set(0.0).at[idxgp:idxgp + lmaxgp + 1].set(0.0)
-
-    f = jax.lax.cond(
-        do_relativistic_sa,
-        _photon_rsa,
-        lambda f_in: jax.lax.cond(do_tca, _photon_tca, _photon_hierarchy, f_in),
-        f,
+    idx_last = IX_POL + LMAX_POL - 2
+    dy[idx_last] = polarization_truncation(
+        y[idx_last - 1], y[idx_last], k, opacity, tau, LMAX_POL
     )
 
-    # --- Massless neutrino equations of motion -------------------------------------------------------
-    idxr = 9 + lmaxg + lmaxgp
-    deltarprime = 4.0 / 3.0 * (-thetar_eff - 0.5 * hprime)
-    f = f.at[idxr+0].set( deltarprime )
-    thetarprime = kmode**2 * (0.25 * deltar_eff - shearr_eff)
-    f = f.at[idxr+1].set( thetarprime )
-
-    def _massless_nu_hierarchy(f_in):
-        shearrprime = 8./15. * (thetar_eff + kmode**2 * alpha) - 0.6 * kmode * y[idxr+3]
-        f_in = f_in.at[idxr+2].set( shearrprime )
-        ell = jnp.arange(3, lmaxr)
-        f_in = f_in.at[idxr+ell].set( kmode / (2 * ell + 1) * (ell * y[idxr+ell-1] - (ell + 1) * y[idxr+ell+1]) )
-
-        # ... truncate moment expansion
-        f_in = f_in.at[idxr+lmaxr].set( kmode * y[idxr+lmaxr-1] - (lmaxr + 1) / tau * y[idxr+lmaxr] )
-        return f_in
-
-    def _massless_nu_ufa(f_in):
-        shearrprime = compute_shearprime_ufa(
-            tau=tau,
-            shearr=shearr_eff,
-            thetar=thetar_eff,
-            hprime=hprime,
+    # Massless neutrinos (collisionless).
+    dy[IX_R] = neutrino_monopole_derivative(z, qr, k)
+    dy[IX_R + 1] = neutrino_dipole_derivative(clxr, pir, k)
+    n3 = y[IX_R + 3] if LMAX_NR >= 3 else 0.0
+    dy[IX_R + 2] = neutrino_quadrupole_derivative(qr, n3, sigma, k)
+    for l in range(3, LMAX_NR):
+        dy[IX_R + l] = neutrino_multipole_derivative(
+            l, y[IX_R + l - 1], y[IX_R + l], y[IX_R + l + 1], k
         )
-        f_in = f_in.at[idxr+2].set( shearrprime )
-        return f_in.at[idxr+3:idxr + lmaxr + 1].set(0.0)
-
-    def _massless_nu_rsa(f_in):
-        return f_in.at[idxr:idxr + lmaxr + 1].set(0.0)
-
-    f = jax.lax.cond(
-        do_relativistic_sa,
-        _massless_nu_rsa,
-        lambda f_in: jax.lax.cond(do_ur_fluid, _massless_nu_ufa, _massless_nu_hierarchy, f_in),
-        f,
+    dy[IX_R + LMAX_NR] = neutrino_truncation(
+        y[IX_R + LMAX_NR - 1], y[IX_R + LMAX_NR], k, tau, LMAX_NR
     )
 
-    # --- Massive neutrino equations of motion --------------------------------------------------------
-    q, _ = get_neutrino_momentum_bins( nqmax )
-    #q = q[:, None]
-    aq = a * take_idx(param['amnu']) / q
-
-    v = 1 / jnp.sqrt(1 + aq**2)
-    dlfdlq = -q / (1.0 + jnp.exp(-q))  # derivative of the Fermi-Dirac distribution
-
-
-    f = f.at[iq0 : iq1].set(
-        -kmode * v * y[iq1 : iq2] + hprime* dlfdlq / 6.0 
-    )
-
-    f = f.at[iq1 : iq2].set(
-        kmode * v * (y[iq0 : iq1] - 2.0 * y[iq2 : iq3]) / 3.0
-    )
-
-    f = f.at[iq2 : iq3].set(
-        kmode * v * (2 * y[iq1 : iq2] - 3 * y[iq3 : iq4]) / 5.0 - (hprime / 15 + 2 / 5 * etaprime) * dlfdlq
-    )
-
-    ell = jnp.arange(3, lmaxnu)
-    vv = jnp.tile(v, lmaxnu - 3)
-    denl = jnp.repeat( 2*ell+1, nqmax)
-    
-
-    f = f.at[iq0 + 3 * nqmax : iq0 + lmaxnu * nqmax].set(
-        kmode * vv / denl * (
-            jnp.repeat( ell, nqmax) * y[iq0 + 2*nqmax : iq0 + (lmaxnu-1)*nqmax] 
-            - jnp.repeat( ell+1, nqmax) * y[iq0 + 4*nqmax : iq0 + (lmaxnu+1)*nqmax]
-        ) 
-    )
-
-
-    # Truncate moment expansion.
-    f = f.at[-nqmax-2 :-2].set(
-        kmode * v * y[-2 * nqmax-2 : -nqmax-2] - (lmaxnu + 1) / tau * y[-nqmax-2 :-2]
-    )
-
-    # ---- Quintessence equations of motion -----------------------------------------------------------
-    # ... Ballesteros & Lesgourgues (2010, BL10), arXiv:1004.5509
-    f = f.at[-2].set( # BL10, eq. (3.5)
-        -(1+w_Q) *(thetaq + 0.5 * hprime) - 3*(cs2_Q - w_Q) * aprimeoa * deltaq - 9*(1+w_Q)*(cs2_Q-ca2_Q)*aprimeoa**2/kmode**2 * thetaq
-    )
-    f = f.at[-1].set( # BL10, eq. (3.6)
-        -(1-3*cs2_Q)*aprimeoa*thetaq + cs2_Q/(1+w_Q) * kmode**2 * deltaq
-    )
-
-    #jax.lax.cond(
-    #   f_norm > 1e5,
-    #   lambda: jax.debug.callback(lambda t,norm, y:print(f"⚠️ Crisis at t={t} | dy norm: {norm} | y: {y}"), a, f_norm, y),
-    #   lambda: None
-    #)
-    #jax.debug.print("a={a} -> in = {y}, out = {f}", a=a, y=y, f=f)
-    #print("Inside ODE:",y.shape, f.shape)
-    #worst_index = jnp.argmax(jnp.abs(f))
-    #worst_value = f[worst_index]
-    #jax.debug.print("a={a:.2e} , tau = {tau:.2e}, -> norm={m}  < worst = {i}, w={w}", tau=tau,a=a,m=jnp.linalg.norm(f), i=worst_index, w=worst_value)
-    return f.flatten()
-    #return f
-
-
-
-def model_synchronous_ALL(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax ):     
-    """Solve the synchronous gauge perturbation equations for a single mode.
-
-    Parameters
-    ----------
-    tau : float
-        conformal time
-    yin : array_like
-        input vector of perturbations
-    param : array_like
-        dictionary of parameters and interpolated background functions
-    kmode : float
-        wavenumber of modef
-    lmaxg : int
-        maximum photon temperature hierarchy multipole
-    lmaxgp : int
-        maximum photon polarization hierarchy multipole
-    lmaxr : int
-        maximum massless neutrino hierarchy multipole
-    lmaxnu : int
-        maximum neutrino hierarchy multipole
-    nqmax : int
-        maximum number of momentum bins for massive neutrinos
-
-    Returns
-    -------
-    f : array_like
-        RHS of perturbation equations
-    """
-    print("Inside ODE:",y.shape)
-    def to_scalar(x):
-        return jnp.ravel(x)[0]
-    rsa_settings = get_approximation_settings(param)
-    use_tca = rsa_settings['use_tca']
-    tca_tau_c_over_tau_h_trigger = rsa_settings['tca_tau_c_over_tau_h_trigger']
-    tca_tau_c_over_tau_k_trigger = rsa_settings['tca_tau_c_over_tau_k_trigger']
-    use_rsa = rsa_settings['use_rsa']
-    tau_c_over_tau_trigger = rsa_settings['tau_c_over_tau_trigger']
-    tau_over_tau_k_trigger = rsa_settings['tau_over_tau_k_trigger']
-    use_ur_fluid = rsa_settings['use_ur_fluid']
-    ur_fluid_tau_over_tau_k_trigger = rsa_settings['ur_fluid_tau_over_tau_k_trigger']
-
-    #y = jnp.ravel(y)
-    tau = to_scalar(tau)
-    kmode = to_scalar(kmode)
-    Omegac = param['Omegam'] - param['Omegab']
-
-    iq0 = 10 + lmaxg + lmaxgp + lmaxr
-    iq1 = iq0 + nqmax
-    iq2 = iq1 + nqmax
-    iq3 = iq2 + nqmax
-    iq4 = iq3 + nqmax
-
-    # y = jnp.copy(yin)
-    f = jnp.zeros_like( y )
-
-    #TODO: add curvature
-    # ... curvature
-    K = 0
-    tau = tau + 1e-50
-    
-    # def cotKgen_zero_curv():
-    #     return 1.0/(kmode*tau)
-    # def cotKgen_pos_curv():
-    #     return jnp.sqrt(K)/kmode/jnp.tan(jnp.sqrt(K)*tau)
-    # def cotKgen_neg_curv():
-    #     return jnp.sqrt(-K)/kmode/jnp.tanh(jnp.sqrt(-K)*tau)
-    
-    # cotKgen = jax.lax.switch(int(1+jax.lax.sign(K)), [cotKgen_neg_curv, cotKgen_zero_curv, cotKgen_pos_curv])
-    s2_squared = 1.-3.*K/kmode**2
-    s_l2 = 1.0
-    s_l3 = 1.0
-
-    # ... metric
-    a = y[0]
-    loga = jnp.log(a)
-
-    #ahprime = y[1]
-    eta = y[2]
-
-    # ... cdm
-    deltac = y[3]
-    thetac = y[4]
-
-    # ... baryons
-    deltab = y[5]
-    thetab = y[6]
-
-    # ... photons
-    deltag = y[7]
-    thetag = y[8]
-    shearg = y[9] / 2.0
-
-    # ... massless neutrinos
-    deltar = y[ 9 + lmaxg + lmaxgp]
-    thetar = y[10 + lmaxg + lmaxgp]
-    shearr = y[11 + lmaxg + lmaxgp] / 2.0
-
-    # ... quintessence field
-    deltaq = y[-2]
-    thetaq = y[-1]
-
-    # ... evaluate thermodynamics
-    # tempb   = param['tempba_of_tau_spline'].evaluate( tau ) / a
-    # xeprime = param['xe_of_tau_spline'].derivative( tau )
-    # cs2     = param['cs2a_of_tau_spline'].evaluate( tau ) / a
-    # xe      = param['xe_of_tau_spline'].evaluate( tau )
-
-    # Use pre-composed splines for direct log(a) lookup (performance optimization)
-    cs2     = to_scalar(param['cs2a_of_loga_spline'].evaluate( loga ))/a
-    xe      = to_scalar(param['xe_of_loga_spline'].evaluate( loga ))
-    
-    # ... Photon mass density over baryon mass density
-    photbar = param['grhog'] / (param['grhom'] * param['Omegab'] * a)
-    pb43 = 4.0 / 3.0 * photbar
-
-    # massive neutrinos
-    rhonu = jnp.exp(param['logrhonu_of_loga_spline'].evaluate(loga))
-    pnu = jnp.exp(param['logpnu_of_loga_spline'].evaluate(loga))
-
-    # ... quintessence
-    cs2_Q              = param['cs2_DE'] 
-    w_Q                = param['w_DE_0'] + param['w_DE_a'] * (1.0 - a) 
-    rho_Q              = a**(-3*(1+param['w_DE_0']+param['w_DE_a'])) * jnp.exp(3*(a-1)*param['w_DE_a'])
-    rho_plus_p_theta_Q = (1+w_Q) * rho_Q * param['grhom'] * param['OmegaDE'] * thetaq * a**2
-    
-    # ... homogeneous background
-    # grho = (
-    #     param['grhom'] * param['Omegam'] / a
-    #     + (param['grhog'] + param['grhor'] * (param['Neff'] + param['Nmnu'] * rhonu)) / a**2
-    #     + param['grhom'] * param['OmegaDE'] * rho_Q * a**2
-    #     + param['grhom'] * param['Omegak']
-    # )
-
-    # gpres = (
-    #     (param['grhog'] + param['grhor'] * param['Neff']) / 3.0 + param['grhor'] * param['Nmnu'] * pnu
-    # ) / a**2 + w_Q * param['grhom'] * param['OmegaDE'] * rho_Q * a**2
-
-    # ... compute expansion rate
-    aprimeoa = to_scalar(get_aprimeoa( param=param, aexp=a ))
-    xeprime = to_scalar(param['xe_of_loga_spline'].derivative( loga ) * aprimeoa)
-    gpres = (
-        (param['grhog'] + param['grhor'] * param['Neff']) / 3.0 + param['grhor'] * param['Nmnu'] * pnu
-    ) / a**2 + w_Q * param['grhom'] * param['OmegaDE'] * rho_Q * a**2
-    aprimeprimeoa = to_scalar(0.5 * (aprimeoa**2 - gpres))
-    # aprimeoa = jnp.sqrt(grho / 3.0)                # Friedmann I
-    # aprimeprimeoa = 0.5 * (aprimeoa**2 - gpres)    # Friedmann II
-
-    # quintessence EOS time derivatives
-    w_Q_prime = -param['w_DE_a'] * aprimeoa * a
-    ca2_Q     = w_Q - w_Q_prime / 3 / ((1+w_Q)+1e-6) / aprimeoa
-
-    # ... Thomson opacity coefficient
-    akthom = 2.3038921003709498e-9 * (1.0 - param['YHe']) * param['Omegab'] * param['H0']**2
-
-    # ... Thomson opacity
-    opac    = to_scalar(xe * akthom / a**2)
-    tauc    = to_scalar(1. / jnp.maximum(opac, 1e-30))
-    taucprime = to_scalar(tauc * (2 * aprimeoa - xeprime / jnp.maximum(xe, 1e-30)))
-    tauh = to_scalar(1.0 / jnp.maximum(aprimeoa, 1e-30))
-    tauk = to_scalar(1.0 / jnp.maximum(kmode, 1e-30))
-
-    do_relativistic_sa = jnp.logical_and(
-        jnp.asarray(use_rsa),
-        in_rsa_regime(
-            tau=tau,
-            kmode=kmode,
-            tau_c=tauc,
-            tau_c_over_tau_trigger=tau_c_over_tau_trigger,
-            tau_over_tau_k_trigger=tau_over_tau_k_trigger,
-        ),
-    )
-    do_ur_fluid = jnp.logical_and(
-        jnp.logical_not(do_relativistic_sa),
-        jnp.logical_and(
-            jnp.asarray(use_ur_fluid),
-            in_ur_fluid_regime(
-                tau=tau,
-                kmode=kmode,
-                tau_over_tau_k_trigger=ur_fluid_tau_over_tau_k_trigger,
-            ),
-        ),
-    )
-    do_tca = jnp.logical_and(
-        jnp.logical_not(do_relativistic_sa),
-        jnp.logical_and(
-            jnp.asarray(use_tca),
-            in_tca_regime(
-                tau_h=tauh,
-                tau_k=tauk,
-                tau_c=tauc,
-                tau_c_over_tau_h_trigger=tca_tau_c_over_tau_h_trigger,
-                tau_c_over_tau_k_trigger=tca_tau_c_over_tau_k_trigger,
-            ),
-        ),
-    )
-    #tauc    = 1. / opac
-    #taucprime = tauc * (2*aprimeoa - xeprime/xe)
-    #F       = tauc / (1+pb43) #CLASS perturbations.c:10072
-    #Fprime  = taucprime/(1+pb43) + tauc*pb43*aprimeoa/(1+pb43)**2 #CLASS perturbations.c:10074
-
-    
-    # ... background scale factor evolution
-    print(f.shape, (aprimeoa*a).shape)
-    f = f.at[0].set( aprimeoa * a )
-    
-    # ... evaluate metric perturbations
-    drhonu, dpnu, fnu, shearnu = nu_perturb( a, param['amnu'], y[iq0:iq1], y[iq1:iq2], y[iq2:iq3], nqmax=nqmax )
-
-    dgrho = (
-        param['grhom'] * (Omegac * deltac + param['Omegab'] * deltab) / a
-        + (param['grhog'] * deltag + param['grhor'] * (param['Neff'] * deltar + param['Nmnu'] * drhonu)) / a**2
-        + param['grhom'] * param['OmegaDE'] * deltaq * rho_Q * a**2
-    )
-
-    # RSA metric estimate without relativistic species (BLT11-inspired closure)
-    dgrho_wo_rel = (
-        param['grhom'] * (Omegac * deltac + param['Omegab'] * deltab) / a
-        + param['grhor'] * param['Nmnu'] * drhonu / a**2
-        + param['grhom'] * param['OmegaDE'] * deltaq * rho_Q * a**2
-    )
-    hprime_rsa = to_scalar((2.0 * kmode**2 * eta + dgrho_wo_rel) / jnp.maximum(aprimeoa, 1e-30))
-    deltag_rsa, thetag_rsa, shearg_rsa, deltar_rsa, thetar_rsa, shearr_rsa = compute_fields_rsa(
-        kmode=kmode,
-        aprimeoa=aprimeoa,
-        hprime=hprime_rsa,
-        eta=eta,
-        deltab=deltab,
-        thetab=thetab,
-        cs2_b=cs2,
-        tau_c=tauc,
-        tau_c_prime=taucprime,
-    )
-
-    deltag_eff = jnp.where(do_relativistic_sa, deltag_rsa, deltag)
-    thetag_eff = jnp.where(do_relativistic_sa, thetag_rsa, thetag)
-    shearg_eff = jnp.where(do_relativistic_sa, shearg_rsa, shearg)
-    deltar_eff = jnp.where(do_relativistic_sa, deltar_rsa, deltar)
-    thetar_eff = jnp.where(do_relativistic_sa, thetar_rsa, thetar)
-    shearr_eff = jnp.where(do_relativistic_sa, shearr_rsa, shearr)
-    dgpres = (
-        (param['grhog'] * deltag_eff + param['grhor'] * param['Neff'] * deltar_eff) / a**2 / 3.0 
-        + param['grhor'] * param['Nmnu'] * dpnu / a**2 
-        + (cs2_Q * param['grhom'] * param['OmegaDE'] * deltaq * rho_Q * a**2 + (cs2_Q-ca2_Q)*(3*aprimeoa * rho_plus_p_theta_Q / kmode**2))
-    )
-    dgtheta = (
-        param['grhom'] * (Omegac * thetac + param['Omegab'] * thetab) / a
-        + 4.0 / 3.0 * (param['grhog'] * thetag_eff + param['Neff'] * param['grhor'] * thetar_eff) / a**2
-        + param['Nmnu'] * param['grhor'] * kmode * fnu / a**2
-        + rho_plus_p_theta_Q
-    )
-    dgshear = (
-        4.0 / 3.0 * (param['grhog'] * shearg_eff + param['Neff'] * param['grhor'] * shearr_eff) / a**2
-        + param['Nmnu'] * param['grhor'] * shearnu / a**2
-    )
-
-    dahprimedtau = -(dgrho + 3.0 * dgpres) * a
-    
-    print(f.shape, (dahprimedtau).shape)
-    f = f.at[1].set( dahprimedtau )
-
-    # ... force energy conservation
-    hprime_full = to_scalar((2.0 * kmode**2 * eta + dgrho) / aprimeoa)
-    hprime = to_scalar(jnp.where(do_relativistic_sa, hprime_rsa, hprime_full))
-
-    etaprime = to_scalar(0.5 * dgtheta / kmode**2)
-    alpha  = to_scalar((hprime + 6.*etaprime)/2./kmode**2)
-    f = f.at[2].set( etaprime )
-    
-    # alphaprime = -3*dgshear/(2*kmode**2) + eta - 2*aprimeoa*alpha
-    # alphaprime -=  9/2 * a**2/kmode**2 * 4/3 * 16/45/opac * (thetag+kmode**2*alpha) * param['grhog']
-
-    # ... cdm equations of motion, MB95 eq. (42)
-    deltacprime = -thetac - 0.5 * hprime
-    f = f.at[3].set( deltacprime )
-    thetacprime = -aprimeoa * thetac  # thetac = 0 in synchronous gauge!
-    f = f.at[4].set( thetacprime )
-
-    idxb = 5
-    # --- baryon equations of motion, MB95 eqs. (66) ---------------------------------------------
-    # ... baryon density, BLT11 eq. (2.1a)
-    deltabprime = -thetab - 0.5 * hprime
-    f = f.at[idxb+0].set( deltabprime )
-    # ... baryon velocity, BLT11 eq. (2.1b)
-    thetabprime = -aprimeoa * thetab + kmode**2 * cs2 * deltab \
-                + pb43 * opac * (thetag_eff - thetab)
-    f = f.at[idxb+1].set( thetabprime )
-
-    # --- photon equations of motion, MB95 eqs. (63) ---------------------------------------------
-    idxg  = 7
-    idxgp = 7 + (lmaxg+1)
-
-    def _photon_hierarchy(f_in):
-        # ... polarization term
-        polter = y[idxg+2] + y[idxgp+0] + y[idxgp+2]
-        # ... photon density, BLT11 eq. (2.4a)
-        deltagprime = 4.0 / 3.0 * (-thetag_eff - 0.5 * hprime)
-        f_in = f_in.at[idxg+0].set( deltagprime )
-        # ... photon velocity, BLT11 eq. (2.4b)
-        thetagprime = kmode**2 * (0.25 * deltag_eff - s2_squared * shearg_eff) \
-                    - opac * (thetag_eff - thetab)
-        f_in = f_in.at[idxg+1].set( thetagprime )
-        # ... photon shear, BLT11 eq. (2.4c)
-        sheargprime = 8./15. * (thetag_eff+kmode**2*alpha) -3/5*kmode*s_l3/s_l2*y[idxg+3] \
-                    - opac*(y[idxg+2]-0.1*s_l2*polter)
-        f_in = f_in.at[idxg+2].set( sheargprime )
-
-        #... photon temperature l>=3, BLT11 eq. (2.4d)
-        ell  = jnp.arange(3, lmaxg )
-        ell_2d = ell[:,None]
-        f_in = f_in.at[idxg+ell].set( kmode  / (2 * ell_2d + 1) * (ell_2d * y[idxg+ell-1] - (ell_2d + 1) * y[idxg+ell+1]) - opac * y[idxg+ell] )
-        # photon temperature hierarchy truncation, BLT11 eq. (2.5)
-        f_in = f_in.at[idxg+lmaxg].set( kmode * y[idxg+lmaxg-1] - (lmaxg + 1) / tau * y[idxg+lmaxg] - opac * y[idxg+lmaxg] )
-
-        #... polarization equations, BLT11 eq. (2.4e)
-        ell  = jnp.arange(0, lmaxgp) # l=0...lmaxgp-1
-        ell_2d = ell[:, None]
-        f_in = f_in.at[idxgp+ell].set( kmode  / (2 * ell_2d + 1) * (ell_2d * y[idxgp+ell-1] - (ell_2d + 1) * y[idxgp+ell+1]) - opac * y[idxgp+ell] )
-        f_in = f_in.at[idxgp+0].add( opac * polter / 2 )  # photon polarization l=0
-        f_in = f_in.at[idxgp+2].add( opac * polter / 10 ) # photon polarization l=2
-
-        # photon polarization hierarchy truncation
-        f_in = f_in.at[idxgp+lmaxgp].set( kmode * y[idxgp+lmaxgp-1] - (lmaxgp + 1) / tau * y[idxgp+lmaxgp] - opac * y[idxgp+lmaxgp] )
-        return f_in
-
-    def _photon_tca(f_in):
-        deltabprime_tca = -thetab - 0.5 * hprime
-        thetabprime_tca = (
-            -aprimeoa * thetab + kmode**2 * cs2 * deltab + kmode**2 * pb43 * (0.25 * deltag - s2_squared * shearg)
-        ) / (1.0 + pb43)
-
-        deltagprime_tca = 4.0 / 3.0 * (-thetag - 0.5 * hprime)
-        slip = (
-            2.0 * pb43 / (1.0 + pb43) * aprimeoa * (thetab - thetag)
-            + tauc
-            * (
-                -aprimeprimeoa * thetab
-                - 0.5 * aprimeoa * kmode**2 * deltag
-                + kmode**2 * (cs2 * deltabprime_tca - 0.25 * deltagprime_tca)
-            )
-            / (1.0 + pb43)
-        )
-        thetabprime_tca = thetabprime_tca + pb43 / (1.0 + pb43) * slip
-        thetagprime_tca = (-thetabprime_tca - aprimeoa * thetab + kmode**2 * cs2 * deltab) / jnp.maximum(pb43, 1e-30) + kmode**2 * (
-            0.25 * deltag - s2_squared * shearg
-        )
-
-        f_in = f_in.at[idxb + 0].set(deltabprime_tca)
-        f_in = f_in.at[idxb + 1].set(thetabprime_tca)
-        f_in = f_in.at[idxg + 0].set(deltagprime_tca)
-        f_in = f_in.at[idxg + 1].set(thetagprime_tca)
-        f_in = f_in.at[idxg + 2:idxg + lmaxg + 1].set(0.0)
-        f_in = f_in.at[idxgp:idxgp + lmaxgp + 1].set(0.0)
-        return f_in
-
-    def _photon_rsa(f_in):
-        return f_in.at[idxg:idxg + lmaxg + 1].set(0.0).at[idxgp:idxgp + lmaxgp + 1].set(0.0)
-
-    f = jax.lax.cond(
-        do_relativistic_sa,
-        _photon_rsa,
-        lambda f_in: jax.lax.cond(do_tca, _photon_tca, _photon_hierarchy, f_in),
-        f,
-    )
-
-    # --- Massless neutrino equations of motion -------------------------------------------------------
-    idxr = 9 + lmaxg + lmaxgp
-    deltarprime = 4.0 / 3.0 * (-thetar_eff - 0.5 * hprime)
-    f = f.at[idxr+0].set( deltarprime )
-    thetarprime = kmode**2 * (0.25 * deltar_eff - shearr_eff)
-    f = f.at[idxr+1].set( thetarprime )
-
-    def _massless_nu_hierarchy(f_in):
-        shearrprime = 8./15. * (thetar_eff + kmode**2 * alpha) - 0.6 * kmode * y[idxr+3]
-        f_in = f_in.at[idxr+2].set( shearrprime )
-        ell = jnp.arange(3, lmaxr)
-        ell_2d = ell[:, None]
-        f_in = f_in.at[idxr+ell].set( kmode / (2 * ell_2d + 1) * (ell_2d * y[idxr+ell-1] - (ell_2d + 1) * y[idxr+ell+1]) )
-
-        # ... truncate moment expansion
-        f_in = f_in.at[idxr+lmaxr].set( kmode * y[idxr+lmaxr-1] - (lmaxr + 1) / tau * y[idxr+lmaxr] )
-        return f_in
-
-    def _massless_nu_ufa(f_in):
-        shearrprime = compute_shearprime_ufa(
-            tau=tau,
-            shearr=shearr_eff,
-            thetar=thetar_eff,
-            hprime=hprime,
-        )
-        f_in = f_in.at[idxr+2].set( shearrprime )
-        return f_in.at[idxr+3:idxr + lmaxr + 1].set(0.0)
-
-    def _massless_nu_rsa(f_in):
-        return f_in.at[idxr:idxr + lmaxr + 1].set(0.0)
-
-    f = jax.lax.cond(
-        do_relativistic_sa,
-        _massless_nu_rsa,
-        lambda f_in: jax.lax.cond(do_ur_fluid, _massless_nu_ufa, _massless_nu_hierarchy, f_in),
-        f,
-    )
-
-    # --- Massive neutrino equations of motion --------------------------------------------------------
-    q, _ = get_neutrino_momentum_bins( nqmax )
-    q = q[:, None]
-    aq = a * param['amnu'] / q
-    v = 1 / jnp.sqrt(1 + aq**2)
-    dlfdlq = -q / (1.0 + jnp.exp(-q))  # derivative of the Fermi-Dirac distribution
-
-    f = f.at[iq0 : iq1].set(
-        -kmode * v * y[iq1 : iq2] + hprime* dlfdlq / 6.0 
-    )
-    f = f.at[iq1 : iq2].set(
-        kmode * v * (y[iq0 : iq1] - 2.0 * y[iq2 : iq3]) / 3.0
-    )
-    f = f.at[iq2 : iq3].set(
-        kmode * v * (2 * y[iq1 : iq2] - 3 * y[iq3 : iq4]) / 5.0 - (hprime / 15 + 2 / 5 * etaprime) * dlfdlq
-    )
-
-    ell = jnp.arange(3, lmaxnu)
-    ell_2d = ell[:, None]
-    vv = jnp.tile(v, (lmaxnu - 3,1))
-    denl = jnp.repeat( 2*ell_2d+1, nqmax , axis=0)
-    
-    print("lmaxnu = {}, nqmax = {}", lmaxnu, nqmax)
-
-    print(y.shape)
-    print(vv.shape, denl.shape, y[iq0 + 2*nqmax : iq0 + (lmaxnu-1)*nqmax].shape, y[iq0 + 4*nqmax : iq0 + (lmaxnu+1)*nqmax].shape)
-    f = f.at[iq0 + 3 * nqmax : iq0 + lmaxnu * nqmax].set(
-        kmode * vv / denl * (
-            jnp.repeat( ell_2d, nqmax ,axis=0) * y[iq0 + 2*nqmax : iq0 + (lmaxnu-1)*nqmax] 
-            - jnp.repeat( ell_2d+1, nqmax ,axis=0) * y[iq0 + 4*nqmax : iq0 + (lmaxnu+1)*nqmax]
-        ) 
-    )
-
-    # Truncate moment expansion.
-    f = f.at[-nqmax-2 :-2].set(
-        kmode * v * y[-2 * nqmax-2 : -nqmax-2] - (lmaxnu + 1) / tau * y[-nqmax-2 :-2]
-    )
-
-    # ---- Quintessence equations of motion -----------------------------------------------------------
-    # ... Ballesteros & Lesgourgues (2010, BL10), arXiv:1004.5509
-    f = f.at[-2].set( # BL10, eq. (3.5)
-        -(1+w_Q) *(thetaq + 0.5 * hprime) - 3*(cs2_Q - w_Q) * aprimeoa * deltaq - 9*(1+w_Q)*(cs2_Q-ca2_Q)*aprimeoa**2/kmode**2 * thetaq
-    )
-    f = f.at[-1].set( # BL10, eq. (3.6)
-        -(1-3*cs2_Q)*aprimeoa*thetaq + cs2_Q/(1+w_Q) * kmode**2 * deltaq
-    )
-
-    print("Inside ODE:",y.shape, f.shape)
-    #return f.flatten()
-    return f
-
-def convert_to_output_variables(*, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax , idx):
-    """Convert the synchronous gauge perturbations to the output fields.
-
-    Parameters
-    ----------
-    y : array_like
-        input vector of perturbations
-    param : dict
-        dictionary of parameters and interpolated background functions
-    kmode : float
-        wavenumber of mode [1/Mpc]
-    lmaxg : int
-        maximum photon Boltmann hierarchy moment
-    lmaxgp : int
-        maximum photon polarization hierarchy moment
-    lmaxr : int
-        maximum massless neutrino hierarchy moment
-    lmaxnu : int
-        maximum massive neutrino hierarchy moment
-    nqmax : int
-        number of momentum bins for massive neutrinos
-
-    Returns
-    -------
-    yout : array_like
-        output vector of perturbations:
-            eta, etaprime, hprime, alpha,       # 0-3
-            deltam,  thetam / (aH),             # 4-5
-            deltabc, thetabc / (aH),            # 6-7
-            deltac,  thetac / (aH),             # 8-9
-            deltab,  thetab / (aH),             # 10-11
-            deltag,  thetag / (aH),             # 12-13
-            deltar,  thetar / (aH),             # 14-15
-            deltanu, thetanu / (aH),            # 16-17
-            deltaq,  thetaq / (aH),             # 18-19
-    where aH = \\mathcal{H} = a' / a, which is the conformal Hubble rate.
-    """
-
-    
-    def take_idx(x):
-      return jnp.take(x, idx, mode="wrap")
-    Omegac = take_idx(param['Omegam'] - param['Omegab'])
-
-    iq0 = 10 + lmaxg + lmaxgp + lmaxr
-    iq1 = iq0 + nqmax
-    iq2 = iq1 + nqmax
-    iq3 = iq2 + nqmax
-
-    a = y[0]
-    eta = y[2]
-
-    # ... cdm
-    deltac = y[3]
-    thetac = y[4]
-
-    # ... baryons
-    deltab = y[5]
-    thetab = y[6]
-
-    # ... photons
-    deltag = y[7]
-    thetag = y[8]
-
-    # ... massless neutrinos
-    deltar = y[ 9 + lmaxg + lmaxgp]
-    thetar = y[10 + lmaxg + lmaxgp]
-
-    #... massive neutrinos
-    rhonu = jnp.exp(take_idx(param['logrhonu_of_loga_spline'].evaluate(jnp.log(a))))
-    pnu = jnp.exp(take_idx(param['logpnu_of_loga_spline'].evaluate( jnp.log(a) )) )
-    rho_plus_p = rhonu + pnu
-
-    drhonu, _, fnu, _ = nu_perturb( a, take_idx(param['amnu']), y[iq0:iq1], y[iq1:iq2], y[iq2:iq3], nqmax=nqmax )
-    deltanu = drhonu / rhonu
-    thetanu = kmode * fnu / rho_plus_p
-
-    # ... quintessence field
-    deltaq    = y[-2]
-    thetaq    = y[-1]
-    w_Q       = take_idx(param['w_DE_0'] + param['w_DE_a'] * (1.0 - a))
-    rho_Q     = a**(-3*take_idx(1+param['w_DE_0']+param['w_DE_a'])) * jnp.exp(3*(a-1)*take_idx(param['w_DE_a']))
-    rho_plus_p_theta_Q = (1+w_Q) * rho_Q * take_idx(param['grhom'] * param['OmegaDE']) * thetaq * a**2
-
-
-    # ... background
-    grho = take_idx(
-        param['grhom'] * param['Omegam'] / a
-        + (param['grhog'] + param['grhor'] * (param['Neff'] + param['Nmnu'] * rhonu)) / a**2
-        + param['grhom'] * param['OmegaDE'] * rho_Q * a**2
-        + param['grhom'] * param['Omegak']
-    )
-
-    gpres = take_idx(
-        (param['grhog'] + param['grhor'] * param['Neff']) / 3.0 + param['grhor'] * param['Nmnu'] * pnu
-    ) / a**2 + w_Q * take_idx(param['grhom'] * param['OmegaDE']) * rho_Q * a**2
-    
-    # ... compute expansion rate
-    aprimeoa = jnp.sqrt(grho / 3.0)                # Friedmann I
-    
-    # ... metric perturbations
-    dgrho = take_idx(
-        param['grhom'] * (Omegac * deltac + param['Omegab'] * deltab) / a
-        + (param['grhog'] * deltag + param['grhor'] * (param['Neff'] * deltar + param['Nmnu'] * drhonu)) / a**2
-        + param['grhom'] * param['OmegaDE'] * deltaq * rho_Q * a**2
-    )
-    dgtheta = take_idx(
-        param['grhom'] * (Omegac * thetac + param['Omegab'] * thetab) / a
-        + 4.0 / 3.0 * (param['grhog'] * thetag + param['Neff'] * param['grhor'] * thetar) / a**2
-        + param['Nmnu'] * param['grhor'] * kmode * fnu / a**2
-        + rho_plus_p_theta_Q
-    )
-    
-    hprime = (2.0 * kmode**2 * eta + dgrho) / aprimeoa
-    etaprime = 0.5 * dgtheta / kmode**2
-    alpha  = (hprime + 6.*etaprime)/2./kmode**2
-
-
-    # total matter perturbations
-    deltam = take_idx(
-        ( param['grhom'] * (Omegac * deltac + param['Omegab'] * deltab) / a
-        + (param['grhor'] * param['Nmnu'] * drhonu) / a**2) / (param['grhom'] * param['Omegam'] / a
-        + (param['grhor'] * param['Nmnu'] * rhonu)/ a**2 )
-    )
-    thetam = take_idx(
-        (param['grhom'] * (Omegac * thetac + param['Omegab'] * thetab) / a + param['Nmnu'] * param['grhor'] * kmode * fnu / a**2) 
-        / (3.0 * (param['grhom'] * param['Omegam'] / a + param['grhor'] * param['Nmnu'] * rhonu / a**2 ))
-    )
-
-    deltabc = take_idx(param['grhom'] * (Omegac * deltac + param['Omegab'] * deltab)/ a) \
-        / (param['grhom'] * param['Omegam'] / a)
-    thetabc = take_idx(param['grhom'] * (Omegac * thetac + param['Omegab'] * thetab) / a) \
-        / (3.0 * (param['grhom'] * param['Omegam'] / a) / a**2)
-    
-    #... gauge trafo from comoving (MB95 eq. 27b)
-    thetam   += alpha * kmode**2
-    thetabc  += alpha * kmode**2
-
-    ##################################################################################################################
-
-    # store fields of interest
-    yout = jnp.array([
-        eta, etaprime, hprime, alpha,       # 0-3
-        deltam,  thetam  / aprimeoa,        # 4-5
-        deltabc, thetabc / aprimeoa,        # 6-7
-        deltac,  thetac  / aprimeoa,        # 8-9
-        deltab,  thetab  / aprimeoa,        # 10-11
-        deltag,  thetag  / aprimeoa,        # 12-13
-        deltar,  thetar  / aprimeoa,        # 14-15
-        deltanu, thetanu / aprimeoa,        # 16-17
-        deltaq,  thetaq  / aprimeoa,        # 18-19
-    ])
-    
-                
-    return yout
-
-
-def adiabatic_ics_one_mode( *, tau: float|Array, param, kmode, nvar, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax ):
-    """Initial conditions for adiabatic perturbations"""
-    Omegac = param['Omegam'] - param['Omegab']
-
-    iq0 = 10 + lmaxg + lmaxgp + lmaxr
-    iq1 = iq0 + nqmax
-    iq2 = iq1 + nqmax
-    iq3 = iq2 + nqmax
-    iq4 = iq3 + nqmax
-
-    a = param['a_of_tau_spline'].evaluate(tau)
-
-    # .. isentropic ("adiabatic") initial conditions
-    rhom  = param['grhom'] * param['Omegam'] / a**3
-    rhor  = (param['grhog'] + param['grhor'] * (param['Neff'] + param['Nmnu']*jnp.exp(param['logrhonu_of_loga_spline'].evaluate(jnp.log(a))))) / a**4
-
-    ##jax.debug.print("rhor = {rhor} ! {grhog}, {grhor}", rhor=rhor, grhog=param['grhog'], grhor=param['grhor'])
-    rhonu = param['grhor'] * (param['Neff'] + param['Nmnu']*jnp.exp(param['logrhonu_of_loga_spline'].evaluate(jnp.log(a)))) / a**4
-
-    ##jax.debug.print("nu = {rhonu} ! {grhor}, {Neff}, {Nmnu}, {logrhonu_spline}, {a}", rhonu=rhonu, grhor=param['grhor'], Neff=param['Neff'], Nmnu=param['Nmnu'], logrhonu_spline=param['logrhonu_of_loga_spline'].evaluate(jnp.log(a)), a=a)
-
-    fracb  = param['Omegab'] / param['Omegam']
-    fracg  = param['grhog'] / rhor
-    fracnu = rhonu / rhor
-    
-    #jax.debug.print("fracnu = {fracnu} ! {rhor}, {rhonu}", fracnu=fracnu, rhonu=rhonu, rhor=rhor)
-    
-    #def print_callback(arg):
-    #  fracnu, rhor, rhonu = arg
-    #  print(f"ACTUAL VALUES:\nfracnu={fracnu}\nrhor={rhor}\nrhonu={rhonu}\n")
-    #  print(f"TYPES: fracnu={fracnu.dtype}, rhor={rhor.dtype}")
-
-    # This safely hooks into JAX's execution pipeline, ignoring tracers
-    #jax.debug.callback(print_callback, (fracnu, rhor, rhonu))
-
-
-    om    = a * rhom / jnp.sqrt(rhor)
-    
-    curvature_ini = -1.0
-    s2_squared = 1.0
-
-    #... photons
-    deltag = -(kmode*tau)**2 / 3 * (1 - om * tau / 5) * curvature_ini * s2_squared
-    thetag = -(kmode*tau)**3/tau /36 * (1-3*(1+5*fracb-fracnu)/20/(1-fracnu)*om*tau) * curvature_ini * s2_squared
-
-    #... baryons
-    deltab = 0.75 * deltag
-    thetab = thetag
-
-    #... CDM
-    deltac = 0.75 * deltag
-    thetac = jnp.zeros(deltag.shape)
-
-    #... massless neutrinos
-    deltar = deltag
-    thetar = -(kmode*tau)**4/tau/36/(4*fracnu+15) * (4*fracnu+11+12 - 3*(8*fracnu*fracnu+50*fracnu+275)/20/(2*fracnu+15)*tau*om) * curvature_ini
-    shearr = (kmode*tau)**2/(45+12*fracnu) * (3*s2_squared-1) * (1+(4*fracnu-5)/4/(2*fracnu+15)*tau*om) * curvature_ini
-
-    #... massive neutrinos
-    deltan = deltar
-    thetan = thetar
-    shearn = shearr
-
-    # ... quintessence, Ballesteros & Lesgourgues (2010, BL20), arXiv:1004.5509
-    cs2_Q  = param['cs2_DE']
-    w_Q    = param['w_DE_0'] + param['w_DE_a'] * (1.0 - a)
-    deltaq = (kmode*tau)**2 / 4 * (1+w_Q)*(4-3*cs2_Q)/(4-6*w_Q+3*cs2_Q) * curvature_ini * s2_squared # BL10 eq. 3.7
-    thetaq = (kmode*tau)**4 / tau / 4 * cs2_Q/(4-6*w_Q+3*cs2_Q) * curvature_ini * s2_squared      # BL10 eq. 3.8
-
-    # metric
-    eta = curvature_ini * (1-(kmode*tau)**2/12/(15+4*fracnu)*(5+4*s2_squared*fracnu - (16*fracnu*fracnu+280*fracnu+325)/10/(2*fracnu+15)*tau*om))
-    #jax.debug.print("initial condition eta = {eta} ! -> {kmode}, {curvature_ini}, {tau}, {fracnu}, {s2_squared}, {om}", eta=eta, kmode=kmode, curvature_ini=curvature_ini, tau=tau, fracnu=fracnu, s2_squared=s2_squared, om=om)
-
-    ahprime = jnp.zeros(deltag.shape) # will not be evolved, only constraint
-
-
-    # ... metric
-    #y = y.at[0].set( a )
-    #y = y.at[1].set( ahprime )
-    #y = y.at[2].set( eta )
-
-    # .. CDM
-    #y = y.at[3].set( deltac )
-    #y = y.at[4].set( thetac )
-
-    # .. baryons
-    #y = y.at[5].set( deltab )
-    #y = y.at[6].set( thetab )
-
-    # ... Photons (total intensity and polarization)
-    #y = y.at[7].set( deltag )
-    #y = y.at[8].set( thetag )
-    # shear and polarization are zero at the initial time
-    
-    # ... massless neutrinos
-    #y = y.at[ 9 + lmaxg + lmaxgp].set( deltar )
-    #y = y.at[10 + lmaxg + lmaxgp].set( thetar )
-    #y = y.at[11 + lmaxg + lmaxgp].set( shearr * 2.0 )
-    # higher moments are zero at the initial time
-
-    # ... massive neutrinos
-    # if params.cp.Nmnu > 0:
-    # q = jnp.arange(1, nqmax + 1) - 0.5  # so dq == 1 # if not using CAMB approx
-    q, _ = get_neutrino_momentum_bins( nqmax )
-    q = q[:, None]
-    aq = (a * param['amnu']) / q
-    v = 1 / jnp.sqrt(1 + aq**2)
-    # akv = jnp.outer(kmode, v)
-    dlfdlq = -q / (1.0 + jnp.exp(-q))
-    #y = y.at[iq0:iq1].set( -0.25 * dlfdlq * deltan)
-    #y = y.at[iq1:iq2].set( -dlfdlq * thetan / v / kmode / 3.0)
-    #y = y.at[iq2:iq3].set( -0.5 * dlfdlq * shearn)
-    # higher moments are zero at the initial time
-
-    # ... quintessence, Ballesteros & Lesgourgues (2010, BL20), arXiv:1004.5509
-    #y = y.at[-2].set( deltaq )
-    #y = y.at[-1].set( thetaq )
-    
-    #print([(x.shape if hasattr(x,'shape') else None) for x in [a, ahprime, eta, deltac, thetac, deltab, thetab, deltag, thetag] ])
-    #print([(x.shape if hasattr(x,'shape') else None) for x in [deltar, thetar, shearr * 2.0] ])
-    #print(jnp.zeros(1+lmaxg+lmaxgp)[:, None].shape)
-    #print(jnp.zeros(6+lmaxr)[:, None].shape)
-    #print((-0.25 * dlfdlq * deltan).shape)
-    #print((-dlfdlq * thetan / v / kmode / 3.0).shape)
-    #print((-0.5 * dlfdlq * shearn).shape)
-    #print([(x.shape if hasattr(x,'shape') else None) for x in [deltaq, thetaq] ])
-
-    block1 = jnp.vstack([a, ahprime, eta, deltac, thetac, deltab, thetab, deltag, thetag])
-    block2 = jnp.zeros((1+lmaxg+lmaxgp,1))
-    block3 = jnp.vstack([deltar, thetar, shearr * 2.0])
-    block4 = jnp.zeros((6+lmaxr,1))
-    block5 = -0.25 * dlfdlq * deltan
-    block6 = -dlfdlq * thetan / v / kmode / 3.0
-    block7 = -0.5 * dlfdlq * shearn
-    block8 = jnp.zeros(((lmaxnu-3)*nqmax, 1))
-    block9 = jnp.vstack([deltaq, thetaq])
-    
-    blocks = [block1, block2, block3, block4, block5, block6, block7, block8, block9]
-    ymax = max(b.shape[1] for b in blocks)
-
-    print(iq0, iq1, iq2, iq3, iq3+2)
-    blocks_aligned = [jnp.broadcast_to(b, (b.shape[0], ymax)) if b.shape[1]!=ymax else b for b in blocks]
-
-    y = jnp.concatenate(blocks_aligned, axis=0)
-    
-    
-    #jax.debug.print("initial condition = {y} !", y=y)
-    
-    return y
-
-
-def determine_starting_time( *, param, k ):
-    # ADOPTED from CLASS:
-    # largest wavelengths start being sampled when universe is sufficiently opaque. This is quantified in terms of the ratio of thermo to hubble time scales, 
-    # \f$ \tau_c/\tau_H \f$. Start when start_largek_at_tau_c_over_tau_h equals this ratio. Decrease this value to start integrating the wavenumbers earlier 
-    # in time.
-    start_small_k_at_tau_c_over_tau_h =  0.0004 
-
-    # ADOPTED from CLASS:
-    #  largest wavelengths start being sampled when mode is sufficiently outside Hubble scale. This is quantified in terms of the ratio of hubble time scale 
-    #  to wavenumber time scale, \f$ \tau_h/\tau_k \f$ which is roughly equal to (k*tau). Start when this ratio equals start_large_k_at_tau_k_over_tau_h. 
-    #  Decrease this value to start integrating the wavenumbers earlier in time. 
-    start_large_k_at_tau_h_over_tau_k = 0.07 #0.05
-
-    tau0 = param['taumin']
-    tau1 = param['tau_of_a_spline'].evaluate( 0.1 ) # don't start after a=0.1
-    tau_k = 1.0/k
-
-    def get_tauc_tauH( tau, param ):
-        akthom = 2.3048e-9 * (1.0 - param['YHe']) * param['Omegab'] * param['H0']**2
-        xe = param['xe_of_tau_spline'].evaluate( tau )
-        a = param['a_of_tau_spline'].evaluate(tau)
-        opac = xe * akthom / a**2
-
-        # Note: For starting time calculation, we use the full aprimeoa from background
-        # This is slightly different from the old radiation-only approximation but more accurate
-        aprimeoa = get_aprimeoa( param=param, aexp=a )
-        return 1.0/opac, 1.0/aprimeoa
-
-
-    def get_tauH( tau, param ):
-        a = param['a_of_tau_spline'].evaluate(tau)
-        aprimeoa = get_aprimeoa( param=param, aexp=a )
-        return 1.0/aprimeoa
-
-    # condition for small k: tau_c(a) / tau_H(a) < start_small_k_at_tau_c_over_tau_h
-    def cond_small_k( logtau, param ):
-        tau_c, tau_H = get_tauc_tauH( jnp.exp(logtau), param[0] )
-        # adotoa/opac > start_small_k_at_tau_c_over_tau_h
-        start_small_k_at_tau_c_over_tau_h = param[1]
-        return tau_c/tau_H/start_small_k_at_tau_c_over_tau_h - 1.0
-
-    # condition for large k: tau_H(a) / tau_k < start_large_k_at_tau_k_over_tau_h
-    def cond_large_k( logtau, param ):
-        tau_H = get_tauH( jnp.exp(logtau), param[0] )
-        tau_k = param[2]
-        start_large_k_at_tau_h_over_tau_k = param[1]
-        return tau_H/tau_k/start_large_k_at_tau_h_over_tau_k - 1.0
-
-    logtau_large_k = root_find_bisect_nocond(func=cond_large_k, xleft=jnp.log(tau0), xright=jnp.log(tau1), numit=7, param=(param,start_large_k_at_tau_h_over_tau_k,tau_k) )
-    logtau_small_k = root_find_bisect_nocond(func=cond_small_k, xleft=jnp.log(tau0), xright=jnp.log(tau1), numit=7, param=(param,start_small_k_at_tau_c_over_tau_h) )
-
-    return jnp.exp(jnp.minimum(logtau_small_k, logtau_large_k))
-
-
-class VectorField(eqx.Module):
-    model: eqx.Module
-
-    def __call__(self, t, y, args):
-        return self.model(t, y, args)
-
-def rms_norm_filtered_batched(x: PyTree, filter_indices: jnp.ndarray, weights: list[jnp.ndarray]) -> Scalar:
-    
-    xs_weighted = jax.vmap(lambda _x, _w: _x[filter_indices] * _w, (0, 0))(x, jnp.array(weights))
-    x_, _ = fu.ravel_pytree(xs_weighted)
-    return _rms_norm(x_)
-
-    # norms = jax.vmap(_rms_norm)(xs_weighted)
-
-    # return jnp.max(norms)
-
-
-def rms_norm_filtered(x: PyTree, filter_indices: jnp.ndarray, weights: jnp.ndarray) -> Scalar:
-    x, _ = fu.ravel_pytree(x)
-    if x.size == 0:
-        return 0
-    return _rms_norm(x[filter_indices] * weights)
-
-
-@jax.custom_jvp
-def _rms_norm(x):
-    x_sq = jnp.real(x * jnp.conj(x))
-    return jnp.sqrt(jnp.mean(x_sq))
-
-
-@_rms_norm.defjvp
-def _rms_norm_jvp(x, tx):
-    (x,) = x
-    (tx,) = tx
-    out = _rms_norm(x)
-    # Get zero gradient, rather than NaN gradient, in these cases
-    pred = (out == 0) | jnp.isinf(out)
-    numerator = jnp.where(pred, 0, x)
-    denominator = jnp.where(pred, 1, out * x.size)
-    t_out = jnp.dot(numerator / denominator, tx)
-    return out, t_out
-    
-
-# @partial(jax.jit, static_argnames=('lmaxg', 'lmaxgp', 'lmaxr', 'lmaxnu', 'nqmax','max_steps'))
-def evolve_one_mode( *, tau_max, tau_out, param, kmode, 
-                        lmaxg : int, lmaxgp : int, lmaxr : int, lmaxnu : int,
-                        nqmax : int, rtol: float, atol: float,
-                        pcoeff : float, icoeff : float, dcoeff : float, factormax : float, factormin : float, max_steps : int, return_full : bool = False):
-
-    jax.debug.print("Evolving k_mode={km}",km=kmode)
-    modelX_ = VectorField(
-        lambda tau, y, params : model_synchronous( idx = params[2], tau=tau, y=y, param=params[0], kmode=params[1],  
-                                                   lmaxg=lmaxg, lmaxgp=lmaxgp, lmaxr=lmaxr, lmaxnu=lmaxnu, nqmax=nqmax) )
-    modelX = drx.ODETerm( modelX_ )
-    
-    # ... determine the number of active variables (i.e. the number of equations), absent any optimizations
-    nvar   = 7 + (lmaxg + 1) + (lmaxgp + 1) + (lmaxr + 1) + nqmax * (lmaxnu + 1) + 2
-
-    # ... determine starting time
-    tau_start = determine_starting_time( param=param, k=kmode )
-    tau_start = 0.99 * jnp.minimum( jnp.min(tau_out), tau_start )
-
-    # ... set adiabatic ICs
-    y0 = adiabatic_ics_one_mode( tau=tau_start, param=param, kmode=kmode, nvar=nvar, 
-                       lmaxg=lmaxg, lmaxgp=lmaxgp, lmaxr=lmaxr, lmaxnu=lmaxnu, nqmax=nqmax )
-
-    #model_synchronous( tau=tau_start, y=y0, param=param, kmode=kmode, lmaxg=lmaxg, lmaxgp=lmaxgp, lmaxr=lmaxr, lmaxnu=lmaxnu, nqmax=nqmax)
-    # create solver wrapper, we use the Kvaerno5 solver, which is a 5th order implicit solver
-    def DEsolve_implicit(model, t0, t1, y0, kmode , idx):
-        print(t0.shape, t1.shape, y0.shape, kmode.shape, idx.shape)
-        return drx.diffeqsolve(
-            terms=model,
-            #solver=Rodas5Transformed(),
-            solver=drx.Kvaerno5(),
-            t0=t0.squeeze(),
-            t1=t1.squeeze(),
-            dt0=jnp.minimum(t0/4, 0.5*(t1-t0)).squeeze(),
-            y0=y0,
-            #saveat=saveat,
-
-            ##########throw=False, ## HERE HERE HERE
-            
-            saveat = drx.SaveAt(dense=True),
-            #saveat = drx.SaveAt(dense=True),
-            stepsize_controller = drx.PIDController(rtol=rtol, atol=atol, norm=lambda t:rms_norm_filtered(t,jnp.array([0,2,3,5,6,7]), jnp.array([1,kmode**2,1,1,1/kmode**2,1])),
-                                                    pcoeff=pcoeff, icoeff=icoeff, dcoeff=dcoeff, factormax=factormax, factormin=factormin),
-            # default controller has icoeff=1, pcoeff=0, dcoeff=0
-            max_steps=max_steps,
-            args=(param, kmode, idx),
-            # adjoint=drx.RecursiveCheckpointAdjoint(), # for backward differentiation
-            adjoint=drx.DirectAdjoint(),  #for forward differentiation
-            # adjoint=drx.BacksolveAdjoint(), # for backward differentiation
-        )
-
-    # solve before neutrinos become fluid
-    #saveat = drx.SaveAt(ts=tau_out)
-    # 2. Stack them into a unified PyTree layout
-    #saveat = jax.tree_util.tree_stack(saveat_list)
-    #sol = DEsolve_implicit( model=modelX, t0=jnp.min(tau_start), t1=jnp.max(tau_max), y0=y0, saveat=saveat, kmode=kmode )
-    print("Y0 shape = ",y0.shape)
-
-    sol_fn = jax.vmap(DEsolve_implicit, in_axes=(None, 1, 0, 1, None, 0))
-    print(tau_start.shape, tau_max.shape, y0.shape,  kmode.shape, jnp.arange(y0.shape[1]).shape)
-    sol = sol_fn(modelX, tau_start, tau_max, y0, kmode, jnp.arange(y0.shape[1]))
-
-    #print(sol)
-    #first_nan_idx = jnp.argmax(jnp.isinf(sol.ts))
-    #last_valid_idx = first_nan_idx - 1
-    #jax.debug.print("Stalled at time t = {t}", t=sol.ts[last_valid_idx])
-    #jax.debug.print("State right before failure: {y}", y=jax.tree_util.tree_leaves(sol.ys)[0][last_valid_idx])
-
-    print(tau_out.shape)
-    extracted_ys = jax.vmap(
-      lambda s, t_grid: jax.vmap(s.evaluate)(t_grid), 
-      in_axes=(0, 0)
-    )(sol, tau_out.T)
-    
-    print(extracted_ys.shape)
-
-    ys_projected = jax.vmap( lambda tau, y: jax.vmap(
-        lambda _tau, _y: apply_rsa_state_projection(
-            y=_y,
-            tau=_tau,
-            kmode=kmode,
-            param=param,
-            lmaxg=lmaxg,
-            lmaxgp=lmaxgp,
-            lmaxr=lmaxr,
-            nqmax=nqmax,
-            nu_perturb_fn=nu_perturb,
-        ))(tau, y),
-    in_axes=(1, 0))(tau_out, extracted_ys)
-
-    print(ys_projected.shape)
-    if not return_full:
-        # convert outputs
-        yout = jax.vmap( lambda y_: jax.vmap( lambda y : convert_to_output_variables( y=y, param=param, kmode=kmode, lmaxg=lmaxg, lmaxgp=lmaxgp, lmaxr=lmaxr, lmaxnu=lmaxnu, nqmax=nqmax, idx=idx) )( y_ , idx), in_axes=(0,0))(ys_projected, jnp.arange(y0.shape[1]))
-    else:
-        # return full solution output
-        yout = ys_projected
-
-    print("Solution = ",yout.shape)
-    return yout
-
-
-#### NEW CODE FOR BATCHED CALCULATION ####
-
-def determine_start_times_per_batch(tau_out, param, kmodes, batch_size):
-    n_total = len(kmodes)
-
-    # starting time for one moda:
-    def starting_time_one_mode(p, k):
-        tau_start = determine_starting_time( param=p, k=k )
-        tau_start = 0.99 * jnp.minimum( jnp.min(tau_out), tau_start )
-
-        return tau_start
-    
-     # ... determine starting times for each mode
-    tau_start_all_modes = jax.vmap(starting_time_one_mode, (None, 0))( param, kmodes)
-
-    # arange the starting times into batches
-    tau_start_batches = jnp.array(jnp.split(tau_start_all_modes, n_total // batch_size))
-
-    # finally pick the same starting time for each batch
-    return jax.vmap(lambda a: jnp.min(a))(tau_start_batches)
-
-def calculate_ics(tau_start_batched, kmode_batches, param, nvar, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax):
-    
-    def calculate_ic_one_mode(tau_start, kmode):
-        return adiabatic_ics_one_mode( tau=tau_start, param=param, kmode=kmode, nvar=nvar, 
-                       lmaxg=lmaxg, lmaxgp=lmaxgp, lmaxr=lmaxr, lmaxnu=lmaxnu, nqmax=nqmax )
-
-    calc_ics_one_batch = jax.vmap(calculate_ic_one_mode, (None, 0))
-     
-    calc_ics_all_batches = jax.vmap(calc_ics_one_batch, (0, 0))
-
-    # assert False, str((jnp.array(tau_start_batched).shape, jnp.array(kmode_batches).shape)) == ((32,), (32, 16))
-
-    return calc_ics_all_batches(jnp.array(tau_start_batched), jnp.array(kmode_batches))
-
-
-def reduce_state_ur_fluid(*, y, lmaxg, lmaxgp, lmaxr):
-    """Remove massless-neutrino moments l>=3 from the state vector."""
-    idxr = 9 + lmaxg + lmaxgp
-    return jnp.concatenate((y[:idxr + 3], y[idxr + lmaxr + 1:]))
-
-
-def expand_state_ur_fluid(*, y_reduced, lmaxg, lmaxgp, lmaxr):
-    """Expand reduced UFA state back to full layout by padding zeroed moments."""
-    idxr = 9 + lmaxg + lmaxgp
-    n_removed = lmaxr - 2
-    zeros = jnp.zeros((n_removed,), dtype=y_reduced.dtype)
-    return jnp.concatenate((y_reduced[:idxr + 3], zeros, y_reduced[idxr + 3:]))
-
-# @partial(jax.jit, static_argnames=('lmaxg', 'lmaxgp', 'lmaxr', 'lmaxnu', 'nqmax', 'max_steps', 'batch_size', 'return_full'))
-def evolve_modes_batched( *, tau_max, tau_out, param, kmodes, 
-                        lmaxg : int, lmaxgp : int, lmaxr : int, lmaxnu : int,
-                        nqmax : int, rtol: float, atol: float,
-                        pcoeff : float, icoeff : float, dcoeff : float, 
-                        factormax : float, factormin : float, max_steps : int  , 
-                        batch_size: int, return_full : bool = False):
-
-    n_total = len(kmodes)
-    n_batches = n_total // batch_size
-
-    kmode_batches = jnp.array(jnp.split(kmodes, n_batches))
-
-    def F(tau, y, kmode):
-        return model_synchronous( tau=tau, y=y, param=param, kmode=kmode,  
-                                                   lmaxg=lmaxg, lmaxgp=lmaxgp, lmaxr=lmaxr, lmaxnu=lmaxnu, nqmax=nqmax)
-
-    # For Rodas5Batched with Diffrax 0.7.0:
-    # Rodas5Batched extracts: f, _args = args
-    # Then calls: terms.vf(t, y, _args)
-    # We need terms.vf to vmap f over batch, but f is not passed to vf
-    # Solution: Create a closure that captures F
-
-    def vf_batched(t, y_batch, args):
-        """
-        Batched vector field for Rodas5Batched.
-
-        Args:
-            t: time scalar
-            y_batch: (batch_size, nvars) batched states
-            args: During compatibility check: tuple (f, batch_params)
-                  During actual solve: just batch_params (kmodes)
-
-        Returns:
-            (batch_size, nvars) batched derivatives
-        """
-        # Handle both compatibility check and actual solve
-        if isinstance(args, tuple) and len(args) == 2:
-            # Compatibility check phase: args = (f, batch_params)
-            # Return zeros for shape inference
-            return jax.tree_util.tree_map(jnp.zeros_like, y_batch)
-        else:
-            # Actual solve phase: args = batch_params (kmodes)
-            # vmap F over batch: F(t, y[i], kmode[i]) for each i
-            return jax.vmap(F, in_axes=(None, 0, 0))(t, y_batch, args)
-
-    modelX_term = drx.ODETerm(vf_batched)
-    
-    # ... determine the number of active variables (i.e. the number of equations), absent any optimizations
-    nvar   = 7 + (lmaxg + 1) + (lmaxgp + 1) + (lmaxr + 1) + nqmax * (lmaxnu + 1) + 2
-
-    # ... determine the starting times for each batch
-    tau_start_batched = determine_start_times_per_batch(tau_out, param, kmodes, batch_size)
-
-    # ... set adiabatic ICs for each kmode an batch together
-    y0_batches = calculate_ics(tau_start_batched, kmode_batches, param, nvar, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax)
-
-    # create solver wrapper
-    def DEsolve_implicit(t0, y0, kmodes_batch):
-
-        # This function now only returns the solution.ys and nothing else, since the other info is not used
-        # at the moment. Might save some memory after compilation?
-
-        filters_full = jax.vmap(lambda kmode: jnp.array([1,kmode**2,1,1,1/kmode**2,1]))(kmodes_batch)
-
-        sol =  drx.diffeqsolve(
-            terms=modelX_term,
-            solver=Rodas5Batched(),
-            t0=t0,
-            t1=tau_max,
-            dt0=jnp.minimum(t0/4, 0.5*(tau_max-t0)),
-            y0=y0,
-            saveat=drx.SaveAt(ts=tau_out),
-            stepsize_controller = drx.PIDController(rtol=rtol, atol=atol,
-                                                    norm=lambda t:rms_norm_filtered_batched(t, jnp.array([0,2,3,5,6,7]), filters_full),
-                                                    pcoeff=pcoeff, icoeff=icoeff, dcoeff=dcoeff, factormax=factormax, factormin=factormin),
-            max_steps=max_steps,
-            args=(F, kmodes_batch),
-            adjoint=drx.DirectAdjoint(),
-        )
-
-        if sol.result != dfx.RESULTS.successful:
-          jax.debug.print("Solver failed with code: {r}",r=sol.result)
-
-        return sol.ys
-
-
-    DEsolve_implicit_vmap = jax.vmap(DEsolve_implicit, (0,0,0))
-
-    ys = DEsolve_implicit_vmap(tau_start_batched, y0_batches, kmode_batches)
-
-    n_batches, n_steps, _batch_size, _nvar = ys.shape
-
-    # Transpose to (n_batches, batch_size, n_steps, nvar) then reshape to (n_total, n_steps, nvar)
-    ys_transposed = jnp.transpose(ys, (0, 2, 1, 3))
-    reordered_ys = jnp.reshape(ys_transposed, (n_total, n_steps, _nvar))
-
-    projected_ys = jax.vmap(
-        lambda _k, _ys: jax.vmap(
-            lambda _tau, _y: apply_rsa_state_projection(
-                y=_y,
-                tau=_tau,
-                kmode=_k,
-                param=param,
-                lmaxg=lmaxg,
-                lmaxgp=lmaxgp,
-                lmaxr=lmaxr,
-                nqmax=nqmax,
-                nu_perturb_fn=nu_perturb,
-            )
-        )(tau_out, _ys)
-    )(kmodes, reordered_ys)
-
-    if not return_full:
-        # convert outputs
-        def calculate_final_ys( kmode, ys): 
-            return jax.vmap( lambda y : convert_to_output_variables( y=y, param=param, kmode=kmode, 
-                                                       lmaxg=lmaxg, lmaxgp=lmaxgp, lmaxr=lmaxr, lmaxnu=lmaxnu, nqmax=nqmax) )( ys )
-        
-        return jax.vmap(calculate_final_ys, (0,0))(kmodes, projected_ys)
-    else:
-        # return full solution output
-        return projected_ys
-
-
-
-def evolve_perturbations( *, param, aexp_out, kmin : float, kmax : float, num_k : int,
-                         lmaxg : int = 11, lmaxgp : int = 11, lmaxr : int = 11, lmaxnu : int = 8,
-                         nqmax : int = 3, rtol: float = 1e-4, atol: float = 1e-4,
-                         pcoeff : float = 0.25, icoeff : float = 0.80, dcoeff : float = 0.0,
-                         factormax : float = 20.0, factormin : float = 0.3, max_steps : int = 2048, return_full : bool = False, k_sampling_method: str = 'camb'):
-    """evolve cosmological perturbations in the synchronous gauge
-
-    Parameters
-    ----------
-    param : dict
-        dictionary of parameters and interpolated functions
-        Optional TCA controls:
-        - use_tca (bool): enable/disable tight-coupling approximation (default: False)
-        - tca_tau_c_over_tau_h_trigger (float): TCA-to-full trigger threshold for tau_c/tau_h (default: 0.015)
-        - tca_tau_c_over_tau_k_trigger (float): TCA-to-full trigger threshold for tau_c/tau_k (default: 0.010)
-        Optional RSA controls:
-        - use_rsa (bool): enable/disable radiation streaming approximation (default: True)
-        - rsa_tau_c_over_tau_trigger (float): trigger threshold for tau_c/tau (default: 10.0)
-        - rsa_tau_over_tau_k_trigger (float): trigger threshold for tau/tau_k = k*tau (default: 80.0)
-        - use_ur_fluid (bool): enable/disable ultra-relativistic fluid approximation (default: True)
-        - ur_fluid_tau_over_tau_k_trigger (float): trigger threshold for UFA k*tau (default: 120.0)
-    aexp_out : jnp.ndarray
-        array of scale factors at which to output
-    kmin : float
-        minimum wavenumber [in units 1/Mpc]
-    kmax : float
-        maximum wavenumber [in units 1/Mpc]
-    num_k : int
-        number of wavenumbers
-    lmaxg : int
-        maximum multipole for photon temperature
-    lmaxgp : int
-        maximum multipole for photon polarization
-    lmaxr : int
-        maximum multipole for massless neutrinos
-    lmaxnu : int
-        maximum multipole for massive neutrinos
-    nqmax : int
-        number of momentum bins for massive neutrinos
-    rtol : float
-        relative tolerance for ODE solver
-    atol : float
-        absolute tolerance for ODE solver
-    k_sampling_method : str
-        'log' for logarithmic, 'linear' for linear, 'camb' for CAMB-like hybrid sampling.
-
-    Returns
-    -------
-    y : jnp.ndarray
-        array of shape (num_k, nout, nvar) containing the perturbations
-    k : jnp.ndarray
-        array of shape (num_k) containing the wavenumbers [in units 1/Mpc]
-    """
-    if k_sampling_method == 'log':
-        kmodes = jnp.geomspace(kmin, kmax, num_k)
-    elif k_sampling_method == 'linear':
-        kmodes = jnp.linspace(kmin, kmax, num_k)
-    elif k_sampling_method == 'camb':
-        if 'tau_maxvis' not in param:
-            raise ValueError("param dictionary must contain 'tau_maxvis' for 'camb' k-sampling.")
-        taurst = param['tau_maxvis']
-        taurst = taurst.mean()
-        
-        # Simplified CAMB-like sampling
-        q_switch1 = 8.0 / taurst
-        q_switch2 = 30.0 / taurst
-        
-        n1 = int(num_k * 0.2)
-        n2 = int(num_k * 0.4)
-        n3 = num_k - n1 - n2
-        
-        k1 = jnp.geomspace(kmin, q_switch1, n1, endpoint=False)
-        k2 = jnp.linspace(q_switch1, q_switch2, n2, endpoint=False)
-        k3 = jnp.geomspace(q_switch2, kmax, n3)
-        kmodes = jnp.concatenate([k1, k2, k3])
-    else:
-        raise ValueError(f"Unknown k_sampling_method: {k_sampling_method}")
-    
-
-    # determine output times from aexp_out
-    aexp_out = jnp.atleast_1d(aexp_out)
-    tau_out = jax.vmap( lambda a: param['tau_of_a_spline'].evaluate(a) )(aexp_out).squeeze(1)
-    
-    #global_min = jnp.min(tau_out)
-    #global_max = jnp.max(tau_out)
-
-    #ref_track = jnp.mean(tau_out, axis=1)
-    #normalized_profile = (ref_track - jnp.min(ref_track)) / (jnp.max(ref_track) - jnp.min(ref_track))
-    #master_tau = global_min + normalized_profile * (global_max - global_min)
-    #tau_max = jnp.max(master_tau)
-    tau_max = jnp.max(tau_out, axis=0)
-    nout = aexp_out.shape[0]
-    
-    # set up ICs and solve ODEs for all the modes
-    y1 = jax.lax.map(
-        lambda k : evolve_one_mode( tau_max=tau_max, tau_out=tau_out, 
-                                    param=param, kmode=k, lmaxg=lmaxg, lmaxgp=lmaxgp, lmaxr=lmaxr, 
-                                    lmaxnu=lmaxnu, nqmax=nqmax, rtol=rtol, atol=atol,
-                                    pcoeff=pcoeff, icoeff=icoeff, dcoeff=dcoeff, 
-                                    factormax=factormax, factormin=factormin, max_steps=max_steps, return_full=return_full )
-                    , kmodes)
-
-    param['lmaxg'] = lmaxg
-    param['lmaxgp'] = lmaxgp
-    param['lmaxr'] = lmaxr
-    param['lmaxnu'] = lmaxnu
-    param['nqmax'] = nqmax
-    param['nout'] = nout
-    param['tau_out'] = tau_out
-    
-    return y1, kmodes, param
-
-
-@partial(jax.jit, static_argnames=('kmin', 'kmax', 'num_k', 'lmaxg', 'lmaxgp', 'lmaxr', 'lmaxnu', 'nqmax', 'max_steps', 'batch_size', 'return_full', 'k_sampling_method'))
-def evolve_perturbations_batched( *, param, aexp_out, kmin : float, kmax : float, num_k : int,
-                         lmaxg : int = 11, lmaxgp : int = 11, lmaxr : int = 11, lmaxnu : int = 8,
-                         nqmax : int = 3, rtol: float = 1e-4, atol: float = 1e-4,
-                         pcoeff : float = 0.25, icoeff : float = 0.80, dcoeff : float = 0.0,
-                         factormax : float = 20.0, factormin : float = 0.3, max_steps : int = 4096 , 
-                         batch_size: int = 16, return_full : bool = False, k_sampling_method: str = 'camb'):
-    """evolve cosmological perturbations in the synchronous gauge
-
-    Parameters
-    ----------
-    param : dict
-        dictionary of parameters and interpolated functions
-        Optional TCA controls:
-        - use_tca (bool): enable/disable tight-coupling approximation (default: False)
-        - tca_tau_c_over_tau_h_trigger (float): TCA-to-full trigger threshold for tau_c/tau_h (default: 0.015)
-        - tca_tau_c_over_tau_k_trigger (float): TCA-to-full trigger threshold for tau_c/tau_k (default: 0.010)
-        Optional RSA controls:
-        - use_rsa (bool): enable/disable radiation streaming approximation (default: True)
-        - rsa_tau_c_over_tau_trigger (float): trigger threshold for tau_c/tau (default: 10.0)
-        - rsa_tau_over_tau_k_trigger (float): trigger threshold for tau/tau_k = k*tau (default: 80.0)
-        - use_ur_fluid (bool): enable/disable ultra-relativistic fluid approximation (default: True)
-        - ur_fluid_tau_over_tau_k_trigger (float): trigger threshold for UFA k*tau (default: 120.0)
-    aexp_out : jnp.ndarray
-        array of scale factors at which to output
-    kmin : float
-        minimum wavenumber [in units 1/Mpc]
-    kmax : float
-        maximum wavenumber [in units 1/Mpc]
-    num_k : int
-        number of wavenumbers
-    lmaxg : int
-        maximum multipole for photon temperature
-    lmaxgp : int
-        maximum multipole for photon polarization
-    lmaxr : int
-        maximum multipole for massless neutrinos
-    lmaxnu : int
-        maximum multipole for massive neutrinos
-    nqmax : int
-        number of momentum bins for massive neutrinos
-    rtol : float
-        relative tolerance for ODE solver
-    atol : float
-        absolute tolerance for ODE solver
-    batch_size: int
-        number of modes to batch together for ODE solver
-    return_full : bool
-        if True, return full state vector; if False, return converted output variables
-    k_sampling_method : str
-        'log' for logarithmic, 'linear' for linear, 'camb' for CAMB-like hybrid sampling.
-
-    Returns
-    -------
-    y : jnp.ndarray
-        array of shape (num_k, nout, nvar) containing the perturbations
-    k : jnp.ndarray
-        array of shape (num_k) containing the wavenumbers [in units 1/Mpc]
-    param : dict
-        updated parameter dictionary with output information
-    """
-    if k_sampling_method == 'log':
-        kmodes = jnp.geomspace(kmin, kmax, num_k)
-    elif k_sampling_method == 'linear':
-        kmodes = jnp.linspace(kmin, kmax, num_k)
-    elif k_sampling_method == 'camb':
-        if 'tau_maxvis' not in param:
-            raise ValueError("param dictionary must contain 'tau_maxvis' for 'camb' k-sampling.")
-        taurst = param['tau_maxvis']
-        
-        # Simplified CAMB-like sampling
-        q_switch1 = 8.0 / taurst
-        q_switch2 = 30.0 / taurst
-        
-        n1 = int(num_k * 0.2)
-        n2 = int(num_k * 0.4)
-        n3 = num_k - n1 - n2
-        
-        k1 = jnp.geomspace(kmin, q_switch1, n1, endpoint=False)
-        k2 = jnp.linspace(q_switch1, q_switch2, n2, endpoint=False)
-        k3 = jnp.geomspace(q_switch2, kmax, n3)
-        kmodes = jnp.concatenate([k1, k2, k3])
-    else:
-        raise ValueError(f"Unknown k_sampling_method: {k_sampling_method}")
-    
-
-    # determine output times from aexp_out
-    aexp_out = jnp.atleast_1d(aexp_out)
-    tau_out = jax.vmap( lambda a: param['tau_of_a_spline'].evaluate(a) )(aexp_out)
-    tau_max = jnp.max(tau_out)
-    nout = aexp_out.shape[0]
-
-    # do all calculations batched in here
-    y1 = evolve_modes_batched(tau_max=tau_max, tau_out=tau_out, param=param, kmodes=kmodes, lmaxg=lmaxg, lmaxgp=lmaxgp, lmaxr=lmaxr, 
-                                    lmaxnu=lmaxnu, nqmax=nqmax, rtol=rtol, atol=atol,
-                                    pcoeff=pcoeff, icoeff=icoeff, dcoeff=dcoeff, 
-                                    factormax=factormax, factormin=factormin, max_steps=max_steps,
-                                    batch_size=batch_size, return_full=return_full )
-    
-    # Store parameters in param dict for compatibility with non-batched version
-    param['lmaxg'] = lmaxg
-    param['lmaxgp'] = lmaxgp
-    param['lmaxr'] = lmaxr
-    param['lmaxnu'] = lmaxnu
-    param['nqmax'] = nqmax
-    param['nout'] = nout
-    param['tau_out'] = tau_out
-    
-    return y1, kmodes, param
-
-@partial(jax.jit, static_argnames=('lmaxg', 'lmaxgp', 'lmaxr', 'lmaxnu', 'nqmax', 'idxcosmo'))
-def compute_time_derivatives(yout, tau, kmodes, param, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax, idxcosmo):
-    """Compute time derivatives by re-evaluating the ODE system.
-
-    This function computes dy/dτ by re-evaluating the synchronous gauge
-    perturbation equations at each output time and k-mode. This is useful
-    for CMB source function calculations that require time derivatives.
-
-    Parameters
-    ----------
-    yout : jnp.ndarray
-        State vector array with shape (n_kmodes, n_times, n_vars)
-    tau : jnp.ndarray
-        Conformal time array with shape (n_times,)
-    kmodes : jnp.ndarray
-        Wavenumber array with shape (n_kmodes,)
-    param : dict
-        Parameter dictionary (excluding static integer parameters)
-    lmaxg : int
-        Maximum photon temperature multipole (static)
-    lmaxgp : int
-        Maximum photon polarization multipole (static)
-    lmaxr : int
-        Maximum massless neutrino multipole (static)
-    lmaxnu : int
-        Maximum massive neutrino multipole (static)
-    nqmax : int
-        Number of neutrino momentum bins (static)
-
-    Returns
-    -------
-    jnp.ndarray
-        Time derivatives with same shape as yout (n_kmodes, n_times, n_vars)
-
-    Examples
-    --------
-    >>> yout, kmodes, param = evolve_perturbations_batched(...)
-    >>> tau = param['tau_out']
-    >>> lmaxg = param['lmaxg']
-    >>> lmaxgp = param['lmaxgp']
-    >>> lmaxr = param['lmaxr']
-    >>> lmaxnu = param['lmaxnu']
-    >>> nqmax = param['nqmax']
-    >>> yprime = compute_time_derivatives(yout, tau, kmodes, param, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax)
-    """
-
-    # Create indices for vectorization
-    idxtau = jnp.arange(len(tau))
-    idxk = jnp.arange(len(kmodes))
-
-    # Compute derivatives by re-evaluating the ODE system
-    yprime = jax.vmap(
-        lambda ik: jax.vmap(
-            lambda itau: model_synchronous(
-                tau=tau[itau],
-                y=yout[ik, itau, :],
-                param=param,
-                kmode=kmodes[ik],
-                lmaxg=lmaxg,
-                lmaxgp=lmaxgp,
-                lmaxr=lmaxr,
-                lmaxnu=lmaxnu,
-                nqmax=nqmax,
-                idx=idxcosmo
-            )
-        )(idxtau)
-    )(idxk)
-
-    return yprime
-
-
-# @partial(jax.jit, static_argnames=('N'))
-def get_xi_from_P( *, k : jnp.ndarray, Pk : jnp.ndarray, N : int, ell : int = 0 ):
-    """ get the correlation function from the power spectrum  using FFTlog, cf.
-        J. D. Talman (1978). JCP, 29:35-48		
-        A. J. S. Hamilton (2000).  MNRAS, 312:257-284
-
-    Args:
-        k (array_like)   : the wavenumbers [units 1/Mpc]
-        Pk (array_like)  : the power spectrum
-        N (int)          : length of the input vector
-        ell (int)        : the multipole to compute (0,2,4,...)
-
-    Returns:
-        xi (array_like)  : the correlation function
-        r (array_like)   : the radii [units in Mpc]
-    """
-    N = len(k)
-    kmin = k[0]
-    kmax = k[N-1]
-
-    L = jnp.log(kmax/kmin)
-
-    # FFTlog algorithm:
-    fPk = jnp.fft.rfft( Pk * k**1.5 )
-
-    ki = jnp.pi * jnp.arange( N//2+1 ) / L
-    zp = (1.5+ell)/2 + 1j* ki
-
-    theta = jax.vmap( lambda z: jnp.imag( lngamma_complex_e( z ) ) )( zp )
-
-    fPk = fPk * jnp.exp( 2j * (theta - jnp.log(jnp.pi) * ki) )
-
-    r  = 2*jnp.pi/k
-    xi = jnp.real( 1j**ell * jnp.fft.irfft( fPk ) / (2*jnp.pi*r)**1.5 )
-    return xi[::-1], r[::-1] # reverse order since 1/k is decreasing for increasing k
-
-
-def get_power( *, k : jax.Array, y : jax.Array, idx : int , param : dict) -> jax.Array:
-    """ compute the power spectrum from the perturbations, field indices are:
-
-            eta, etaprime, hprime, alpha,       # 0-3
-            deltam,  thetam / (aH),             # 4,5
-            deltabc, thetabc / (aH),            # 6,7
-            deltac,  thetac / (aH),             # 8,9
-            deltab,  thetab / (aH),             # 10,11
-            deltag,  thetag / (aH),             # 12,13
-            deltar,  thetar / (aH),             # 14,15
-            deltanu, thetanu / (aH),            # 16,17
-            deltaq,  thetaq / (aH),             # 18,19
-    
-    Args:
-        k (array_like)   : the wavenumbers [in units 1/Mpc]
-        y (array_like)   : the perturbations
-        idx (int)        : index of the perturbation to compute the power spectrum for
-        param (dict)     : dictionary of all parameters
-        
-    Returns:
-        Pk (array_like)  : the power spectrum
-    """
-    return 2 * jnp.pi**2 * param['A_s'] *(k/param['k_p'])**(param['n_s'] - 1) * k**(-3) * y[...,idx]**2
-
-
-def get_power_smoothed( *, k : jax.Array, y : jax.Array, dlogk : float, idx : int , param : dict) -> jax.Array:
-    """ compute Savitzky-Golay smoothed version of the power spectrum, field indices are:
-
-            eta, etaprime, hprime, alpha,       # 0-3
-            deltam,  thetam / (aH),             # 4,5
-            deltabc, thetabc / (aH),            # 6,7
-            deltac,  thetac / (aH),             # 8,9
-            deltab,  thetab / (aH),             # 10,11
-            deltag,  thetag / (aH),             # 12,13
-            deltar,  thetar / (aH),             # 14,15
-            deltanu, thetanu / (aH),            # 16,17
-            deltaq,  thetaq / (aH),             # 18,19
-    
-    Args:
-        k (array_like)   : the wavenumbers [in units 1/Mpc]
-        y (array_like)   : the perturbations
-        dlogk (float)    : the log bin width (dlogk = 1.0)
-        idx (int)        : index of the perturbation to compute the power spectrum for
-        param (dict)     : dictionary of all parameters
-        
-    Returns:
-        Pk (array_like)  : the power spectrum
-    """
-    window_length = round(dlogk/(jnp.log(k[1])-jnp.log(k[0])))
-    window_length += (window_length+1)%2
-
-    Pm  = get_power( y=y, k=k, idx=idx, param=param )
-
-    Pms = jnp.exp(savgol_filter(y=jnp.log(Pm), window_length=window_length, polyorder=3))
-
-    # replace boundary affected regions with original signal
-    Pms = Pms.at[:window_length//2].set( Pm[:window_length//2] )
-    Pms = Pms.at[-window_length//2:].set( Pm[-window_length//2:] )
-
-    return Pms
-
-def power_Kaiser( *, y : jax.Array, kmodes : jax.Array, bias : float, mu_sampling : bool = True, smooth_dlogk : float = None, nmu : int, param : dict) -> tuple[jax.Array, jax.Array]:
-    """ compute the anisotropic power spectrum using the Kaiser formula
-    
-    Args:
-        y (array_like)       : input solution from the EB solver
-        kmodes (array_like)  : the list of wave numbers in units of [1/Mpc]
-        bias (float)         : linear tracer bias
-        mu_sampling (bool)   : if True, sample the mu bins, else sample the theta bins
-        smooth_dlogk (float) : if not None, use Savitzky-Golay smoothing at this log scale
-        sigma_z0 (float)     : redshift error sigma_z = sigma_z0 * (1+z)
-        nmu (int)            : number of mu bins
-        param (dict)         : dictionary of all data
-
-    Returns:
-        P(k,mu) (array_like) : anisotropic spectrum
-        mu (array_like)      : mu bins
-    """
-    
-    if mu_sampling:
-        mu = jnp.linspace(-1,1,nmu)
-    else:
-        theta = jnp.linspace(0,jnp.pi,nmu)
-        mu = jnp.cos(theta)
-    
-    if smooth_dlogk is None:
-        fac = 2 * jnp.pi**2 * param['A_s']
-        deltam = jnp.sqrt(fac *(kmodes/param['k_p'])**(param['n_s'] - 1) * kmodes**(-3)) * y[:,4]
-        thetam = jnp.sqrt(fac *(kmodes/param['k_p'])**(param['n_s'] - 1) * kmodes**(-3)) * y[:,5]
-    else:
-        Pdelta = get_power_smoothed( y=y, k=kmodes, dlogk=smooth_dlogk, idx=4, param=param )
-        Ptheta = get_power_smoothed( y=y, k=kmodes, dlogk=smooth_dlogk, idx=5, param=param )
-        deltam = jnp.sqrt(Pdelta)
-        thetam = -jnp.sqrt(Ptheta)
-
-    # thetam already contains 1/ mathcal{H} factor   -f delta = theta
-    Pkmu = (bias*deltam[:,None] - mu[None,:]**2 * thetam[:,None])**2
-    return Pkmu, mu
-
-
-
-def power_multipoles( *, y : jnp.ndarray, kmodes : jnp.ndarray, b : float, param ) -> tuple[jax.Array]:
-    """ compute the power spectrum multipoles (l=0,2,4)
-
-    Args:
-        y (array_like)       : input solution from the EB solver
-        kmodes (array_like)  : the list of wave numbers [in units 1/Mpc]
-        b (float)            : linear bias
-
-    Returns:
-        P0 (array_like)      : monopole
-        P2 (array_like)      : quadrupole
-        P4 (array_like)      : hexadecapole
-    """
-    fac = 2 * jnp.pi**2 * param['A_s']
-    deltam = jnp.sqrt(fac *(kmodes/param['k_p'])**(param['n_s'] - 1) * kmodes**(-3)) * y[:,4]
-    thetam = jnp.sqrt(fac *(kmodes/param['k_p'])**(param['n_s'] - 1) * kmodes**(-3)) * y[:,5]
-
-    # powerspectrum multipoles
-    P0 = b**2 * deltam**2 - 2*b/3 * deltam*thetam + 1/5*thetam**2
-    P2 = -4*b/3 * deltam * thetam + 4/7 * thetam**2
-    P4 = 8/35 * thetam**2
-
-    return P0, P2, P4
-
+    return tuple(dy)

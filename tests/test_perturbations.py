@@ -1,153 +1,255 @@
+"""Scalar Einstein-Boltzmann perturbation-equation tests.
+
+Ported from the DISCO2 ``tests/test_perturbations.py`` suite, keeping the
+analytical (pure-function) checks of the perturbation equations, initial
+conditions, and power-spectrum mapping. The full ODE-solve comparison (DISCO2
+validated a numba-CUDA solve against CAMB) is intentionally excluded here; the
+end-to-end solve is covered by ``tests/test_perturbations_system.py`` against
+CLASS.
+"""
+
+import math
+
+import numpy as np
 import pytest
-import jax
-import jax.numpy as jnp
+
+from discoeb.background import (
+    grhob,
+    grhoc,
+    grhog,
+    grhornomass,
+    grhov,
+    hubble_a,
+)
+import discoeb.matter_power_spectrum as M
+import discoeb.perturbations as P
+
+from cosmologies import BENCHMARK_COSMOLOGIES
 
 
-from discoeb.background import evolve_background
-from discoeb.perturbations import evolve_perturbations, evolve_perturbations_batched
+DEFAULT_COSMOLOGY = BENCHMARK_COSMOLOGIES["planck_2018_flat_lcdm"]
 
-from conftest import k_CLASS, Pkbc_CLASS
-
-## Cosmological Parameters
-Tcmb    = 2.7255
-YHe     = 0.248
-Omegam  = 0.3099
-Omegab  = 0.0488911
-Omegac  = Omegam - Omegab
-w_DE_0  = -0.99
-w_DE_a  = 0.0
-cs2_DE  = 1.0
-
-# Initialize neutrinos.
-num_massive_neutrinos = 1
-mnu     = 0.06  #eV
-Tnu     = (4/11)**(1/3) #0.71611 # Tncdm of CLASS
-Neff    = 3.046 # -1 if massive neutrino present
-N_nu_mass = 1
-N_nu_rel = Neff - N_nu_mass * (Tnu/((4/11)**(1/3)))**4
-h       = 0.67742
-A_s     = 2.1064e-09
-n_s     = 0.96822
-k_p     = 0.05
-
-# modes to sample
-nmodes = 512
-kmin = 1e-5
-kmax = 1e+2
-kmax_small=1e+1
-aexp = 0.01
-aexp_out = jnp.array([aexp]) 
+COSMOLOGY_CASES = [
+    pytest.param(DEFAULT_COSMOLOGY, id="planck_2018_flat_lcdm"),
+]
 
 
-## Compute Background evolution
-param = {}
-param['Omegam']  = Omegam
-param['Omegab']  = Omegab
-param['w_DE_0']  = w_DE_0
-param['w_DE_a']  = w_DE_a
-param['cs2_DE']  = cs2_DE
-param['Omegak']  = 0.0
-param['A_s']     = A_s
-param['n_s']     = n_s
-param['H0']      = 100*h
-param['Tcmb']    = Tcmb
-param['YHe']     = YHe
-param['Neff']    = N_nu_rel
-param['Nmnu']    = N_nu_mass
-param['mnu']     = mnu
+def density_coefficients(cosmology) -> tuple[float, float, float, float, float]:
+    """Return the ``grho`` density coefficients ``(g, r, c, b, v)`` for a cosmology."""
 
-iout = -1
-fac = 2 * jnp.pi**2 * A_s
+    grhog_value = grhog(cosmology.T_cmb)
+    return (
+        grhog_value,
+        grhornomass(grhog_value, cosmology.Neff_massless),
+        grhoc(cosmology.omega_c_h2),
+        grhob(cosmology.omega_b_h2),
+        grhov(
+            cosmology.omega_b_h2,
+            cosmology.omega_c_h2,
+            cosmology.h,
+            cosmology.Neff_massless,
+            cosmology.T_cmb,
+        ),
+    )
 
-relevant_indices = (k_CLASS >= kmin) & (k_CLASS <= kmax)
-test_points = k_CLASS[relevant_indices]
-test_values = Pkbc_CLASS[relevant_indices]
 
-small_kmax_indices = (k_CLASS >= kmin) & (k_CLASS <= kmax_small)
-small_kmax_test_points = k_CLASS[relevant_indices]
-small_kmax_test_values = Pkbc_CLASS[relevant_indices]
+# ============================================================
+# ANALYTICAL TESTS (pure functions, no integration)
+# ============================================================
 
-@jax.jit
-def perturbations_jit(param): 
-    return evolve_perturbations( 
-        param=param, aexp_out=aexp_out, kmin=kmin, kmax=kmax, num_k=256,
-        lmaxg = 11, lmaxgp = 11, lmaxr = 11, lmaxnu  = 8,
-        nqmax = 3, rtol = 1e-3, atol = 1e-3,
-        pcoeff = 0.25, icoeff = 0.80, dcoeff = 0.0,
-        factormax  = 20.0, factormin  = 0.3, max_steps  = 2048)
 
-@jax.jit
-def perturbations_batched_jit(param):
-    return evolve_perturbations_batched(param=param,
-        aexp_out=aexp_out, kmin=kmin, kmax=kmax, num_k=256,
-        lmaxg = 11, lmaxgp = 11, lmaxr = 11, lmaxnu  = 8,
-        nqmax = 3, rtol = 1e-3, atol = 1e-3,
-        pcoeff = 0.25, icoeff = 0.80, dcoeff = 0.0,
-        factormax  = 20.0, factormin  = 0.3, max_steps  = 2048, batch_size=32)
+def test_state_layout_is_consistent_with_config():
+    """Check that the state-vector indices tile the hierarchy without gaps."""
 
-@pytest.fixture(scope="session")
-def background_param():
-    bg_param = evolve_background(param=param, thermo_module='RECFAST')
-    yield bg_param
+    assert P.IX_ETAK == 0
+    assert P.IX_G == P.IX_VB + 1
+    assert P.IX_POL == P.IX_G + P.LMAX_G + 1
+    assert P.IX_R == P.IX_POL + (P.LMAX_POL - 1)
+    assert P.NVAR == P.IX_R + P.LMAX_NR + 1
 
-class TestEvolvePerturbations:
 
-    @pytest.mark.parametrize("batch_size", [4, 8, 16, 32, 64])
-    def test_power_spectrum_varying_batchsize_small_kmax(self, batch_size, background_param):
+def test_comoving_densities_scale_with_species_dilution():
+    """Check the ``8*pi*G*rho_i a^2`` coefficients dilute with the correct powers of a."""
 
-        y, kmodes, _ = evolve_perturbations_batched(
-            param=background_param, kmin=kmin, kmax=kmax_small, num_k=nmodes, aexp_out=aexp_out,
-            lmaxg = 31, lmaxgp = 31, lmaxr = 31, lmaxnu = 31, nqmax = 5,
-            max_steps=2048, rtol=1e-4, atol=1e-4, batch_size=batch_size
+    g, r, c, b, v = 1.0, 2.0, 3.0, 4.0, 5.0
+    a1, a2 = 0.1, 0.4
+    g1, r1, c1, b1, v1 = P.comoving_densities(a1, g, r, c, b, v)
+    g2, r2, c2, b2, v2 = P.comoving_densities(a2, g, r, c, b, v)
+
+    # Radiation ~ a^-2, matter ~ a^-1, Lambda ~ a^2 in these comoving coefficients.
+    assert g2 / g1 == pytest.approx((a1 / a2) ** 2)
+    assert r2 / r1 == pytest.approx((a1 / a2) ** 2)
+    assert c2 / c1 == pytest.approx(a1 / a2)
+    assert b2 / b1 == pytest.approx(a1 / a2)
+    assert v2 / v1 == pytest.approx((a2 / a1) ** 2)
+
+
+@pytest.mark.parametrize("cosmology", COSMOLOGY_CASES)
+def test_expansion_rate_matches_background_hubble(cosmology):
+    """Check ``adotoa = a H(a)`` against the independent background module."""
+
+    dens = density_coefficients(cosmology)
+    for a in (1.0e-4, 1.0e-2, 0.5, 1.0):
+        adotoa = P.expansion_rate(*P.comoving_densities(a, *dens))
+        assert adotoa == pytest.approx(a * hubble_a(a, *dens), rel=1.0e-13)
+
+
+def test_metric_constraints_invert_their_definitions():
+    """Check the metric helpers ``z`` and ``sigma`` satisfy their defining algebra."""
+
+    dgrho, etak, adotoa, k, dgq = 1.3e-6, -0.2, 3.0e-4, 0.05, 4.0e-7
+    z = P.metric_z(dgrho, etak, adotoa, k)
+    sigma = P.shear_sigma(z, dgq, k)
+
+    assert z * adotoa == pytest.approx(0.5 * dgrho / k + etak)
+    assert sigma - z == pytest.approx(1.5 * dgq / k**2)
+
+
+@pytest.mark.parametrize("cosmology", COSMOLOGY_CASES)
+def test_adiabatic_initial_conditions_super_horizon_ratios(cosmology):
+    """Check the adiabatic mode obeys its defining ratios as ``k tau -> 0``.
+
+    Deep in radiation domination the growing adiabatic mode has
+    ``delta_c = delta_b = (3/4) delta_gamma``, ``delta_nu = delta_gamma``,
+    ``v_b = (3/4) q_gamma``, and the metric perturbation ``etak -> -k``.
+    """
+
+    g, r, c, b, v = density_coefficients(cosmology)
+    k = 0.2
+    tau = 1.0e-3 / k  # k tau = 1e-3, deep super-horizon
+    y = P.adiabatic_initial_conditions(k, tau, g, r, c, b)
+
+    clxg = y[P.IX_G]
+    assert clxg > 0.0
+    assert y[P.IX_CLXC] == pytest.approx(0.75 * clxg, rel=1.0e-12)
+    assert y[P.IX_CLXB] == pytest.approx(0.75 * clxg, rel=1.0e-12)
+    assert y[P.IX_VB] == pytest.approx(0.75 * y[P.IX_G + 1], rel=1.0e-12)
+    assert y[P.IX_R] == pytest.approx(clxg, rel=1.0e-12)
+    assert clxg == pytest.approx((k * tau) ** 2 / 3.0, rel=1.0e-3)
+    assert y[P.IX_ETAK] == pytest.approx(-k, rel=1.0e-4)
+    assert y[P.IX_POL] == 0.0
+    assert y[P.IX_R + 4] == 0.0
+
+
+@pytest.mark.parametrize("cosmology", COSMOLOGY_CASES)
+def test_neutrino_radiation_fraction_is_physical(cosmology):
+    """Check the neutrino radiation fraction lies in (0, 1) and matches the ratio."""
+
+    g, r = density_coefficients(cosmology)[:2]
+    Rv = P.neutrino_radiation_fraction(g, r)
+    assert 0.0 < Rv < 1.0
+    assert Rv == pytest.approx(r / (g + r), rel=1.0e-14)
+
+
+def test_multipole_recurrence_coefficients():
+    """Anchor the free-streaming recurrence coefficients against hand computation."""
+
+    k, opacity = 0.1, 0.5
+    assert P.photon_temperature_multipole_derivative(
+        5, 1.0, 2.0, 3.0, k, opacity
+    ) == pytest.approx(k * 5 / 11 * 1.0 - k * 6 / 11 * 3.0 - opacity * 2.0)
+    assert P.neutrino_multipole_derivative(5, 1.0, 2.0, 3.0, k) == pytest.approx(
+        k * 5 / 11 * 1.0 - k * 6 / 11 * 3.0
+    )
+    polfac = 8 * 4 / 6
+    assert P.polarization_multipole_derivative(
+        5, 1.0, 2.0, 3.0, k, opacity
+    ) == pytest.approx(-opacity * 2.0 + k * 5 / 11 * 1.0 - polfac * k / 11 * 3.0)
+
+
+def test_matter_power_spectrum_normalization():
+    """Check the primordial and matter power-spectrum normalizations."""
+
+    A_s, n_s, k_pivot = 2.1e-9, 0.96, 0.05
+    assert M.primordial_curvature_power(k_pivot, A_s, n_s, k_pivot) == pytest.approx(
+        A_s
+    )
+    k, delta_m = 0.1, 12.3
+    expected = (
+        2.0
+        * math.pi**2
+        / k**3
+        * M.primordial_curvature_power(k, A_s, n_s, k_pivot)
+        * delta_m**2
+    )
+    assert M.matter_power_spectrum(k, delta_m, A_s, n_s, k_pivot) == pytest.approx(
+        expected
+    )
+
+
+def test_total_matter_contrast_is_density_weighted():
+    """Check the total-matter contrast reduces to the density-weighted mean."""
+
+    assert M.total_matter_density_contrast(8.0, 1.0, 2.0, 6.0) == pytest.approx(
+        (8.0 * 1.0 + 2.0 * 6.0) / (8.0 + 2.0)
+    )
+
+
+@pytest.mark.parametrize("cosmology", COSMOLOGY_CASES)
+def test_boltzmann_rhs_metric_and_matter_wiring(cosmology):
+    """Check the RHS wires the metric, CDM, and baryon equations to the helpers."""
+
+    dens = density_coefficients(cosmology)
+    k, a, tau = 0.1, 1.0e-3, 250.0
+    rng = np.random.default_rng(1)
+    y = rng.standard_normal(P.NVAR) * 1.0e-3
+    dy = np.asarray(P.boltzmann_rhs(tau, y, k, a, 50.0, 1.0e-10, *dens))
+
+    assert dy.shape == (P.NVAR,)
+
+    g, r, c, b, _ = P.comoving_densities(a, *dens)
+    adotoa = P.expansion_rate(*P.comoving_densities(a, *dens))
+    dgrho = P.density_perturbation(
+        b, y[P.IX_CLXB], c, y[P.IX_CLXC], g, y[P.IX_G], r, y[P.IX_R]
+    )
+    dgq = P.momentum_perturbation(b, y[P.IX_VB], g, y[P.IX_G + 1], r, y[P.IX_R + 1])
+    z = P.metric_z(dgrho, y[P.IX_ETAK], adotoa, k)
+
+    assert dy[P.IX_ETAK] == pytest.approx(0.5 * dgq)
+    assert dy[P.IX_CLXC] == pytest.approx(-k * z)
+    assert dy[P.IX_CLXB] == pytest.approx(-k * (z + y[P.IX_VB]))
+    assert dy[P.IX_G] == pytest.approx(-k * (4.0 / 3.0 * z + y[P.IX_G + 1]))
+
+
+@pytest.mark.parametrize("cosmology", COSMOLOGY_CASES)
+def test_boltzmann_rhs_evolves_full_photon_hierarchy(cosmology):
+    """Check that the full photon/polarization hierarchy evolves at high opacity.
+
+    Without a tight-coupling approximation, the higher multipoles are driven by
+    the exact Thomson scattering terms even deep in the early universe, so their
+    derivatives are non-zero whenever the corresponding multipoles are.
+    """
+
+    dens = density_coefficients(cosmology)
+    k, a, tau, opacity = 0.1, 1.0e-6, 5.0, 1.0e7
+    rng = np.random.default_rng(2)
+    y = rng.standard_normal(P.NVAR) * 1.0e-3
+    dy = P.boltzmann_rhs(tau, y, k, a, opacity, 1.0e-9, *dens)
+
+    for ell in range(3, P.LMAX_G):
+        assert dy[P.IX_G + ell] == pytest.approx(
+            P.photon_temperature_multipole_derivative(
+                ell,
+                y[P.IX_G + ell - 1],
+                y[P.IX_G + ell],
+                y[P.IX_G + ell + 1],
+                k,
+                opacity,
+            )
         )
-        
-        Pkbc = fac *(kmodes/k_p)**(n_s - 1) * kmodes**(-3) * y[:,iout,6]**2
-        disco_eb_values = jnp.interp(small_kmax_test_points, kmodes, Pkbc)
+    for idx in range(P.IX_POL + 1, P.IX_R):
+        assert dy[idx] != 0.0
 
-        assert jnp.allclose(disco_eb_values, small_kmax_test_values, rtol=0.1), "relative error exceeded 0.1"
-        assert jnp.allclose(disco_eb_values, small_kmax_test_values, rtol=0.01), "relative error exceeded 0.01"
-        assert jnp.allclose(disco_eb_values, small_kmax_test_values, rtol=0.005), "relative error exceeded 0.005"
-
-
-    def test_power_spectrum_vs_CLASS_batched(self, background_param):
-
-        y, kmodes, _ = evolve_perturbations_batched(
-            param=background_param, kmin=kmin, kmax=kmax, num_k=nmodes, aexp_out=aexp_out,
-            lmaxg = 31, lmaxgp = 31, lmaxr = 31, lmaxnu = 31, nqmax = 5,
-            max_steps=2048, rtol=1e-4, atol=1e-4, batch_size=32
-        )
-        
-        Pkbc = fac *(kmodes/k_p)**(n_s - 1) * kmodes**(-3) * y[:,iout,6]**2
-        disco_eb_values = jnp.interp(test_points, kmodes, Pkbc)
-        
-        assert jnp.allclose(disco_eb_values, test_values, rtol=0.1), "relative error exceeded 0.1"
-        assert jnp.allclose(disco_eb_values, test_values, rtol=0.01), "relative error exceeded 0.01"
-        assert jnp.allclose(disco_eb_values, test_values, rtol=0.005), "relative error exceeded 0.005"
-
-
-    def test_power_spectrum_vs_CLASS(self, background_param):
-
-        y, kmodes, _ = evolve_perturbations(
-            param=background_param, kmin=kmin, kmax=kmax, num_k=nmodes, aexp_out=aexp_out,
-            lmaxg = 31, lmaxgp = 31, lmaxr = 31, lmaxnu = 31, nqmax = 5,
-            max_steps=2048, rtol=1e-5, atol=1e-5
-        )
-        
-        
-        Pkbc = fac *(kmodes/k_p)**(n_s - 1) * kmodes**(-3) * y[:,iout,6]**2
-        disco_eb_values = jnp.interp(test_points, kmodes, Pkbc)
-
-        assert jnp.allclose(disco_eb_values, test_values, rtol=0.1), "relative error exceeded 0.1"
-        assert jnp.allclose(disco_eb_values, test_values, rtol=0.01), "relative error exceeded 0.01"
-        assert jnp.allclose(disco_eb_values, test_values, rtol=0.005), "relative error exceeded 0.005"
-
-    def test_benchmark_evolve_perturbations(self, benchmark, background_param):
-        _ = perturbations_jit(param=background_param)
-
-        _ = benchmark(perturbations_jit, param=background_param)
-
-
-    def test_benchmark_evolve_perturbations_batched(self, benchmark, background_param):
-        _ = perturbations_batched_jit(param=background_param)
-
-        _ = benchmark(perturbations_batched_jit, param=background_param)
+    g, r, c, b, _ = P.comoving_densities(a, *dens)
+    adotoa = P.expansion_rate(g, r, c, b, P.comoving_densities(a, *dens)[4])
+    dgrho = P.density_perturbation(
+        b, y[P.IX_CLXB], c, y[P.IX_CLXC], g, y[P.IX_G], r, y[P.IX_R]
+    )
+    dgq = P.momentum_perturbation(b, y[P.IX_VB], g, y[P.IX_G + 1], r, y[P.IX_R + 1])
+    z = P.metric_z(dgrho, y[P.IX_ETAK], adotoa, k)
+    sigma = P.shear_sigma(z, dgq, k)
+    polter = P.polarization_source(y[P.IX_G + 2], y[P.IX_POL])
+    expected_pig = P.photon_quadrupole_derivative(
+        y[P.IX_G + 1], y[P.IX_G + 3], y[P.IX_G + 2], polter, sigma, k, opacity
+    )
+    assert dy[P.IX_G + 2] == pytest.approx(expected_pig)
