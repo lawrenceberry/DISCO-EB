@@ -117,3 +117,132 @@ This is the dimensionless momentum integral of the relativistic Fermi-Dirac
 distribution and normalizes the neutrino momentum-bin weights so that a single
 massless flavour has unit density.
 """
+
+H_PLANCK = 6.62607015e-34
+"""Planck constant in J s (PDG 2023)."""
+
+M_E = 9.1093837015e-31
+"""Electron mass in kg (PDG 2023)."""
+
+
+# =============================================================================
+# RECFAST recombination constants
+#
+# Atomic-physics inputs and the derived RECFAST prefactors used by
+# :mod:`discoeb.recfast`. The names mirror the historical RECFAST code base
+# (Seager, Sasselov & Scott 1999/2000; Wong, Moss & Scott 2008). Raw wavenumbers
+# are in m^-1, decay rates in s^-1, cross sections in m^2; the derived ``C*``
+# quantities are the temperature-like / geometric prefactors that appear in the
+# RECFAST right-hand side.
+# =============================================================================
+
+L_H_ION = 1.096787737e7
+"""Hydrogen ionization wavenumber in m^-1."""
+
+L_H_ALPHA = 8.225916453e6
+"""Hydrogen Ly-alpha transition wavenumber in m^-1."""
+
+L_HE1_ION = 1.98310772e7
+"""Neutral-helium ionization wavenumber in m^-1."""
+
+L_HE2_ION = 4.389088863e7
+"""Singly ionized helium ionization wavenumber in m^-1."""
+
+L_HE_2S = 1.66277434e7
+"""Neutral-helium 2S singlet wavenumber in m^-1."""
+
+L_HE_2P = 1.71134891e7
+"""Neutral-helium 2P singlet wavenumber in m^-1."""
+
+L_HE_2PT = 1.690871466e7
+"""Neutral-helium 2P triplet wavenumber in m^-1."""
+
+L_HE_2ST = 1.5985597526e7
+"""Neutral-helium 2S triplet wavenumber in m^-1."""
+
+L_HE2ST_ION = 3.8454693845e6
+"""Neutral-helium triplet ionization threshold wavenumber in m^-1."""
+
+LAMBDA_2S1S = 8.2245809
+"""Hydrogen two-photon decay rate in s^-1."""
+
+LAMBDA_HE = 51.3
+"""Helium two-photon decay rate in s^-1."""
+
+A2P_S = 1.798287e9
+"""Helium singlet 2P spontaneous decay rate in s^-1."""
+
+A2P_T = 177.58
+"""Helium triplet 2P spontaneous decay rate in s^-1."""
+
+SIGMA_HE_2PS = 1.436289e-22
+"""Helium singlet continuum opacity cross section in m^2."""
+
+SIGMA_HE_2PT = 1.484872e-22
+"""Helium triplet continuum opacity cross section in m^2."""
+
+RECFAST_FUDGE = 1.125
+"""Hydrogen recombination fudge factor used by RECFAST."""
+
+AGAUSS1 = -0.14
+AGAUSS2 = 0.079
+"""Gaussian correction amplitudes for the hydrogen escape correction."""
+
+ZGAUSS1 = 7.28
+ZGAUSS2 = 6.73
+"""Gaussian correction centers in log(1+z)."""
+
+WGAUSS1 = 0.18
+WGAUSS2 = 0.33
+"""Gaussian correction widths in log(1+z)."""
+
+CR = 2.0 * math.pi * M_E * K_B_SI / H_PLANCK**2
+"""Saha prefactor coefficient ``2*pi*m_e*k_B / h_P^2``."""
+
+CB1_HE1 = H_PLANCK * C_SI * L_HE1_ION / K_B_SI
+"""Neutral-helium ionization temperature in K."""
+
+CB1_HE2 = H_PLANCK * C_SI * L_HE2_ION / K_B_SI
+"""Singly ionized helium ionization temperature in K."""
+
+CDB = H_PLANCK * C_SI * (L_H_ION - L_H_ALPHA) / K_B_SI
+"""Hydrogen Balmer-continuum energy gap expressed as a temperature."""
+
+CDB_HE = H_PLANCK * C_SI * (L_HE1_ION - L_HE_2S) / K_B_SI
+"""Helium singlet continuum energy gap expressed as a temperature."""
+
+CK = (1.0 / L_H_ALPHA) ** 3 / (8.0 * math.pi)
+"""Hydrogen Sobolev wavelength factor ``lambda_alpha^3/(8*pi)``."""
+
+CK_HE = (1.0 / L_HE_2P) ** 3 / (8.0 * math.pi)
+"""Helium singlet Sobolev wavelength factor ``lambda^3/(8*pi)``."""
+
+CL = H_PLANCK * C_SI * L_H_ALPHA / K_B_SI
+"""Hydrogen Ly-alpha transition temperature in K."""
+
+CL_HE = H_PLANCK * C_SI * L_HE_2S / K_B_SI
+"""Helium singlet transition temperature in K."""
+
+BFACT = H_PLANCK * C_SI * (L_HE_2P - L_HE_2S) / K_B_SI
+"""Helium singlet 2P-2S splitting expressed as a temperature."""
+
+CL_PST = H_PLANCK * C_SI * (L_HE_2PT - L_HE_2ST) / K_B_SI
+"""Helium triplet 2P-2S splitting expressed as a temperature."""
+
+CB1_HE2ST = H_PLANCK * C_SI * L_HE2ST_ION / K_B_SI
+"""Helium triplet ionization threshold expressed as a temperature."""
+
+CL_HE_2ST = H_PLANCK * C_SI * L_HE_2ST / K_B_SI
+"""Helium triplet 2S transition temperature in K."""
+
+A_RAD = 4.0 * SIGMA_SB / C_SI
+"""Radiation constant in SI units, ``4*sigma_SB/c``."""
+
+CT = (8.0 / 3.0) * (SIGMA_T / (M_E * C_SI)) * A_RAD
+"""Compton-cooling coefficient appearing in the matter-temperature equation."""
+
+PI = math.pi
+"""Circle constant as a plain float, so backend-agnostic helpers avoid ``math.pi``."""
+
+SQRT_PI = math.pi**0.5
+"""``sqrt(pi)`` for the Doppler/Sobolev escape primitives."""
