@@ -41,6 +41,13 @@ OPEN_COSMOLOGY = dataclasses.replace(DEFAULT_COSMOLOGY, Omegak=0.05)
 # Planck's minimal-mass convention: one massive species of 0.06 eV.
 MASSIVE_NU_COSMOLOGY = BENCHMARK_COSMOLOGIES["planck_2018_flat_lcdm_massive_nu"]
 
+# All three extensions at once, to pin down how they compose: the DE fluid and
+# the massive-neutrino hierarchies both extend the Schur-EB dense core, and their
+# state-vector indices must interleave consistently.
+EXTENDED_COSMOLOGY = dataclasses.replace(
+    MASSIVE_NU_COSMOLOGY, Omegak=0.05, w_DE_0=-0.9, w_DE_a=0.05, cs2_DE=1.0
+)
+
 # Log-uniform matter-power benchmark wavenumbers in Mpc^-1.
 MATTER_POWER_K = np.geomspace(2.0e-3, 0.3, 24, dtype=np.float64)
 
@@ -144,6 +151,19 @@ def test_matter_power_spectrum_matches_class_massive_neutrinos():
 
     pk_ours = solve_matter_power_spectrum(MATTER_POWER_K, MASSIVE_NU_COSMOLOGY)
     pk_class = _class_linear_pk(MASSIVE_NU_COSMOLOGY, MATTER_POWER_K)
+
+    rel = np.abs(pk_ours / pk_class - 1.0)
+    assert float(np.max(rel)) < PK_GATE
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="numba-CUDA requires a CUDA GPU")
+def test_matter_power_spectrum_matches_class_all_extensions():
+    """Curvature + CPL dark energy + massive neutrinos together: P_cb(k) vs CLASS."""
+
+    from discoeb.perturbations_system import solve_matter_power_spectrum
+
+    pk_ours = solve_matter_power_spectrum(MATTER_POWER_K, EXTENDED_COSMOLOGY)
+    pk_class = _class_linear_pk(EXTENDED_COSMOLOGY, MATTER_POWER_K)
 
     rel = np.abs(pk_ours / pk_class - 1.0)
     assert float(np.max(rel)) < PK_GATE
