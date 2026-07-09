@@ -30,6 +30,11 @@ DARK_ENERGY_COSMOLOGY = dataclasses.replace(
     DEFAULT_COSMOLOGY, w_DE_0=-0.9, w_DE_a=0.05, cs2_DE=1.0
 )
 
+# Open universe. Omega_k is deliberately large (the Planck benchmark's 7e-4 would
+# change P(k) by <0.1%, below the gate) so the curved-geometry corrections are
+# actually exercised.
+OPEN_COSMOLOGY = dataclasses.replace(DEFAULT_COSMOLOGY, Omegak=0.05)
+
 # Log-uniform matter-power benchmark wavenumbers in Mpc^-1.
 MATTER_POWER_K = np.geomspace(2.0e-3, 0.3, 24, dtype=np.float64)
 
@@ -82,6 +87,23 @@ def test_matter_power_spectrum_matches_class():
 
     pk_ours = solve_matter_power_spectrum(MATTER_POWER_K, DEFAULT_COSMOLOGY)
     pk_class = _class_linear_pk(DEFAULT_COSMOLOGY, MATTER_POWER_K)
+
+    rel = np.abs(pk_ours / pk_class - 1.0)
+    assert float(np.max(rel)) < PK_GATE
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="numba-CUDA requires a CUDA GPU")
+def test_matter_power_spectrum_matches_class_curvature():
+    """Open universe (Omega_k = 0.05): numba-CUDA P(k) vs CLASS.
+
+    Exercises the curved-geometry metric corrections (the ``s2^2`` factors and
+    the ``K h'`` term in ``eta'``), which suppress growth by ~9% in P(k).
+    """
+
+    from discoeb.perturbations_system import solve_matter_power_spectrum
+
+    pk_ours = solve_matter_power_spectrum(MATTER_POWER_K, OPEN_COSMOLOGY)
+    pk_class = _class_linear_pk(OPEN_COSMOLOGY, MATTER_POWER_K)
 
     rel = np.abs(pk_ours / pk_class - 1.0)
     assert float(np.max(rel)) < PK_GATE

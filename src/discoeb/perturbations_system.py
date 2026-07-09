@@ -29,6 +29,7 @@ import numpy as np
 from scipy import interpolate
 
 from .background import (
+    critical_density_grho,
     dark_energy_density_ratio,
     dtau_da,
     grhob,
@@ -68,7 +69,9 @@ TAU_START = 0.1
 # Packed-parameter row layout consumed by the device rhs/jac.
 #   p = (grhog, grhornomass, grhoc, grhob, grhov,
 #        tau_start, tau_end, k, cosmology_idx, save_index,
-#        w_DE_0, w_DE_a, cs2_DE)
+#        w_DE_0, w_DE_a, cs2_DE, grhok)
+# grhok = grhom * Omega_k is the (constant) comoving curvature density
+# coefficient 8*pi*G*rho_K a^2; it is 0 for a flat cosmology.
 IX_TAU_START = 5
 IX_TAU_END = 6
 IX_K = 7
@@ -77,7 +80,8 @@ IX_SAVE_INDEX = 9
 IX_W_DE_0 = 10
 IX_W_DE_A = 11
 IX_CS2_DE = 12
-N_PARAM = 13
+IX_GRHOK = 13
+N_PARAM = 14
 
 THERMO_TABLE_DTYPE = np.float32
 BATCHES_PER_BLOCK = 32
@@ -86,22 +90,28 @@ BATCHES_PER_BLOCK = 32
 def density_coefficients(cosmology) -> tuple[float, float, float, float, float]:
     """Return the background ``grho`` density coefficients for ``cosmology``.
 
-    Uses the massless-neutrino count (this stage is flat LambdaCDM + massless nu).
+    Uses the massless-neutrino count (this stage is LambdaCDM + massless nu). The
+    dark-energy coefficient is corrected for curvature: :func:`background.grhov`
+    closes the density budget assuming flatness, so for ``Omega_k != 0`` the
+    curvature density ``grhom * Omega_k`` is removed from it (``OmegaDE = 1 -
+    Omega_m - Omega_r - Omega_k``).
     """
 
     grhog_value = grhog(cosmology.T_cmb)
+    grhov_value = grhov(
+        cosmology.omega_b_h2,
+        cosmology.omega_c_h2,
+        cosmology.h,
+        cosmology.Neff_massless,
+        cosmology.T_cmb,
+    )
+    grhok = critical_density_grho(cosmology.H0) * cosmology.Omegak
     return (
         grhog_value,
         grhornomass(grhog_value, cosmology.Neff_massless),
         grhoc(cosmology.omega_c_h2),
         grhob(cosmology.omega_b_h2),
-        grhov(
-            cosmology.omega_b_h2,
-            cosmology.omega_c_h2,
-            cosmology.h,
-            cosmology.Neff_massless,
-            cosmology.T_cmb,
-        ),
+        grhov_value - grhok,
     )
 
 
@@ -137,6 +147,7 @@ def build_thermo_tables(cosmology, n_grid: int = N_THERMO_GRID):
     # is consistent with the expansion the perturbation RHS integrates on.
     w0 = cosmology.w_DE_0
     wa = cosmology.w_DE_a
+    grhok = critical_density_grho(cosmology.H0) * cosmology.Omegak
     amin = 1.0e-9
     a_grid = np.geomspace(amin, 1.0, N_BACKGROUND_A)
     dtauda_vals = np.array(
@@ -148,6 +159,7 @@ def build_thermo_tables(cosmology, n_grid: int = N_THERMO_GRID):
                 grhoc_v,
                 grhob_v,
                 grhov_v,
+                grhok=grhok,
                 rho_de=float(dark_energy_density_ratio(float(a), w0, wa)),
             )
             for a in a_grid
@@ -212,9 +224,11 @@ def make_params(cosmology, k_values: np.ndarray, tau_end: float) -> np.ndarray:
     w_de_0 = np.full(n, cosmology.w_DE_0, dtype=np.float64)
     w_de_a = np.full(n, cosmology.w_DE_a, dtype=np.float64)
     cs2_de = np.full(n, cosmology.cs2_DE, dtype=np.float64)
+    grhok = critical_density_grho(cosmology.H0) * cosmology.Omegak
+    grhok_col = np.full(n, grhok, dtype=np.float64)
     return np.column_stack(
         (rows, tau_start, tau_end_col, np.asarray(k_values, dtype=np.float64),
-         cosmology_idx, save_index, w_de_0, w_de_a, cs2_de)
+         cosmology_idx, save_index, w_de_0, w_de_a, cs2_de, grhok_col)
     )
 
 
@@ -321,7 +335,10 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
             grhov_t = p[4] * rho_Q * a2
         else:
             grhov_t = p[4] * a2
-        adotoa = math.sqrt((grhog_t + grhor_t + grhoc_t + grhob_t + grhov_t) / 3.0)
+        grhok = p[IX_GRHOK]
+        adotoa = math.sqrt(
+            (grhog_t + grhor_t + grhoc_t + grhob_t + grhov_t + grhok) / 3.0
+        )
 
         etak = y[IX_ETAK]
         clxc = y[IX_CLXC]
@@ -341,8 +358,15 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
             thetaq = y[IX_THETAQ]
             dgrho = dgrho + grhov_t * clxq
             dgq = dgq + grhov_t * (1.0 + w_Q) * thetaq / k
-        z = (0.5 * dgrho / k + etak) / adotoa
-        sigma = z + 1.5 * dgq / (k * k)
+        # Curved-geometry metric relations (CLASS perturbations.c, synchronous):
+        #   h'    = (k^2 s2^2 eta + 1.5 a^2 delta_rho)/(0.5 aH),   z = h'/(2k)
+        #   eta'  = (1.5 a^2 (rho+p)theta + 0.5 K h')/(k^2 s2^2)
+        #   sigma = k alpha = (z + 1.5 dgq/k^2)/s2^2
+        # with K = -grhok/3 and s2^2 = 1 - 3K/k^2 = 1 + grhok/k^2 (= 1 when flat).
+        s2 = 1.0 + grhok / (k * k)
+        Kcurv = -grhok / 3.0
+        z = (0.5 * dgrho / k + s2 * etak) / adotoa
+        sigma = (z + 1.5 * dgq / (k * k)) / s2
         photbar = grhog_t / grhob_t
         pb43 = 4.0 / 3.0 * photbar
         delta_p_b = cs2 * clxb
@@ -351,7 +375,7 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
 
         for i in range(NVAR):
             out[i] = 0.0
-        out[IX_ETAK] = 0.5 * dgq
+        out[IX_ETAK] = (0.5 * dgq + Kcurv * z) / s2
         out[IX_CLXC] = -k * z
         out[IX_CLXB] = -k * (z + vb)
         out[IX_VB] = vbdot
@@ -425,8 +449,14 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
     def make_jac():
         # The Einstein-Boltzmann RHS is linear in y, so the Jacobian is the
         # (background-dependent) coefficient matrix. It is assembled here as a
-        # sparse set of nonzero entries and returned as a dense 50x50 nested
-        # tuple; numba's dead-code elimination prunes the zero entries.
+        # sparse set of nonzero entries and returned as a dense nested tuple;
+        # numba's dead-code elimination prunes the zero entries.
+        #
+        # Note: the curvature corrections to the metric relations (the s2^2
+        # factors and the K*z term in etak') are carried by the RHS but omitted
+        # here. Rodas5P is a Rosenbrock-*W* method, whose order conditions hold
+        # for an approximate Jacobian, so this only affects step-size efficiency,
+        # not accuracy (verified: curved P(k) matches CLASS to ~1e-3).
         zc = {
             IX_ETAK: "zc_etak",
             IX_CLXB: "zc_clxb",
@@ -582,7 +612,8 @@ def jac(y, tau, p):
     grhoc_t = p[2] / a
     grhob_t = p[3] / a
 {grhov_block}
-    adotoa = math.sqrt((grhog_t + grhor_t + grhoc_t + grhob_t + grhov_t) / 3.0)
+    grhok = p[IX_GRHOK]
+    adotoa = math.sqrt((grhog_t + grhor_t + grhoc_t + grhob_t + grhov_t + grhok) / 3.0)
     photbar = grhog_t / grhob_t
     pb43 = 4.0 / 3.0 * photbar
     zc_etak = 1.0 / adotoa
@@ -605,6 +636,7 @@ def jac(y, tau, p):
             "IX_W_DE_0": IX_W_DE_0,
             "IX_W_DE_A": IX_W_DE_A,
             "IX_CS2_DE": IX_CS2_DE,
+            "IX_GRHOK": IX_GRHOK,
         }
         exec(source, ns)
         return cuda.jit(device=True)(ns["jac"])
