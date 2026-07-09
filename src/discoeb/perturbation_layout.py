@@ -141,22 +141,28 @@ class PerturbationLayout:
         """Base index of the massive-neutrino momentum-bin hierarchies.
 
         The multipole ``psi_l`` of momentum bin ``q`` is stored at
-        ``ix_massive_nu + l * nqmax + q`` (multipole-major, bin-minor), matching
-        the DISCO-EB momentum-bin packing.
+        ``ix_massive_nu + q * (lmaxnu + 1) + l`` (**bin-major, multipole-minor**),
+        so that each bin's free-streaming tail ``psi_3 ... psi_lmaxnu`` is
+        contiguous and can be treated as one tridiagonal block by the Schur-EB
+        block-LU solver.
         """
         if self.nqmax == 0:
             raise AttributeError("massive neutrinos are not enabled in this layout")
         return self._ix_after_dark_energy
 
-    def ix_psi(self, l: int, q: int) -> int:
-        """Return the state index of massive-neutrino multipole ``psi_l`` of bin ``q``."""
+    def ix_psi_base(self, q: int) -> int:
+        """Return the state index of ``psi_0`` for momentum bin ``q``."""
         if self.nqmax == 0:
             raise AttributeError("massive neutrinos are not enabled in this layout")
-        if not (0 <= l <= self.lmaxnu):
-            raise IndexError(f"multipole l={l} out of range [0, {self.lmaxnu}]")
         if not (0 <= q < self.nqmax):
             raise IndexError(f"momentum bin q={q} out of range [0, {self.nqmax})")
-        return self.ix_massive_nu + l * self.nqmax + q
+        return self.ix_massive_nu + q * (self.lmaxnu + 1)
+
+    def ix_psi(self, l: int, q: int) -> int:
+        """Return the state index of massive-neutrino multipole ``psi_l`` of bin ``q``."""
+        if not (0 <= l <= self.lmaxnu):
+            raise IndexError(f"multipole l={l} out of range [0, {self.lmaxnu}]")
+        return self.ix_psi_base(q) + l
 
     # --- Total size -----------------------------------------------------------
 

@@ -5,9 +5,12 @@ Solves the linear matter power spectrum with the numba-CUDA Rodas5P solver
 ``rodas5Pnumba`` + the Schur-EB block-LU) and compares it against **CLASS**
 linear ``P(k)`` via the ``classy`` Python package, for:
 
-    * flat LambdaCDM + massless neutrinos (Stage 1), and
+    * flat LambdaCDM + massless neutrinos (Stage 1),
+    * spatial curvature (``Omega_k != 0``), which modifies the metric relations,
     * dynamical dark energy (CPL fluid, ``w > -1`` throughout), which adds the
-      DE fluid perturbations to the state and grows the Schur-EB dense core.
+      DE fluid perturbations to the state and grows the Schur-EB dense core, and
+    * massive neutrinos, which add one ``psi_l`` momentum-bin hierarchy per
+      quadrature node.
 
 Requires a CUDA GPU with numba-CUDA (the tests skip otherwise).
 """
@@ -34,6 +37,9 @@ DARK_ENERGY_COSMOLOGY = dataclasses.replace(
 # change P(k) by <0.1%, below the gate) so the curved-geometry corrections are
 # actually exercised.
 OPEN_COSMOLOGY = dataclasses.replace(DEFAULT_COSMOLOGY, Omegak=0.05)
+
+# Planck's minimal-mass convention: one massive species of 0.06 eV.
+MASSIVE_NU_COSMOLOGY = BENCHMARK_COSMOLOGIES["planck_2018_flat_lcdm_massive_nu"]
 
 # Log-uniform matter-power benchmark wavenumbers in Mpc^-1.
 MATTER_POWER_K = np.geomspace(2.0e-3, 0.3, 24, dtype=np.float64)
@@ -73,7 +79,10 @@ def _class_linear_pk(cosmology, k_values):
     cosmo.set(params)
     try:
         cosmo.compute()
-        return np.array([cosmo.pk_lin(float(k), 0.0) for k in k_values])
+        # Our delta_m is the CDM + baryon density contrast, so with massive
+        # neutrinos the matching CLASS spectrum is pk_cb_lin, not pk_lin.
+        pk = cosmo.pk_cb_lin if cosmology.num_massive_neutrinos > 0.0 else cosmo.pk_lin
+        return np.array([pk(float(k), 0.0) for k in k_values])
     finally:
         cosmo.struct_cleanup()
         cosmo.empty()
@@ -117,6 +126,24 @@ def test_matter_power_spectrum_matches_class_dark_energy():
 
     pk_ours = solve_matter_power_spectrum(MATTER_POWER_K, DARK_ENERGY_COSMOLOGY)
     pk_class = _class_linear_pk(DARK_ENERGY_COSMOLOGY, MATTER_POWER_K)
+
+    rel = np.abs(pk_ours / pk_class - 1.0)
+    assert float(np.max(rel)) < PK_GATE
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="numba-CUDA requires a CUDA GPU")
+def test_matter_power_spectrum_matches_class_massive_neutrinos():
+    """One massive neutrino (0.06 eV): numba-CUDA P_cb(k) vs CLASS.
+
+    Each of the ``NQMAX`` momentum bins contributes a ``psi_l`` hierarchy whose
+    lowest three multipoles join the Schur-EB dense core, and whose free-streaming
+    tail becomes an extra tridiagonal block.
+    """
+
+    from discoeb.perturbations_system import solve_matter_power_spectrum
+
+    pk_ours = solve_matter_power_spectrum(MATTER_POWER_K, MASSIVE_NU_COSMOLOGY)
+    pk_class = _class_linear_pk(MASSIVE_NU_COSMOLOGY, MATTER_POWER_K)
 
     rel = np.abs(pk_ours / pk_class - 1.0)
     assert float(np.max(rel)) < PK_GATE

@@ -32,12 +32,13 @@ from .background import (
     critical_density_grho,
     dark_energy_density_ratio,
     dtau_da,
+    get_neutrino_momentum_bins,
     grhob,
     grhoc,
     grhog,
     grhornomass,
-    grhov,
-    helium_number_fraction,
+    neutrino_density_grho,
+    neutrino_mass_parameter,
     thomson_normalization,
 )
 from .background_system import solve_background_system
@@ -81,38 +82,100 @@ IX_W_DE_0 = 10
 IX_W_DE_A = 11
 IX_CS2_DE = 12
 IX_GRHOK = 13
-N_PARAM = 14
+IX_GRHOR_NU = 14
+IX_NMNU = 15
+IX_AMNU = 16
+N_PARAM = 17
 
 THERMO_TABLE_DTYPE = np.float32
 BATCHES_PER_BLOCK = 32
+
+NQMAX = 3
+"""Massive-neutrino momentum bins used by both the background and the hierarchy.
+
+Each bin adds ``lmaxnu + 1 == 16`` state variables and the generated dense
+Jacobian scales as ``nvar^2``, so this sets the numba compile time: 3 bins give
+``nvar = 98``, 5 bins give ``nvar = 130`` and compile ~4x slower for no gain in
+P(k) accuracy against CLASS.
+"""
+
+
+def neutrino_momentum_bins(nqmax: int = NQMAX):
+    """Return ``(q, w, dlnf0_dlnq)`` momentum bins as NumPy arrays.
+
+    ``w`` are normalized so a single massless flavour integrates to unit density,
+    and ``dlnf0/dlnq = -q/(1 + exp(-q))`` is the log-derivative of the
+    Fermi-Dirac background distribution that sources the ``psi`` hierarchy.
+    """
+
+    q, w = get_neutrino_momentum_bins(nqmax)
+    q = np.asarray(q, dtype=np.float64)
+    w = np.asarray(w, dtype=np.float64)
+    dlfdlq = -q / (1.0 + np.exp(-q))
+    return q, w, dlfdlq
+
+
+def massive_neutrino_density_ratio(a, amnu: float, q, w) -> np.ndarray:
+    """Return ``rho_nu(a)/rho_nu0_massless`` on the same momentum quadrature.
+
+    ``rho = sum_i w_i / v_i`` with ``v_i = 1/sqrt(1 + (a amnu/q_i)^2)``, i.e.
+    ``rho = sum_i w_i sqrt(1 + (a amnu/q_i)^2)``. It tends to 1 (relativistic)
+    as ``a -> 0``. Using the *same* quadrature as the perturbation hierarchy
+    keeps ``drho_nu/rho_nu`` consistent.
+    """
+
+    a = np.atleast_1d(np.asarray(a, dtype=np.float64))[:, None]
+    return np.sum(w[None, :] * np.sqrt(1.0 + (a * amnu / q[None, :]) ** 2), axis=1)
+
+
+def massive_neutrino_parameters(cosmology) -> tuple[float, float, float]:
+    """Return ``(grhor_nu, N_mnu, amnu)`` for the massive-neutrino species."""
+
+    grhor_nu = neutrino_density_grho(cosmology.T_cmb)
+    n_mnu = float(cosmology.num_massive_neutrinos)
+    amnu = (
+        neutrino_mass_parameter(cosmology.mnu, cosmology.T_cmb) if n_mnu > 0.0 else 0.0
+    )
+    return grhor_nu, n_mnu, amnu
 
 
 def density_coefficients(cosmology) -> tuple[float, float, float, float, float]:
     """Return the background ``grho`` density coefficients for ``cosmology``.
 
-    Uses the massless-neutrino count (this stage is LambdaCDM + massless nu). The
-    dark-energy coefficient is corrected for curvature: :func:`background.grhov`
-    closes the density budget assuming flatness, so for ``Omega_k != 0`` the
-    curvature density ``grhom * Omega_k`` is removed from it (``OmegaDE = 1 -
-    Omega_m - Omega_r - Omega_k``).
+    ``grhornomass`` uses the *massless* neutrino count. The dark-energy
+    coefficient is fixed by closing the density budget at ``a = 1``,
+
+    ``grhov = grhom - (grhog + grhornomass + grho_mnu(1) + grhoc + grhob + grhok)``,
+
+    which reproduces the flat massless value and automatically accounts for
+    spatial curvature and the massive-neutrino density.
     """
 
     grhog_value = grhog(cosmology.T_cmb)
-    grhov_value = grhov(
-        cosmology.omega_b_h2,
-        cosmology.omega_c_h2,
-        cosmology.h,
-        cosmology.Neff_massless,
-        cosmology.T_cmb,
+    grhornomass_value = grhornomass(grhog_value, cosmology.Neff_massless)
+    grhoc_value = grhoc(cosmology.omega_c_h2)
+    grhob_value = grhob(cosmology.omega_b_h2)
+    grhom = critical_density_grho(cosmology.H0)
+    grhok = grhom * cosmology.Omegak
+
+    grhor_nu, n_mnu, amnu = massive_neutrino_parameters(cosmology)
+    if n_mnu > 0.0:
+        q, w, _ = neutrino_momentum_bins()
+        grho_mnu_today = grhor_nu * n_mnu * float(
+            massive_neutrino_density_ratio(1.0, amnu, q, w)[0]
+        )
+    else:
+        grho_mnu_today = 0.0
+
+    grhov_value = grhom - (
+        grhog_value
+        + grhornomass_value
+        + grho_mnu_today
+        + grhoc_value
+        + grhob_value
+        + grhok
     )
-    grhok = critical_density_grho(cosmology.H0) * cosmology.Omegak
-    return (
-        grhog_value,
-        grhornomass(grhog_value, cosmology.Neff_massless),
-        grhoc(cosmology.omega_c_h2),
-        grhob(cosmology.omega_b_h2),
-        grhov_value - grhok,
-    )
+    return (grhog_value, grhornomass_value, grhoc_value, grhob_value, grhov_value)
 
 
 Z_RECOMB_START = 3500.0
@@ -148,8 +211,18 @@ def build_thermo_tables(cosmology, n_grid: int = N_THERMO_GRID):
     w0 = cosmology.w_DE_0
     wa = cosmology.w_DE_a
     grhok = critical_density_grho(cosmology.H0) * cosmology.Omegak
+    grhor_nu, n_mnu, amnu = massive_neutrino_parameters(cosmology)
+    q_bins, w_bins, _ = neutrino_momentum_bins()
+    grhomnu = grhor_nu * n_mnu
+
+    def rhonu_of_a(a_vals):
+        if n_mnu <= 0.0:
+            return np.ones_like(np.atleast_1d(a_vals), dtype=np.float64)
+        return massive_neutrino_density_ratio(a_vals, amnu, q_bins, w_bins)
+
     amin = 1.0e-9
     a_grid = np.geomspace(amin, 1.0, N_BACKGROUND_A)
+    rhonu_grid = rhonu_of_a(a_grid)
     dtauda_vals = np.array(
         [
             dtau_da(
@@ -160,9 +233,11 @@ def build_thermo_tables(cosmology, n_grid: int = N_THERMO_GRID):
                 grhob_v,
                 grhov_v,
                 grhok=grhok,
+                grhomnu=grhomnu,
+                rhonu=float(rn),
                 rho_de=float(dark_energy_density_ratio(float(a), w0, wa)),
             )
-            for a in a_grid
+            for a, rn in zip(a_grid, rhonu_grid)
         ]
     )
     # Radiation-era conformal time already elapsed by amin: a ~ adotrad * tau.
@@ -204,7 +279,10 @@ def build_thermo_tables(cosmology, n_grid: int = N_THERMO_GRID):
     dlnT_dlna = np.gradient(np.log(tb_safe), np.log(a_vals))
     cs2_vals = np.maximum(barssc * tb_safe * (1.0 - dlnT_dlna / 3.0), 0.0)
 
-    values = np.stack((a_vals, opacity_vals, cs2_vals))
+    # Channel 3: massive-neutrino background density ratio rho_nu(a)/rho_nu0.
+    rhonu_vals = rhonu_of_a(a_vals)
+
+    values = np.stack((a_vals, opacity_vals, cs2_vals, rhonu_vals))
     seconds = np.stack(
         [interpolate.CubicSpline(log_tau_grid, row)(log_tau_grid, 2) for row in values]
     )
@@ -226,9 +304,14 @@ def make_params(cosmology, k_values: np.ndarray, tau_end: float) -> np.ndarray:
     cs2_de = np.full(n, cosmology.cs2_DE, dtype=np.float64)
     grhok = critical_density_grho(cosmology.H0) * cosmology.Omegak
     grhok_col = np.full(n, grhok, dtype=np.float64)
+    grhor_nu, n_mnu, amnu = massive_neutrino_parameters(cosmology)
+    grhor_nu_col = np.full(n, grhor_nu, dtype=np.float64)
+    n_mnu_col = np.full(n, n_mnu, dtype=np.float64)
+    amnu_col = np.full(n, amnu, dtype=np.float64)
     return np.column_stack(
         (rows, tau_start, tau_end_col, np.asarray(k_values, dtype=np.float64),
-         cosmology_idx, save_index, w_de_0, w_de_a, cs2_de, grhok_col)
+         cosmology_idx, save_index, w_de_0, w_de_a, cs2_de, grhok_col,
+         grhor_nu_col, n_mnu_col, amnu_col)
     )
 
 
@@ -243,12 +326,22 @@ def make_initial_states(cosmology, k_values: np.ndarray, layout) -> np.ndarray:
 
     densities = density_coefficients(cosmology)
     y0 = np.zeros((len(k_values), layout.nvar), dtype=np.float64)
+    if layout.has_massive_neutrinos:
+        _, _, dlfdlq = neutrino_momentum_bins(layout.nqmax)
     for i, k in enumerate(k_values):
         core = adiabatic_initial_conditions(float(k), TAU_START, *densities[:4])
         y0[i, : len(core)] = core
         if layout.enable_dark_energy:
             y0[i, layout.ix_clxq] = (1.0 + cosmology.w_DE_0) * core[IX_CLXC]
             y0[i, layout.ix_thetaq] = 0.0
+        if layout.has_massive_neutrinos:
+            # Deep in radiation domination the massive neutrinos are still
+            # relativistic (a*amnu/q << 1, v -> 1), so their phase-space
+            # perturbation reduces to the massless hierarchy:
+            #   psi_l = -(1/4) N_l dln f0/dln q      (Ma & Bertschinger)
+            for qi in range(layout.nqmax):
+                for l in range(0, min(3, LMAX_NR) + 1):
+                    y0[i, layout.ix_psi(l, qi)] = -0.25 * core[IX_R + l] * dlfdlq[qi]
     return y0
 
 
@@ -271,6 +364,12 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
     IX_CLXQ = layout.ix_clxq if ENABLE_DE else 0
     IX_THETAQ = layout.ix_thetaq if ENABLE_DE else 0
 
+    ENABLE_MNU = layout.has_massive_neutrinos
+    NQ = layout.nqmax if ENABLE_MNU else 0
+    LMAXNU = layout.lmaxnu
+    IX_MNU = layout.ix_massive_nu if ENABLE_MNU else 0
+    NPSI = LMAXNU + 1
+
     n_grid = tau_grid.shape[0]
     tau_min = np.asarray([np.log(tau_grid[0])], dtype=np.float64)
     inv_dtau = np.asarray(
@@ -283,6 +382,12 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
     inv_dtau_dev = cuda.to_device(inv_dtau)
     values_dev = cuda.to_device(values_t)
     seconds_dev = cuda.to_device(seconds_t)
+
+    # Massive-neutrino momentum quadrature (device constants).
+    q_np, w_np, dlf_np = neutrino_momentum_bins(NQ if ENABLE_MNU else 1)
+    q_dev = cuda.to_device(np.ascontiguousarray(q_np))
+    w_dev = cuda.to_device(np.ascontiguousarray(w_np))
+    dlf_dev = cuda.to_device(np.ascontiguousarray(dlf_np))
 
     @cuda.jit(device=True)
     def spline_eval(x, p, channel):
@@ -335,9 +440,17 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
             grhov_t = p[4] * rho_Q * a2
         else:
             grhov_t = p[4] * a2
+        if ENABLE_MNU:
+            grhor_nu = p[IX_GRHOR_NU]
+            n_mnu = p[IX_NMNU]
+            amnu = p[IX_AMNU]
+            rhonu = spline_eval(log_tau, p, 3)
+            grho_mnu_t = grhor_nu * n_mnu * rhonu / a2
+        else:
+            grho_mnu_t = 0.0
         grhok = p[IX_GRHOK]
         adotoa = math.sqrt(
-            (grhog_t + grhor_t + grhoc_t + grhob_t + grhov_t + grhok) / 3.0
+            (grhog_t + grhor_t + grho_mnu_t + grhoc_t + grhob_t + grhov_t + grhok) / 3.0
         )
 
         etak = y[IX_ETAK]
@@ -358,6 +471,18 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
             thetaq = y[IX_THETAQ]
             dgrho = dgrho + grhov_t * clxq
             dgq = dgq + grhov_t * (1.0 + w_Q) * thetaq / k
+        if ENABLE_MNU:
+            # Momentum integrals of the phase-space perturbation:
+            #   drho_nu = sum_i w_i psi0_i / v_i ,   f_nu = sum_i w_i psi1_i
+            drhonu = 0.0
+            fnu = 0.0
+            for qi in range(NQ):
+                b = IX_MNU + qi * NPSI
+                vq = 1.0 / math.sqrt(1.0 + (a * amnu / q_dev[qi]) ** 2)
+                drhonu += w_dev[qi] * y[b] / vq
+                fnu += w_dev[qi] * y[b + 1]
+            dgrho = dgrho + grhor_nu * n_mnu * drhonu / a2
+            dgq = dgq + grhor_nu * n_mnu * fnu / a2
         # Curved-geometry metric relations (CLASS perturbations.c, synchronous):
         #   h'    = (k^2 s2^2 eta + 1.5 a^2 delta_rho)/(0.5 aH),   z = h'/(2k)
         #   eta'  = (1.5 a^2 (rho+p)theta + 0.5 K h')/(k^2 s2^2)
@@ -446,6 +571,36 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
                 + cs2_Q / (1.0 + w_Q) * k**2 * clxq
             )
 
+        if ENABLE_MNU:
+            # Massive-neutrino phase-space hierarchy (Ma & Bertschinger; CLASS
+            # perturbations.c, synchronous gauge with metric_continuity = h'/2,
+            # metric_euler = 0, metric_shear = k*sigma, and h' = 2 k z):
+            #   psi0' = -k v psi1 + (k z / 3) dlnf0
+            #   psi1' = (k v / 3) (psi0 - 2 psi2)
+            #   psi2' = (k v / 5) (2 psi1 - 3 psi3) - (2/15) k sigma dlnf0
+            #   psi_l' = (k v / (2l+1)) (l psi_{l-1} - (l+1) psi_{l+1})
+            #   psi_L' = k v psi_{L-1} - (L+1) psi_L / tau
+            for qi in range(NQ):
+                b = IX_MNU + qi * NPSI
+                vq = 1.0 / math.sqrt(1.0 + (a * amnu / q_dev[qi]) ** 2)
+                kv = k * vq
+                dl = dlf_dev[qi]
+                out[b] = -kv * y[b + 1] + (k * z / 3.0) * dl
+                out[b + 1] = kv / 3.0 * (y[b] - 2.0 * y[b + 2])
+                out[b + 2] = (
+                    kv / 5.0 * (2.0 * y[b + 1] - 3.0 * y[b + 3])
+                    - (2.0 / 15.0) * k * sigma * dl
+                )
+                for ell in range(3, LMAXNU):
+                    out[b + ell] = (
+                        kv
+                        / (2.0 * ell + 1.0)
+                        * (ell * y[b + ell - 1] - (ell + 1.0) * y[b + ell + 1])
+                    )
+                out[b + LMAXNU] = (
+                    kv * y[b + LMAXNU - 1] - (LMAXNU + 1.0) * y[b + LMAXNU] / tau
+                )
+
     def make_jac():
         # The Einstein-Boltzmann RHS is linear in y, so the Jacobian is the
         # (background-dependent) coefficient matrix. It is assembled here as a
@@ -467,6 +622,10 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
         # z depends on clxq through dgrho, so clxq joins the metric coupling.
         if ENABLE_DE:
             zc[IX_CLXQ] = "zc_clxq"
+        # z also depends on every psi0(q) through the massive-nu density integral.
+        if ENABLE_MNU:
+            for qi in range(NQ):
+                zc[layout.ix_psi(0, qi)] = f"zc_psi0_{qi}"
         sigc = dict(zc)
         sigc[IX_VB] = "sigc_vb"
         sigc[IX_G + 1] = "sigc_qg"
@@ -474,6 +633,10 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
         # sigma depends on thetaq through dgq.
         if ENABLE_DE:
             sigc[IX_THETAQ] = "sigc_thetaq"
+        # sigma depends on every psi1(q) through the massive-nu momentum integral.
+        if ENABLE_MNU:
+            for qi in range(NQ):
+                sigc[layout.ix_psi(1, qi)] = f"sigc_psi1_{qi}"
         mat: dict[tuple[int, int], list[str]] = {}
 
         def setc(r, c, e):
@@ -487,6 +650,9 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
         setc(IX_ETAK, IX_R + 1, "0.5 * grhor_t")
         if ENABLE_DE:
             setc(IX_ETAK, IX_THETAQ, "0.5 * grhov_t * (1.0 + w_Q) / k")
+        if ENABLE_MNU:
+            for qi in range(NQ):
+                setc(IX_ETAK, layout.ix_psi(1, qi), f"0.5 * velmnu_{qi}")
         for c, t in zc.items():
             addc(IX_CLXC, c, f"-k * {t}")
             addc(IX_CLXB, c, f"-k * {t}")
@@ -563,6 +729,32 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
             setc(IX_THETAQ, IX_CLXQ, "cs2_Q / (1.0 + w_Q) * k**2")
             setc(IX_THETAQ, IX_THETAQ, "-(1.0 - 3.0 * cs2_Q) * adotoa")
 
+        if ENABLE_MNU:
+            for qi in range(NQ):
+                b = layout.ix_psi_base(qi)
+                # psi0' = -k v psi1 + (k z / 3) dlnf0
+                setc(b, b + 1, f"-k * v_{qi}")
+                for c, t in zc.items():
+                    addc(b, c, f"(k / 3.0) * dlf_{qi} * {t}")
+                # psi1' = (k v / 3)(psi0 - 2 psi2)
+                setc(b + 1, b, f"k * v_{qi} / 3.0")
+                setc(b + 1, b + 2, f"-2.0 * k * v_{qi} / 3.0")
+                # psi2' = (k v / 5)(2 psi1 - 3 psi3) - (2/15) k sigma dlnf0
+                setc(b + 2, b + 1, f"2.0 * k * v_{qi} / 5.0")
+                setc(b + 2, b + 3, f"-3.0 * k * v_{qi} / 5.0")
+                for c, t in sigc.items():
+                    addc(b + 2, c, f"-(2.0 / 15.0) * k * dlf_{qi} * ({t})")
+                # Free-streaming tail (tridiagonal in l).
+                for ell in range(3, LMAXNU):
+                    setc(b + ell, b + ell - 1, f"k * v_{qi} * {ell} / {2 * ell + 1}")
+                    setc(
+                        b + ell,
+                        b + ell + 1,
+                        f"-k * v_{qi} * {ell + 1} / {2 * ell + 1}",
+                    )
+                setc(b + LMAXNU, b + LMAXNU - 1, f"k * v_{qi}")
+                setc(b + LMAXNU, b + LMAXNU, f"-{LMAXNU + 1} / tau")
+
         assignments = []
         for (row, col), terms in sorted(mat.items()):
             assignments.append(f"    j_{row}_{col} = " + " + ".join(terms))
@@ -595,6 +787,33 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
             grhov_block = "    grhov_t = p[4] * a2"
             de_defs = ""
 
+        if ENABLE_MNU:
+            mnu_pre = (
+                "    grhor_nu = p[IX_GRHOR_NU]\n"
+                "    n_mnu = p[IX_NMNU]\n"
+                "    amnu = p[IX_AMNU]\n"
+                "    rhonu = spline_eval(log_tau, p, 3)\n"
+                "    grho_mnu_t = grhor_nu * n_mnu * rhonu / a2"
+            )
+            mnu_term = "grho_mnu_t + "
+            lines = []
+            for qi in range(NQ):
+                lines.append(
+                    f"    v_{qi} = 1.0 / math.sqrt(1.0 + (a * amnu / q_dev[{qi}])**2)"
+                )
+                lines.append(f"    dlf_{qi} = dlf_dev[{qi}]")
+                lines.append(f"    velmnu_{qi} = grhor_nu * n_mnu * w_dev[{qi}] / a2")
+                lines.append(
+                    f"    zc_psi0_{qi} = 0.5 * (grhor_nu * n_mnu * w_dev[{qi}]"
+                    f" / (v_{qi} * a2)) / (k * adotoa)"
+                )
+                lines.append(f"    sigc_psi1_{qi} = 1.5 * velmnu_{qi} / (k * k)")
+            mnu_defs = "\n".join(lines)
+        else:
+            mnu_pre = ""
+            mnu_term = ""
+            mnu_defs = ""
+
         source = f"""
 def jac(y, tau, p):
     k = p[IX_K]
@@ -612,8 +831,9 @@ def jac(y, tau, p):
     grhoc_t = p[2] / a
     grhob_t = p[3] / a
 {grhov_block}
+{mnu_pre}
     grhok = p[IX_GRHOK]
-    adotoa = math.sqrt((grhog_t + grhor_t + grhoc_t + grhob_t + grhov_t + grhok) / 3.0)
+    adotoa = math.sqrt((grhog_t + grhor_t + {mnu_term}grhoc_t + grhob_t + grhov_t + grhok) / 3.0)
     photbar = grhog_t / grhob_t
     pb43 = 4.0 / 3.0 * photbar
     zc_etak = 1.0 / adotoa
@@ -625,6 +845,7 @@ def jac(y, tau, p):
     sigc_qg = 1.5 * grhog_t / (k * k)
     sigc_qr = 1.5 * grhor_t / (k * k)
 {de_defs}
+{mnu_defs}
 {chr(10).join(assignments)}
     return ({", ".join(rows)})
 """
@@ -632,11 +853,17 @@ def jac(y, tau, p):
             "cuda": cuda,
             "math": math,
             "spline_eval": spline_eval,
+            "q_dev": q_dev,
+            "w_dev": w_dev,
+            "dlf_dev": dlf_dev,
             "IX_K": IX_K,
             "IX_W_DE_0": IX_W_DE_0,
             "IX_W_DE_A": IX_W_DE_A,
             "IX_CS2_DE": IX_CS2_DE,
             "IX_GRHOK": IX_GRHOK,
+            "IX_GRHOR_NU": IX_GRHOR_NU,
+            "IX_NMNU": IX_NMNU,
+            "IX_AMNU": IX_AMNU,
         }
         exec(source, ns)
         return cuda.jit(device=True)(ns["jac"])
@@ -677,10 +904,11 @@ def solve_perturbations(
     from .perturbation_layout import PerturbationLayout
     from .schur_eb import DENSE_IDX, K_BASES, DENSE_C0, A_SIZE, SchurEBSolver
 
-    layout = PerturbationLayout.from_cosmology(cosmology)
-    if layout.has_massive_neutrinos:
+    layout = PerturbationLayout.from_cosmology(cosmology, nqmax=NQMAX)
+    if layout.has_massive_neutrinos and layout.lmaxnu - 2 != A_SIZE:
         raise NotImplementedError(
-            "massive-neutrino perturbations are not yet wired into the numba solve"
+            "the Schur-EB solver requires all tridiagonal blocks to share a length; "
+            f"massive-nu needs lmaxnu - 2 == {A_SIZE} (got {layout.lmaxnu})"
         )
 
     k_arr = np.ascontiguousarray(np.asarray(k_values, dtype=np.float64))
@@ -694,22 +922,31 @@ def solve_perturbations(
 
     rhs, jac, time_jac = build_numba_callbacks(layout, tau_grid, values, seconds)
 
+    # Assemble the bordered-block structure the Schur-EB solver factorizes:
+    #   dense core  = metric/fluid/low multipoles [+ DE fluid] [+ psi0,1,2 per bin]
+    #   tridiagonal = photon, polarization, massless-nu [+ one tail per bin]
+    # Each tridiagonal block couples into the core only through its lowest
+    # multipole (Theta_3<->Theta_2, E_3<->E_2, N_3<->N_2, psi_3(q)<->psi_2(q)).
+    dense_idx = list(DENSE_IDX)
+    k_bases = list(K_BASES)
+    dense_c0 = list(DENSE_C0)
     if layout.enable_dark_energy:
-        # The DE fluid variables join the densely-coupled metric core.
-        lu_solver = SchurEBSolver(
-            batches_per_block=BATCHES_PER_BLOCK,
-            block_dim=(BATCHES_PER_BLOCK, 1, 1),
-            dense_idx=DENSE_IDX + (layout.ix_clxq, layout.ix_thetaq),
-            k_bases=K_BASES,
-            dense_c0=DENSE_C0,
-            tridiag_len=A_SIZE,
-            nvar=layout.nvar,
-        )
-    else:
-        lu_solver = SchurEBSolver(
-            batches_per_block=BATCHES_PER_BLOCK,
-            block_dim=(BATCHES_PER_BLOCK, 1, 1),
-        )
+        dense_idx += [layout.ix_clxq, layout.ix_thetaq]
+    if layout.has_massive_neutrinos:
+        for qi in range(layout.nqmax):
+            dense_c0.append(len(dense_idx) + 2)  # position of psi2(q) in the core
+            dense_idx += [layout.ix_psi(l, qi) for l in (0, 1, 2)]
+            k_bases.append(layout.ix_psi(3, qi))
+
+    lu_solver = SchurEBSolver(
+        batches_per_block=BATCHES_PER_BLOCK,
+        block_dim=(BATCHES_PER_BLOCK, 1, 1),
+        dense_idx=tuple(dense_idx),
+        k_bases=tuple(k_bases),
+        dense_c0=tuple(dense_c0),
+        tridiag_len=A_SIZE,
+        nvar=layout.nvar,
+    )
 
     sol = rodas5Pnumba_solve(
         rhs,

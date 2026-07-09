@@ -36,7 +36,7 @@ def test_dark_energy_adds_two_state_variables():
 
 
 def test_massive_neutrinos_add_momentum_hierarchies():
-    """Massive neutrinos append nqmax * (lmaxnu + 1) variables, multipole-major."""
+    """Massive neutrinos append nqmax * (lmaxnu + 1) variables, bin-major."""
 
     nqmax, lmaxnu = 5, 12
     L = PerturbationLayout(nqmax=nqmax, lmaxnu=lmaxnu)
@@ -44,11 +44,17 @@ def test_massive_neutrinos_add_momentum_hierarchies():
     assert L.has_massive_neutrinos
     assert L.nvar == base.nvar + nqmax * (lmaxnu + 1)
     assert L.ix_massive_nu == base.nvar
-    # Multipole-major, bin-minor packing.
+    # Bin-major, multipole-minor packing: each bin's hierarchy is contiguous, so
+    # psi_3..psi_lmaxnu forms one tridiagonal block for the Schur-EB solver.
     assert L.ix_psi(0, 0) == base.nvar
-    assert L.ix_psi(0, nqmax - 1) == base.nvar + nqmax - 1
-    assert L.ix_psi(1, 0) == base.nvar + nqmax
+    assert L.ix_psi(1, 0) == base.nvar + 1
+    assert L.ix_psi_base(1) == base.nvar + (lmaxnu + 1)
+    assert L.ix_psi(0, nqmax - 1) == base.nvar + (nqmax - 1) * (lmaxnu + 1)
     assert L.ix_psi(lmaxnu, nqmax - 1) == L.nvar - 1
+    # Contiguity of the free-streaming tail of each bin.
+    for q in range(nqmax):
+        tail = [L.ix_psi(l, q) for l in range(3, lmaxnu + 1)]
+        assert tail == list(range(tail[0], tail[0] + len(tail)))
 
 
 def test_dark_energy_and_massive_neutrinos_stack():
