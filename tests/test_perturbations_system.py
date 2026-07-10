@@ -111,8 +111,8 @@ def _class_linear_pk(cosmology, k_values):
 
 @pytest.mark.skipif(not _cuda_available(), reason="numba-CUDA requires a CUDA GPU")
 @pytest.mark.parametrize("cosmology", PK_COSMOLOGY_CASES)
-def test_matter_power_spectrum_matches_class(cosmology):
-    """Linear matter P(k) vs CLASS across each solver code path.
+def test_matter_power_spectrum_matches_class(cosmology, benchmark):
+    """Linear matter P(k) vs CLASS across each solver code path, timed.
 
     One case per extension, so a failure's parametrization id names the culprit:
 
@@ -126,11 +126,21 @@ def test_matter_power_spectrum_matches_class(cosmology):
           quadrature node (P_cb, since our delta_m is CDM + baryon);
         * ``all_extensions``     -- all three at once, checking their state-vector
           indices interleave consistently.
+
+    The solve is timed with ``benchmark.pedantic``: the warmup round absorbs the
+    one-time numba-CUDA kernel compilation, so the single timed round measures the
+    steady-state GPU solve.
     """
 
     from discoeb.perturbations_system import solve_matter_power_spectrum
 
-    pk_ours = solve_matter_power_spectrum(MATTER_POWER_K, cosmology)
+    pk_ours = benchmark.pedantic(
+        solve_matter_power_spectrum,
+        args=(MATTER_POWER_K, cosmology),
+        rounds=1,
+        warmup_rounds=1,
+        iterations=1,
+    )
     pk_class = _class_linear_pk(cosmology, MATTER_POWER_K)
 
     rel = np.abs(pk_ours / pk_class - 1.0)
