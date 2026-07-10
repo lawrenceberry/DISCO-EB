@@ -1,16 +1,19 @@
 """End-to-end Einstein-Boltzmann perturbation solve vs CLASS.
 
 Solves the linear matter power spectrum with the numba-CUDA Rodas5P solver
-(:func:`discoeb.perturbations_system.solve_matter_power_spectrum`, which uses
-``rodas5Pnumba`` + the Schur-EB block-LU) and compares it against **CLASS**
-linear ``P(k)`` via the ``classy`` Python package, for:
+(``rodas5Pnumba`` + the Schur-EB block-LU) and compares it against **CLASS**
+linear ``P(k)`` via the ``classy`` Python package.
 
-    * flat LambdaCDM + massless neutrinos (Stage 1),
-    * spatial curvature (``Omega_k != 0``), which modifies the metric relations,
-    * dynamical dark energy (CPL fluid, ``w > -1`` throughout), which adds the
-      DE fluid perturbations to the state and grows the Schur-EB dense core, and
-    * massive neutrinos, which add one ``psi_l`` momentum-bin hierarchy per
-      quadrature node.
+Two tests:
+
+    * :func:`test_matter_power_spectrum_matches_class` -- a *batch* solve of
+      ``N`` slightly-perturbed flat-LCDM cosmologies (``N in {1, 128}``) in one
+      GPU launch (:func:`solve_matter_power_spectrum_batch`), timed with
+      ``benchmark.pedantic``; the ``N = 128`` case shows the whole batch solving
+      in essentially the same wall-time as a single cosmology.
+    * :func:`test_matter_power_spectrum_extensions_match_class` -- one cosmology
+      per solver code path (curvature, CPL dark energy, massive neutrinos, and
+      all three at once), so a failure's id names the culprit.
 
 Requires a CUDA GPU with numba-CUDA (the tests skip otherwise).
 """
@@ -20,7 +23,11 @@ import dataclasses
 import numpy as np
 import pytest
 
-from cosmologies import BENCHMARK_COSMOLOGIES, cosmology_to_class_params
+from cosmologies import (
+    BENCHMARK_COSMOLOGIES,
+    cosmology_to_class_params,
+    perturbed_planck_cosmologies,
+)
 
 
 DEFAULT_COSMOLOGY = BENCHMARK_COSMOLOGIES["planck_2018_flat_lcdm"]
@@ -48,13 +55,13 @@ EXTENDED_COSMOLOGY = dataclasses.replace(
     MASSIVE_NU_COSMOLOGY, Omegak=0.05, w_DE_0=-0.9, w_DE_a=0.05, cs2_DE=1.0
 )
 
-# The matter-power comparison cases, each exercising a distinct code path in the
+# The extension comparison cases, each exercising a distinct code path in the
 # solver. These are purpose-built rather than the raw benchmark registry: the
 # DESI benchmark's dark energy crosses w = -1 (phantom), which the CPL fluid
 # cannot represent without the PPF scheme, and the Planck-curved benchmark's
 # Omega_k = 7e-4 changes P(k) by less than the gate. Omega_k = 0.05 and a
 # non-crossing w(a) are used instead so each extension is actually stressed.
-PK_COSMOLOGY_CASES = [
+EXTENSION_COSMOLOGY_CASES = [
     pytest.param(DEFAULT_COSMOLOGY, id="flat_lcdm"),
     pytest.param(OPEN_COSMOLOGY, id="curvature"),
     pytest.param(DARK_ENERGY_COSMOLOGY, id="dark_energy"),
@@ -62,8 +69,20 @@ PK_COSMOLOGY_CASES = [
     pytest.param(EXTENDED_COSMOLOGY, id="all_extensions"),
 ]
 
-# Log-uniform matter-power benchmark wavenumbers in Mpc^-1.
-MATTER_POWER_K = np.geomspace(2.0e-3, 0.3, 24, dtype=np.float64)
+# Batch sizes for the multi-cosmology solve: one cosmology, and a full 128-wide
+# batch, both solved in a single GPU launch.
+BATCH_SIZE_CASES = [pytest.param(1, id="N1"), pytest.param(128, id="N128")]
+
+# Log-uniform matter-power benchmark wavenumbers in Mpc^-1: 128 modes over the
+# standard 1e-4 -- 1 range (matching the DISCO2 benchmark), where the flat-LCDM
+# solve still agrees with CLASS below the gate (~0.4% at k = 1).
+MATTER_POWER_K = np.geomspace(1.0e-4, 1.0, 128, dtype=np.float64)
+
+# The extensions run on a narrower range: at k ~ 1 the massive-neutrino
+# free-streaming, with NQMAX = 3 momentum bins and the lmax truncations, drifts
+# above the gate against CLASS, so the extension cases are validated over the
+# 2e-3 -- 0.3 range where every code path agrees to < 0.5%.
+EXTENSION_MATTER_POWER_K = np.geomspace(2.0e-3, 0.3, 32, dtype=np.float64)
 
 # Relative-error gate on P(k) vs CLASS (matches the DISCO2 CAMB gate).
 PK_GATE = 5.0e-3
@@ -110,9 +129,42 @@ def _class_linear_pk(cosmology, k_values):
 
 
 @pytest.mark.skipif(not _cuda_available(), reason="numba-CUDA requires a CUDA GPU")
-@pytest.mark.parametrize("cosmology", PK_COSMOLOGY_CASES)
-def test_matter_power_spectrum_matches_class(cosmology, benchmark):
-    """Linear matter P(k) vs CLASS across each solver code path, timed.
+@pytest.mark.parametrize("n_cosmologies", BATCH_SIZE_CASES)
+def test_matter_power_spectrum_matches_class(n_cosmologies, benchmark):
+    """Batched linear matter P(k) vs CLASS, timed over the batch size.
+
+    ``N`` slightly-perturbed flat-LCDM cosmologies are solved together in one
+    ``rodas5Pnumba`` launch (:func:`solve_matter_power_spectrum_batch`), and each
+    cosmology's P(k) is checked against its own CLASS reference -- so a mis-tagged
+    thermodynamics table (wrong cosmology feeding a trajectory) would fail here.
+
+    The batch solve is timed with ``benchmark.pedantic``: the warmup round absorbs
+    the one-time numba-CUDA kernel compilation, so the single timed round measures
+    the steady-state GPU solve. Because all ``N * n_k`` trajectories run in one
+    launch, the ``N = 128`` timed round is nearly as fast as ``N = 1``.
+    """
+
+    from discoeb.perturbations_system import solve_matter_power_spectrum_batch
+
+    cosmologies = perturbed_planck_cosmologies(n_cosmologies)
+
+    pk_ours = benchmark.pedantic(
+        solve_matter_power_spectrum_batch,
+        args=(MATTER_POWER_K, cosmologies),
+        rounds=1,
+        warmup_rounds=1,
+        iterations=1,
+    )
+    pk_class = np.stack([_class_linear_pk(c, MATTER_POWER_K) for c in cosmologies])
+
+    rel = np.abs(pk_ours / pk_class - 1.0)
+    assert float(np.max(rel)) < PK_GATE
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="numba-CUDA requires a CUDA GPU")
+@pytest.mark.parametrize("cosmology", EXTENSION_COSMOLOGY_CASES)
+def test_matter_power_spectrum_extensions_match_class(cosmology):
+    """Linear matter P(k) vs CLASS across each solver code path.
 
     One case per extension, so a failure's parametrization id names the culprit:
 
@@ -126,22 +178,12 @@ def test_matter_power_spectrum_matches_class(cosmology, benchmark):
           quadrature node (P_cb, since our delta_m is CDM + baryon);
         * ``all_extensions``     -- all three at once, checking their state-vector
           indices interleave consistently.
-
-    The solve is timed with ``benchmark.pedantic``: the warmup round absorbs the
-    one-time numba-CUDA kernel compilation, so the single timed round measures the
-    steady-state GPU solve.
     """
 
     from discoeb.perturbations_system import solve_matter_power_spectrum
 
-    pk_ours = benchmark.pedantic(
-        solve_matter_power_spectrum,
-        args=(MATTER_POWER_K, cosmology),
-        rounds=1,
-        warmup_rounds=1,
-        iterations=1,
-    )
-    pk_class = _class_linear_pk(cosmology, MATTER_POWER_K)
+    pk_ours = solve_matter_power_spectrum(EXTENSION_MATTER_POWER_K, cosmology)
+    pk_class = _class_linear_pk(cosmology, EXTENSION_MATTER_POWER_K)
 
     rel = np.abs(pk_ours / pk_class - 1.0)
     assert float(np.max(rel)) < PK_GATE

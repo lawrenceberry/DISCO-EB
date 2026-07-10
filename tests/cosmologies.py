@@ -6,6 +6,10 @@ tests can choose representative models without making the library endorse a
 single default data set.
 """
 
+import dataclasses
+
+import numpy as np
+
 from discoeb.constants import NEUTRINO_TEMPERATURE_FACTOR
 from discoeb.cosmology import Cosmology
 
@@ -138,6 +142,34 @@ BENCHMARK_COSMOLOGIES = {
     "planck_2018_flat_lcdm_massive_nu": PLANCK_2018_FLAT_LCDM_MASSIVE_NU,
 }
 """Registry of representative literature cosmologies."""
+
+
+def perturbed_planck_cosmologies(n: int) -> list[Cosmology]:
+    """Return ``n`` deterministically perturbed Planck-2018 flat-LCDM cosmologies.
+
+    A batch of near-identical cosmologies for exercising the multi-cosmology
+    solve: for ``n == 1`` the unperturbed base is returned, otherwise the six
+    parameters that shape the linear matter power spectrum are swept along a
+    single ``phase in [-1, 1]`` line by a few tenths of a percent. Mirrors the
+    perturbation pattern of the DISCO2 ``perturbed_planck_cosmologies`` helper.
+    """
+
+    base = PLANCK_2018_FLAT_LCDM
+    if n == 1:
+        return [base]
+    phase = np.linspace(-1.0, 1.0, n, dtype=np.float64)
+    return [
+        dataclasses.replace(
+            base,
+            omega_b_h2=base.omega_b_h2 * (1.0 + 0.006 * ph),
+            omega_c_h2=base.omega_c_h2 * (1.0 - 0.008 * ph),
+            h=base.h * (1.0 + 0.004 * np.sin(np.pi * ph)),
+            Y_He=base.Y_He * (1.0 + 0.003 * np.cos(0.5 * np.pi * ph)),
+            T_cmb=base.T_cmb * (1.0 + 0.0015 * ph),
+            N_eff=base.N_eff * (1.0 + 0.002 * np.sin(2.0 * np.pi * ph)),
+        )
+        for ph in phase
+    ]
 
 
 def cosmology_to_class_params(cosmology: Cosmology, *, output: str = "tCl") -> dict:
