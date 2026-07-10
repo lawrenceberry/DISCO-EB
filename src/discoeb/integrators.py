@@ -1710,7 +1710,9 @@ def _make_numba_kernel(
                             + 4.883087185713722 * k_stages[7, j]
                         )
                         y_new_j = u[j] + k_stages[7, j]
-                        hist[i, save_idx, j] = theta1 * k_stages[0, j] + theta * (
+                        # Rosenbrock continuous extension between y_old and y_new.
+                        # y[j] is still y_old here; it is advanced after this loop.
+                        hist[i, save_idx, j] = theta1 * y[j] + theta * (
                             y_new_j + theta1 * (h1 + theta * (h2 + theta * h3))
                         )
                     save_idx += 1
@@ -1818,6 +1820,18 @@ def rodas5Pnumba_solve(
     (see the module section header). ``ode_fn``/``jac_fn``/``time_jac_fn`` are
     CUDA-device callbacks with the packed-row signatures documented in DISCO2.
     """
+
+    # The numba kernel's ABI is float64 throughout. If JAX hands us float32
+    # buffers the kernel reinterprets their memory as float64 and silently
+    # returns garbage rather than failing, so refuse them up front.
+    for name, arr in (("y0", y0), ("t_span", t_span), ("params", params)):
+        dtype = jnp.result_type(arr)
+        if dtype != jnp.float64:
+            raise TypeError(
+                f"rodas5Pnumba_solve requires float64 arrays, but {name!r} has "
+                f"dtype {dtype}. Enable 64-bit JAX with "
+                'jax.config.update("jax_enable_x64", True) before building inputs.'
+            )
 
     def solve_impl(y0_arr, t_span_arr, params_arr):
         return _rodas5Pnumba_solve_impl(

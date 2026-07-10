@@ -1,1136 +1,656 @@
+"""CMB temperature source functions, transfer functions, and power spectra.
+
+Once the perturbation hierarchy has been evolved
+(:mod:`discoeb.perturbations_system`), the CMB anisotropy today is obtained by
+*line-of-sight integration* (Seljak & Zaldarriaga 1996): rather than following
+the photon multipole hierarchy up to ``l ~ 2500``, the temperature transfer
+function is written as a single integral of a few local source terms against
+spherical Bessel functions,
+
+    ``Theta_l(k) = int_0^{tau_0} dtau [S j_l(x) + S_j1 j_l'(x) + S_j2 j_l''(x)]``
+
+with ``x = k (tau_0 - tau)``. The sources are built from the saved perturbation
+history and the visibility function ``g = kappa' exp(-kappa)``:
+
+    * ``S``    -- the intrinsic monopole (Sachs-Wolfe) and polarization
+      correction, weighted by ``g``, plus the integrated Sachs-Wolfe term
+      ``2 Phi' exp(-kappa)`` which accumulates along the whole line of sight;
+    * ``S_j1`` -- the Doppler term ``g (sigma + v_b)``;
+    * ``S_j2`` -- the quadrupole/polarization term.
+
+The angular power spectrum then follows from the primordial curvature spectrum,
+
+    ``C_l ~ A_s int dln k (k/k_p)^{n_s - 1} Theta_l(k)^2``,
+
+and is reported as ``D_l = l(l+1) C_l`` in ``muK^2`` (the DISCO-EB
+normalization; see :func:`dl_power_spectrum`).
+
+The perturbation solve runs on the GPU (numba-CUDA Rodas5P); the source
+construction, Bessel projection, and ``C_l`` quadrature run in JAX/NumPy on the
+host. Ported from the DISCO2 prototype's ``cmb.py``.
 """
-This module provides functions to compute the CMB temperature anisotropy
-source functions from background and perturbation evolution output.
-"""
+
+from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-from functools import partial
+import numpy as np
+from scipy import integrate, interpolate, special
 
-from .background import compute_background_quantities, evolve_background
-from .cosmo import get_aprimeoa
-from .perturbations import compute_time_derivatives, evolve_perturbations, nu_perturb, nu_perturb_prime, model_synchronous
-from .spline_interpolation import spline_interpolation
-from .util import lngamma_complex_e
+from .background import dtau_da, grhoa4
+from .perturbations import (
+    IX_CLXB,
+    IX_CLXC,
+    IX_ETAK,
+    IX_G,
+    IX_POL,
+    IX_R,
+    IX_VB,
+    LMAX_G,
+    LMAX_NR,
+    LMAX_POL,
+    anisotropic_stress,
+    comoving_densities,
+    density_perturbation,
+    expansion_rate,
+    momentum_perturbation,
+)
+from .perturbations_system import (
+    TAU_START,
+    build_thermo_tables,
+    density_coefficients,
+    solve_perturbation_history,
+)
 
+DEFAULT_CMB_K = np.geomspace(1.0e-4, 1.0, 128, dtype=np.float64)
+"""Default perturbation wave modes (Mpc^-1) for a CMB solve."""
 
-@jax.jit
-def extract_perturbations(yout, youtprime, lmaxg, lmaxgp, lmaxr):
-    """Extract perturbation variables from the state vector.
+DEFAULT_CMB_ELLS = np.unique(
+    np.concatenate([np.arange(2, 40, 2), np.arange(40, 200, 5), np.arange(200, 2501, 50)])
+).astype(np.int64)
+"""Default multipoles at which ``C_l`` is evaluated."""
 
-    Parameters
-    ----------
-    yout : jnp.ndarray
-        State vector array with shape (n_kmodes, n_times, n_vars)
-    youtprime : jnp.ndarray
-        Time derivatives with shape (n_kmodes, n_times, n_vars)
-    lmaxg : int
-        Maximum photon temperature multipole
-    lmaxgp : int
-        Maximum photon polarization multipole
-    lmaxr : int
-        Maximum massless neutrino multipole
+Z_REION_SEARCH_MAX = 30.0
+"""Redshift below which the reionization visibility bump is located."""
 
-    Returns
-    -------
-    dict
-        Dictionary containing extracted perturbation variables
-    """
-    idxb = 5
-    idxg = 7
-    idxgp = 7 + (lmaxg + 1)
-    idxr = 9 + lmaxg + lmaxgp
-
-    iq0 = 10 + lmaxg + lmaxgp + lmaxr
-
-    perturbations = {
-        # Indices
-        'idxb': idxb,
-        'idxg': idxg,
-        'idxgp': idxgp,
-        'idxr': idxr,
-        'iq0': iq0,
-
-        # Metric
-        'eta': yout[..., 2],
-
-        # CDM
-        'deltac': yout[..., 3],
-        'thetac': yout[..., 4],
-
-        # Baryons
-        'deltab': yout[..., idxb],
-        'thetab': yout[..., idxb + 1],
-        'deltabprime': youtprime[..., idxb],
-        'thetabprime': youtprime[..., idxb + 1],
-
-        # Photons
-        'deltag': yout[..., idxg],
-        'thetag': yout[..., idxg + 1],
-        'shearg': yout[..., idxg + 2] / 2.0,
-        'deltagprime': youtprime[..., idxg],
-        'thetagprime': youtprime[..., idxg + 1],
-        'sheargprime': youtprime[..., idxg + 2] / 2.0,
-
-        # Massless neutrinos
-        'deltar': yout[..., idxr],
-        'thetar': yout[..., idxr + 1],
-        'shearr': yout[..., idxr + 2] / 2.0,
-        'deltarprime': youtprime[..., idxr],
-        'thetarprime': youtprime[..., idxr + 1],
-        'shearrprime': youtprime[..., idxr + 2] / 2.0,
-
-        # Dark energy
-        'deltaq': yout[..., -2],
-        'thetaq': yout[..., -1],
-    }
-
-    return perturbations
+_BESSEL_CACHE: dict[tuple, tuple] = {}
+_CMB_GRID_CACHE: dict[tuple, dict[str, float]] = {}
 
 
-@jax.jit
-def compute_visibility_functions(tau, param):
-    """Create splines and evaluate visibility functions at given conformal times.
+# =============================================================================
+# 1. Finite differences and the visibility function
+# =============================================================================
 
-    This function creates cubic spline interpolations for the visibility function
-    and related quantities from the thermal history computed by evolve_background(),
-    then evaluates them at the requested conformal times. These functions are
-    essential for CMB source function calculations.
 
-    Parameters
-    ----------
-    tau : jnp.ndarray
-        Conformal time values where visibility functions are needed
-    param : dict
-        Parameter dictionary containing thermal history arrays:
-        - tau: Conformal time array from thermal history
-        - opac: Opacity κ = σ_T n_e a^2
-        - gvis: Visibility function g(τ) = κ exp(-τ_c)
-        - gvisprime: First derivative g'(τ)
-        - gvispprime: Second derivative g''(τ)
-        - optical_depth: Optical depth τ_c to conformal time today
+def _grad_last(y, x):
+    """Return ``dy/dx`` along the last axis by centered differences."""
 
-    Returns
-    -------
-    dict
-        Dictionary with keys:
-        - 'opac': Opacity κ at requested times
-        - 'opacprime': Opacity derivative dκ/dτ at requested times
-        - 'gvis': Visibility function g(τ) at requested times
-        - 'gvisprime': First derivative g'(τ) at requested times
-        - 'gvispprime': Second derivative g''(τ) at requested times
-        - 'optical_depth': Optical depth τ_c at requested times
+    mid = (y[..., 2:] - y[..., :-2]) / (x[..., 2:] - x[..., :-2])
+    first = (y[..., 1:2] - y[..., :1]) / (x[..., 1:2] - x[..., :1])
+    last = (y[..., -1:] - y[..., -2:-1]) / (x[..., -1:] - x[..., -2:-1])
+    return jnp.concatenate([first, mid, last], axis=-1)
 
-    Examples
-    --------
-    >>> param = evolve_background(param=param, ...)
-    >>> tau = jnp.linspace(100, 14000, 100)  # Conformal times in Mpc
-    >>> vis_funcs = compute_visibility_functions(tau, param)
-    >>> gvis = vis_funcs['gvis']  # Visibility function g(τ)
 
-    Notes
-    -----
-    The visibility function g(τ) = κ(τ) exp(-τ_c(τ)) peaks at last scattering
-    and determines when photons last interacted with matter. Its derivatives
-    are used in the Doppler and polarization source terms.
+def _visibility_from_opacity(tau, opacity):
+    """Return the optical depth and visibility function from the Thomson opacity.
 
-    The opacity is κ = σ_T n_e a^2 where σ_T is the Thomson cross section
-    and n_e is the free electron density.
+    The optical depth is integrated *backwards* from today, ``kappa(tau_0) = 0``,
+    so ``kappa(tau) = int_tau^{tau_0} kappa' dtau'``. The visibility function
+    ``g = kappa' exp(-kappa)`` is the probability density that a photon seen
+    today last scattered at ``tau``; it is sharply peaked at recombination, with
+    a secondary bump at reionization.
     """
 
-    # Create spline for opacity and evaluate
-    opacspline = spline_interpolation(jnp.log(param['tau_th']), param['opac'])
-    opac = opacspline.evaluate(jnp.log(tau))
-    opacprime = opacspline.derivative(jnp.log(tau)) / tau
-
-    # Create splines for visibility function and derivatives
-    gvis_spline = spline_interpolation(jnp.log(param['tau_th']), param['gvis'])
-    gvisprime_spline = spline_interpolation(jnp.log(param['tau_th']), param['gvisprime'])
-    gvispprime_spline = spline_interpolation(jnp.log(param['tau_th']), param['gvispprime'])
-
-    gvis = gvis_spline.evaluate(jnp.log(tau))
-    gvisprime = gvisprime_spline.evaluate(jnp.log(tau))
-    gvispprime = gvispprime_spline.evaluate(jnp.log(tau))
-
-    # Create spline for optical depth (log-space with floor for numerical stability)
-    optical_depth_spline = spline_interpolation(
-        jnp.log(param['tau_th']),
-        jnp.log(jnp.maximum(param['optical_depth'], 1e-10))
+    dt = tau[..., 1:] - tau[..., :-1]
+    integ = 0.5 * (opacity[..., 1:] + opacity[..., :-1]) * dt
+    optical_depth = jnp.concatenate(
+        [jnp.cumsum(integ[..., ::-1], axis=-1)[..., ::-1], jnp.zeros_like(tau[..., :1])],
+        axis=-1,
     )
-    optical_depth = jnp.exp(optical_depth_spline.evaluate(jnp.log(tau)))
-
-    rdic = {
-        'opac': opac,
-        'opacprime': opacprime,
-        'gvis': gvis,
-        'gvisprime': gvisprime,
-        'gvispprime': gvispprime,
-        'optical_depth': optical_depth,
-    }
-    return {k:v.T[None, ...] for k,v in rdic.items()}
-
-@partial(jax.jit, static_argnames=('nqmax', 'iq0'))
-def compute_neutrino_perturbations(yout, yprime, aexp_out, param, nqmax, iq0):
-    """Compute massive neutrino perturbations by integrating over momentum bins.
-
-    Parameters
-    ----------
-    yout : jnp.ndarray
-        State vector array
-    yprime : jnp.ndarray
-        Time derivatives
-    aexp_out : jnp.ndarray
-        Output scale factors
-    param : dict
-        Cosmological parameters
-    nqmax : int
-        Number of neutrino momentum bins (static)
-    iq0 : int
-        Starting index for neutrino perturbations (static)
-
-    Returns
-    -------
-    dict
-        Dictionary with neutrino perturbation quantities
-    """
-    n_kmodes = yout.shape[0]
-    n_cosmo = yout.shape[1]
-    n_times = yout.shape[2]
-
-    idxtau = jnp.arange(n_times)
-    idxk = jnp.arange(n_kmodes)
-
-    iq1 = iq0 + nqmax
-    iq2 = iq1 + nqmax
-    iq3 = iq2 + nqmax
-
-    idxcosmo = jnp.arange(yout.shape[1])
-    # Compute neutrino perturbations
-    drhonu, dpnu, fnu, shearnu = jax.vmap(
-        lambda ik: jax.vmap(
-          lambda ic: jax.vmap(
-            lambda ia: nu_perturb(
-                aexp_out[ia], param['amnu'],
-                yout[ik, ic, ia, iq0:iq1],
-                yout[ik, ic, ia, iq1:iq2],
-                yout[ik, ic, ia, iq2:iq3],
-                nqmax=nqmax
-            )
-        )(idxtau)
-      )(idxcosmo)
-    )(idxk)
-
-    # Compute conformal Hubble rate at each output time
-    aprimeoa = jax.vmap(lambda ia: get_aprimeoa(param=param, aexp=aexp_out[ia]))(idxtau)
-
-    print(aprimeoa.shape, aexp_out.shape)
-    # Compute time derivatives
-    rho_nu_prime, shear_nu_prime = jax.vmap(
-      lambda ik: jax.vmap(
-        lambda ic: jax.vmap(
-              lambda ia: nu_perturb_prime(
-                  a=aexp_out[ia], amnu=param['amnu'], aprimeoa=aprimeoa[ia, :,  ic],
-                  psi0=yout[ik, ic, ia, iq0:iq1],
-                  psi2=yout[ik, ic, ia, iq2:iq3],
-                  psi0prime=yprime[ik, ic, ia, iq0:iq1],
-                  psi2prime=yprime[ik, ic, ia, iq2:iq3],
-                  nqmax=nqmax
-              )
-          )(idxtau)
-      )(idxcosmo)
-    )(idxk)
-
+    gvis = opacity * jnp.exp(-optical_depth)
+    gvisprime = _grad_last(gvis, tau)
     return {
-        'drhonu': drhonu,
-        'dpnu': dpnu,
-        'fnu': fnu,
-        'shearnu': shearnu,
-        'rho_nu_prime': rho_nu_prime,
-        'shear_nu_prime': shear_nu_prime,
-        'aprimeoa': aprimeoa,
+        "opac": opacity,
+        "opacprime": _grad_last(opacity, tau),
+        "gvis": gvis,
+        "gvisprime": gvisprime,
+        "gvispprime": _grad_last(gvisprime, tau),
+        "optical_depth": optical_depth,
     }
 
 
-@jax.jit
-def compute_metric_perturbations(perturbations, neutrinos, background_quantities,
-                                 param, kmodes, aexp_out):
-    """Compute metric perturbations from Einstein equations.
+def visibility_functions(tau, opacity):
+    """Return ``opacity``, ``optical_depth``, and the visibility ``g`` and derivatives."""
 
-    Parameters
-    ----------
-    perturbations : dict
-        Extracted perturbation variables
-    neutrinos : dict
-        Neutrino perturbation quantities
-    background_quantities : dict
-        Background density and pressure quantities
-    param : dict
-        Cosmological parameters
-    kmodes : jnp.ndarray
-        Wavenumber array
-    aexp_out : jnp.ndarray
-        Output scale factors
-
-    Returns
-    -------
-    dict
-        Metric perturbations (alpha, alphaprime, alphapprime, etc.)
-    """
-    kmode = kmodes[:, None, None]
-    a = aexp_out[None, None, :]
-
-    Omegac = (param['Omegam'] - param['Omegab'])[None, :, None]
-
-    # Extract quantities
-    rhonu = jnp.transpose(background_quantities['rhonu'], (1,0))[None, :, :]
-    rho_Q = background_quantities['rho_Q'][None, None, :]
-    w_Q = background_quantities['w_Q'][None, None, :]
-    cs2_Q = param['cs2_DE'][None, None, :]
-    
-    grhom = param['grhom'][None, :, None]
-    OmegaDE = param['OmegaDE'][None, :, None]
-    Omegam = param['Omegam'][None, :, None]
-    Omegab = param['Omegab'][None, :, None]
-    w0 = param['w_DE_0'][None,:,None]
-    wa = param['w_DE_a'][None,:,None]
-    grhor = param['grhor'][None,:,None]
-    grhog = param['grhog'][None,:,None]
-    Neff = param['Neff'][None,:,None]
-    Nmnu = param['Nmnu'][None,:,None]
-
-    aprimeoa = jnp.transpose(neutrinos['aprimeoa'], (1,2,0))
-    rho_nu_prime = neutrinos['rho_nu_prime']
-    fnu = neutrinos['fnu']
-    drhonu = neutrinos['drhonu']
-    shearnu = neutrinos['shearnu']
-    shear_nu_prime = neutrinos['shear_nu_prime']
-
-    # Quintessence velocity term
-    rho_plus_p_theta_Q = (1 + w_Q) * rho_Q *  grhom * OmegaDE * perturbations['thetaq'] * a**2
-
-    # Quintessence EOS time derivatives
-    w_Q_prime = -wa * aprimeoa * a
-    ca2_Q = w_Q - w_Q_prime / 3 / ((1 + w_Q) + 1e-6) / aprimeoa
-
-    # Total background energy density derivative
-    grhoprime = (
-        -grhom * Omegam / a
-        - 2 * (grhog + grhor * (Neff + Nmnu * rhonu)) / a**2
-        + grhom * OmegaDE * (
-            -3 * (1 + w0 + (1 - a) * wa) * rho_Q * a**2
-            + 2 * rho_Q * a**2
-        )
-    ) * aprimeoa + grhor * Nmnu * rho_nu_prime / a**2
-
-    aprimeoaprime = grhoprime / (6 * aprimeoa)
-
-    # Total perturbations
-    dgrho = (
-        grhom * (Omegac * perturbations['deltac'] + Omegab * perturbations['deltab']) / a
-        + (grhog * perturbations['deltag'] + grhor * (
-            Neff * perturbations['deltar'] + Nmnu * drhonu
-        )) / a**2
-        + grhom * OmegaDE * perturbations['deltaq'] * rho_Q * a**2
-    )
-
-    dgtheta = (
-        grhom * (Omegac * perturbations['thetac'] + Omegab * perturbations['thetab']) / a
-        + 4.0 / 3.0 * (grhog * perturbations['thetag'] + Neff * grhor * perturbations['thetar']) / a**2
-        + Nmnu * grhor * kmode * fnu / a**2
-        + rho_plus_p_theta_Q
-    )
-
-    dgshear = (
-        4.0 / 3.0 * (grhog * perturbations['shearg'] + Neff * grhor * perturbations['shearr']) / a**2
-        + Nmnu * grhor * shearnu / a**2
-    )
-
-    dgshearprime = (
-        4.0 / 3.0 * (grhog * perturbations['sheargprime']
-                     + Neff * grhor * perturbations['shearrprime']) / a**2
-        + Nmnu * grhor * shear_nu_prime / a**2
-        - 2 * aprimeoa * dgshear
-    )
-
-    # Metric perturbations from Einstein equations
-    hprime = (2.0 * kmode**2 * perturbations['eta'] + dgrho) / aprimeoa
-    etaprime = 0.5 * dgtheta / kmode**2
-    alpha = (hprime + 6.0 * etaprime) / 2.0 / kmode**2
-    alphaprime = -3 * dgshear / (2 * kmode**2) + perturbations['eta'] - 2 * aprimeoa * alpha
-    alphapprime = (-3 * dgshearprime / (2 * kmode**2) + etaprime
-                   - 2 * (aprimeoaprime * alpha + aprimeoa * alphaprime))
-
+    out = _visibility_from_opacity(jnp.asarray(tau), jnp.asarray(opacity))
     return {
-        'hprime': hprime,
-        'etaprime': etaprime,
-        'alpha': alpha,
-        'alphaprime': alphaprime,
-        'alphapprime': alphapprime,
-        'aprimeoa': aprimeoa,
-        'aprimeoaprime': aprimeoaprime,
+        "opacity": out["opac"],
+        "optical_depth": out["optical_depth"],
+        "g": out["gvis"],
+        "gprime": out["gvisprime"],
+        "gpprime": out["gvispprime"],
     }
 
 
-@jax.jit
-def compute_polarization_terms(perturbations, metric, visibility_functions,
-                               yout, yprime, kmodes, lmaxg, lmaxgp):
-    """Compute polarization-related quantities for CMB source function.
+# =============================================================================
+# 2. Source functions
+# =============================================================================
 
-    Parameters
-    ----------
-    perturbations : dict
-        Extracted perturbation variables
-    metric : dict
-        Metric perturbations
-    visibility_functions : dict
-        Visibility function and derivatives
-    yout : jnp.ndarray
-        Full state vector
-    yprime : jnp.ndarray
-        Time derivatives
-    kmodes : jnp.ndarray
-        Wavenumber array
-    lmaxg : int
-        Maximum photon temperature multipole
-    lmaxgp : int
-        Maximum photon polarization multipole
 
-    Returns
-    -------
-    dict
-        Dictionary with polarization_term, polarization_termprime, polarization_termpprime
-    """
-    kmode = kmodes[:, None, None]
-    idxg = perturbations['idxg']
-    idxgp = perturbations['idxgp']
+def extract_perturbations(yout, youtprime):
+    """Name the perturbation state entries the source construction consumes."""
 
-    # Coupling term derivative
-    couplprime = (8 * (perturbations['thetagprime'] + kmode**2 * metric['alphaprime']) / 15
-                  - kmode * 0.6 * (yprime[..., idxg + 3] + yprime[..., idxgp + 1] + yprime[..., idxgp + 3]))
-
-    # Polarization multipole combinations
-    polarization_term = yout[..., idxg + 2] + yout[..., idxgp + 0] + yout[..., idxgp + 2]
-    polarization_termprime = yprime[..., idxg + 2] + yprime[..., idxgp + 0] + yprime[..., idxgp + 2]
-    polarization_termpprime = (couplprime
-                               - 0.3 * (visibility_functions['opacprime'] * polarization_term
-                                       + visibility_functions['opac'] * polarization_termprime))
-                                       
-    #polarization_termpprime = (couplprime.T
-    #                           - 0.3 * (visibility_functions['opacprime'] @ polarization_term.T
-    #                                   + visibility_functions['opac'] @ polarization_termprime.T)).T
-
+    zeros = jnp.zeros_like(yout[..., IX_G])
     return {
-        'polarization_term': polarization_term,
-        'polarization_termprime': polarization_termprime,
-        'polarization_termpprime': polarization_termpprime,
+        "eta": yout[..., IX_ETAK],
+        "deltac": yout[..., IX_CLXC],
+        "deltab": yout[..., IX_CLXB],
+        "thetab": yout[..., IX_VB],
+        "deltag": yout[..., IX_G],
+        "thetag": yout[..., IX_G + 1],
+        "pig": yout[..., IX_G + 2],
+        "shearg": yout[..., IX_G + 2] / 2.0,
+        "theta3": yout[..., IX_G + 3] if LMAX_G >= 3 else zeros,
+        "deltar": yout[..., IX_R],
+        "thetar": yout[..., IX_R + 1],
+        "pir": yout[..., IX_R + 2],
+        "shearr": yout[..., IX_R + 2] / 2.0,
+        "n3": yout[..., IX_R + 3] if LMAX_NR >= 3 else zeros,
+        "e2": yout[..., IX_POL] if LMAX_POL >= 2 else zeros,
+        "deltagprime": youtprime[..., IX_G],
+        "thetagprime": youtprime[..., IX_G + 1],
     }
 
 
-@jax.jit
-def compute_source_term_isw(metric, visibility_functions, perturbations, tau):
-    """Compute the Integrated Sachs-Wolfe (ISW) source term.
+def compute_metric_perturbations(perturbations, dens, a, k_values):
+    """Return the synchronous-gauge metric variables along each mode's history.
 
-    The ISW effect arises from photons gaining or losing energy as they
-    traverse time-evolving gravitational potentials during radiation-matter
-    transition and dark energy domination.
-
-    In synchronous gauge, the ISW term is:
-
-        S1 = exp(-τ_c) × (η' + α'')
-
-    which corresponds to (Ψ' - Φ') in Newtonian gauge, where Ψ and Φ are
-    the two gravitational potentials.
-
-    The algebraic computation η' + α'' suffers from catastrophic cancellation
-    at late times when both terms are individually large but nearly equal in
-    magnitude.  Using the identity η' + α'' = d/dτ(η + α'), we instead
-    differentiate the smooth composite potential via cubic-spline interpolation,
-    which is O(h⁴)-accurate and avoids the cancellation entirely.
-
-    Parameters
-    ----------
-    metric : dict
-        Metric perturbations including alphaprime
-    visibility_functions : dict
-        Visibility function and optical depth
-    perturbations : dict
-        Extracted perturbation variables including eta
-    tau : jnp.ndarray
-        Conformal time array (n_tau,)
-
-    Returns
-    -------
-    jnp.ndarray
-        ISW source term S1
+    ``z`` and ``sigma`` are the metric expansion and shear. ``phi`` is the *Weyl*
+    potential ``(Phi + Psi) / 2`` -- the mean of the two Newtonian-gauge
+    potentials, which differ by the anisotropic stress, ``Psi - Phi = -dgpi/k^2``.
+    Twice its conformal-time derivative is the full ISW source ``Phi' + Psi'``.
     """
-    # η + α' is smooth in τ; differentiate via cubic spline to get η' + α''
-    # without cancellation.  Shape: (n_k, n_tau)
-    potential = perturbations['eta'] + metric['alphaprime']
 
-    def _deriv_one_k(pot_k, t):
-        spl = spline_interpolation(t, pot_k)
-        return spl.derivative(t)
+    grhog_v, grhor_v, grhoc_v, grhob_v, grhov_v = dens
+    grhog_t, grhor_t, grhoc_t, grhob_t, grhov_t = comoving_densities(
+        a, grhog_v, grhor_v, grhoc_v, grhob_v, grhov_v
+    )
+    aprimeoa = expansion_rate(grhog_t, grhor_t, grhoc_t, grhob_t, grhov_t)
+    k = jnp.asarray(k_values, dtype=jnp.float64)[:, None]
 
-    s1 = jax.vmap(_deriv_one_k, in_axes=(0, None))(potential, tau[0])
-
-    # Suppress before recombination (universe opaque)
-    expmmu = jnp.exp(-visibility_functions['optical_depth'])
-
-    S1 = expmmu * s1
-
-    return S1
-
-
-@jax.jit
-def compute_source_term_sachs_wolfe(perturbations, metric, visibility_functions,
-                                    polarization_terms, kmodes):
-    """Compute the Sachs-Wolfe source term at last scattering.
-
-    The SW effect is the dominant contribution from temperature and potential
-    perturbations at the last scattering surface, weighted by the visibility function.
-
-    S2 = g(τ) × [Θ₀/4 + 2Φ + polarization + baryon velocity]
-
-    Parameters
-    ----------
-    perturbations : dict
-        Extracted perturbation variables
-    metric : dict
-        Metric perturbations
-    visibility_functions : dict
-        Visibility function
-    polarization_terms : dict
-        Polarization-related quantities
-    kmodes : jnp.ndarray
-        Wavenumber array
-
-    Returns
-    -------
-    jnp.ndarray
-        Sachs-Wolfe source term S2
-    """
-    kmode = kmodes[:, None, None]
-
-    # Potential contribution
-    s2 = 2 * metric['alphaprime']
-
-    S2 = visibility_functions['gvis'] * (
-        0.25 * perturbations['deltag']  # Temperature monopole
-        + s2  # Gravitational potential
-        + polarization_terms['polarization_term'] / 16  # E-mode coupling
-        + (perturbations['thetabprime'] + 3 / 16 * polarization_terms['polarization_termpprime']) / kmode**2  # Baryon velocity
+    dgrho = density_perturbation(
+        grhob_t, perturbations["deltab"],
+        grhoc_t, perturbations["deltac"],
+        grhog_t, perturbations["deltag"],
+        grhor_t, perturbations["deltar"],
+    )
+    dgtheta = momentum_perturbation(
+        grhob_t, perturbations["thetab"],
+        grhog_t, perturbations["thetag"],
+        grhor_t, perturbations["thetar"],
+    )
+    dgshear = anisotropic_stress(
+        grhog_t, 2.0 * perturbations["shearg"], grhor_t, 2.0 * perturbations["shearr"]
     )
 
-    return S2
-
-
-@jax.jit
-def compute_source_term_doppler(perturbations, metric, visibility_functions,
-                                polarization_terms, kmodes):
-    """Compute the Doppler source term.
-
-    The Doppler effect arises from bulk motion of baryons at last scattering,
-    creating a velocity-induced anisotropy pattern (acoustic peaks).
-
-    S3 = g'(τ) × [Φ + v_b/k² + polarization]
-
-    Parameters
-    ----------
-    perturbations : dict
-        Extracted perturbation variables
-    metric : dict
-        Metric perturbations
-    visibility_functions : dict
-        Visibility function derivative
-    polarization_terms : dict
-        Polarization-related quantities
-    kmodes : jnp.ndarray
-        Wavenumber array
-
-    Returns
-    -------
-    jnp.ndarray
-        Doppler source term S3
-    """
-    kmode = kmodes[:, None, None]
-
-    S3 = visibility_functions['gvisprime'] * (
-        metric['alpha']  # Gravitational potential
-        + (perturbations['thetab'] + 3 / 8 * polarization_terms['polarization_termprime']) / kmode**2  # Baryon velocity
-    )
-
-    return S3
-
-
-@jax.jit
-def compute_source_term_polarization(visibility_functions, polarization_terms, kmodes):
-    """Compute the polarization coupling source term.
-
-    This term describes the generation of E-mode polarization through
-    Thomson scattering of anisotropic radiation.
-
-    S4 = g''(τ) × (3/16) × polarization / k²
-
-    Parameters
-    ----------
-    visibility_functions : dict
-        Second derivative of visibility function
-    polarization_terms : dict
-        Polarization-related quantities
-    kmodes : jnp.ndarray
-        Wavenumber array
-
-    Returns
-    -------
-    jnp.ndarray
-        Polarization source term S4
-    """
-    kmode = kmodes[:, None, None]
-
-    S4 = visibility_functions['gvispprime'] * 3 / 16 * polarization_terms['polarization_term'] / kmode**2
-
-    return S4
-
-
-@jax.jit
-def compute_source_function(perturbations, metric, visibility_functions,
-                            yout, yprime, kmodes, lmaxg, lmaxgp, tau):
-    """Compute the CMB temperature anisotropy source function.
-
-    Computes the four source terms:
-    - S1: Integrated Sachs-Wolfe (ISW) effect
-    - S2: Sachs-Wolfe effect at last scattering
-    - S3: Doppler effect
-    - S4: Polarization coupling
-
-    Parameters
-    ----------
-    perturbations : dict
-        Extracted perturbation variables
-    metric : dict
-        Metric perturbations
-    visibility_functions : dict
-        Visibility function and derivatives (gvis, gvisprime, gvispprime, optical_depth)
-    yout : jnp.ndarray
-        Full state vector
-    yprime : jnp.ndarray
-        Time derivatives
-    kmodes : jnp.ndarray
-        Wavenumber array
-    lmaxg : int
-        Maximum photon temperature multipole
-    lmaxgp : int
-        Maximum photon polarization multipole
-    tau : jnp.ndarray
-        Conformal time array (n_tau,)
-
-    Returns
-    -------
-    dict
-        Source function components (S1, S2, S3, S4, S) and polarization_terms
-    """
-    # Compute polarization terms (needed by multiple source terms)
-    polarization_terms = compute_polarization_terms(
-        perturbations, metric, visibility_functions, yout, yprime, kmodes, lmaxg, lmaxgp
-    )
-
-    # Compute each source term
-    S1 = compute_source_term_isw(metric, visibility_functions, perturbations, tau)
-
-    S2 = compute_source_term_sachs_wolfe(
-        perturbations, metric, visibility_functions, polarization_terms, kmodes
-    )
-
-    S3 = compute_source_term_doppler(
-        perturbations, metric, visibility_functions, polarization_terms, kmodes
-    )
-
-    S4 = compute_source_term_polarization(
-        visibility_functions, polarization_terms, kmodes
-    )
-
-    # Total source function
-    S = S1 + S2 + S3 + S4
-
+    z = (0.5 * dgrho / k + perturbations["eta"]) / aprimeoa
+    sigma = z + 1.5 * dgtheta / (k * k)
+    phi = -((dgrho + 3.0 * dgtheta * aprimeoa / k) + dgshear) / (2.0 * k * k)
     return {
-        'S1': S1,  # ISW
-        'S2': S2,  # Sachs-Wolfe
-        'S3': S3,  # Doppler
-        'S4': S4,  # Polarization
-        'S': S,    # Total
-        'polarization_terms': polarization_terms,
+        "aprimeoa": aprimeoa,
+        "grhog_t": grhog_t,
+        "grhor_t": grhor_t,
+        "grhoc_t": grhoc_t,
+        "grhob_t": grhob_t,
+        "dgrho": dgrho,
+        "dgtheta": dgtheta,
+        "dgshear": dgshear,
+        "z": z,
+        "sigma": sigma,
+        "phi": phi,
     }
 
 
-def _fftlog_bessel_integral_coefficients(ell, p):
-    """Compute the analytical coefficient for ∫ χ^p j_ℓ(kχ) dχ.
+def compute_source_function(perturbations, metric, vis, kmodes, tau):
+    """Return the line-of-sight temperature sources ``S``, ``S_j1``, ``S_j2``.
 
-    For power-law functions, the spherical Bessel integral has a closed form:
+    The decomposition follows CAMB: the ``j_l`` source carries the intrinsic
+    monopole and the ISW term, the ``j_l'`` source carries the Doppler term, and
+    the ``j_l''`` source carries the quadrupole/polarization term. ``polter`` is
+    the combination of the photon quadrupole and the E-mode ``E_2`` that Thomson
+    scattering couples to.
 
-        ∫₀^∞ χ^p j_ℓ(kχ) dχ = (2^(p-1) / k^(p+1)) × √π × Γ((1+ℓ+p)/2) / Γ((2+ℓ-p)/2)
-
-    This function computes the coefficient excluding the k-dependent part,
-    which is applied separately.
-
-    Parameters
-    ----------
-    ell : jnp.ndarray
-        Multipole moments (shape: n_ell)
-    p : jnp.ndarray
-        Complex power-law indices (shape: n_coeffs), typically p = bias + i*eta_n
-
-    Returns
-    -------
-    jnp.ndarray
-        Coefficients M_ℓ(p) with shape (n_ell, n_coeffs)
-
-    References
-    ----------
-    Assassi et al. (2017), JCAP 11 (2017) 054, arXiv:1705.05022
-    Reymond et al. (2025), arXiv:2505.22718
+    Note that ``metric["phi"]`` is the *Weyl* potential ``(Phi + Psi) / 2``, not
+    ``Phi``: it carries the ``dgpi`` term, and ``Psi - Phi = -dgpi / k^2``. That
+    is what makes ``isw = 2 phi' exp(-kappa)`` the *complete* ISW source,
+    ``exp(-kappa) (Phi' + Psi')``. CLASS instead splits the ISW across two
+    channels, ``exp(-kappa) 2 Phi'`` against ``j_l`` and ``exp(-kappa) k (Psi -
+    Phi)`` against ``j_l'``; integrating the latter by parts recovers the form
+    used here together with an extra ``g (Psi - Phi)`` monopole contribution,
+    and indeed ``monopole`` below reduces identically to ``delta_g/4 + alpha'``.
+    So there is no separate anisotropic-stress term to add.
     """
-    def compute_log_coeff(ell_val, p_val):
-        a1 = (1.0 + ell_val + p_val) / 2.0
-        a2 = (2.0 + ell_val - p_val) / 2.0
-        return (
-            (p_val - 1.0) * jnp.log(2.0)
-            + 0.5 * jnp.log(jnp.pi)
-            + lngamma_complex_e(a1)
-            - lngamma_complex_e(a2)
-        )
 
-    # Use nested vmap for efficient broadcasting over ell and p
-    compute_log_coeff_vmap = jax.vmap(jax.vmap(compute_log_coeff, in_axes=(None, 0)), in_axes=(0, None))
-    log_coeff = compute_log_coeff_vmap(jnp.atleast_1d(ell), jnp.atleast_1d(p))
+    kmode = jnp.asarray(kmodes, dtype=jnp.float64)[:, None]
+    polter = perturbations["pig"] / 10.0 + 9.0 / 15.0 * perturbations["e2"]
+    phi = metric["phi"]
 
-    return jnp.exp(log_coeff)
+    phidot = _grad_last(phi, tau)
+    isw = 2.0 * phidot * jnp.exp(-vis["optical_depth"])
+    monopole = -perturbations["eta"] / kmode + 2.0 * phi + 0.25 * perturbations["deltag"]
+
+    s_j0 = isw + vis["gvis"] * (monopole + 0.625 * polter)
+    s_j1 = vis["gvis"] * (metric["sigma"] + perturbations["thetab"])
+    s_j2 = 1.875 * vis["gvis"] * polter
+    return {"S": s_j0, "S_j1": s_j1, "S_j2": s_j2, "isw": isw}
 
 
-@partial(jax.jit, static_argnames=['n_fftlog', 'n_k_dense'])
-def compute_theta_ell(ells, kmodes, tau, S, tau0, n_fftlog=16384, n_k_dense=0):
-    """Compute multipole moments Θ_ℓ(k) via FFTLog-based line-of-sight integration.
+def source_functions(y, tau, a, k, opacity, dens):
+    """Return the CMB source functions from a saved perturbation history.
 
-    Uses the FFTLog algorithm to efficiently compute the line-of-sight integral:
-
-        Θ_ℓ(k) = ∫₀^τ₀ S(k,τ) j_ℓ(k(τ₀-τ)) dτ
-
-    The method decomposes the source function into power laws using FFTLog,
-    then uses analytical formulas for the spherical Bessel integrals of power laws.
-    This avoids direct evaluation of oscillatory Bessel functions.
-
-    When ``n_k_dense > 0`` the source function is cubic-spline-interpolated
-    from the input k-grid onto a denser ``n_k_dense``-point log-k grid before
-    the FFTLog step.  S is smooth in k while Θ_ℓ(k) is oscillatory, so this
-    resolves the subsequent k-integral in ``compute_Cell`` cheaply.
-
-    Parameters
-    ----------
-    ellmax : int
-        Maximum multipole moment
-    kmodes : jnp.ndarray
-        Wavenumber array (shape: n_kmodes)
-    tau : jnp.ndarray
-        Conformal time array (shape: n_times)
-    S : jnp.ndarray
-        Source function (shape: n_kmodes × n_times)
-    tau0 : float
-        Conformal time today
-    n_fftlog : int, optional
-        Number of FFTLog coefficients (default: 16384)
-    n_k_dense : int, optional
-        If > 0, cubic-spline-interpolate S onto this many log-spaced k-modes
-        before integration.  Default: 0 (use the input k-grid as-is).
-
-    Returns
-    -------
-    theta_ell : jnp.ndarray
-        Multipole moments Θ_ℓ(k) with shape (n_kmodes, ellmax+1)
-    kmodes : jnp.ndarray
-        The k-grid actually used (dense grid if ``n_k_dense > 0``, otherwise
-        the input ``kmodes``)
-
-    References
-    ----------
-    Assassi et al. (2017), JCAP 11 (2017) 054, arXiv:1705.05022
-    Reymond et al. (2025), arXiv:2505.22718
+    ``y`` has shape ``(n_k, n_tau, nvar)``; ``tau``, ``a`` and ``opacity`` are
+    shared across modes and have shape ``(n_tau,)``.
     """
-    # Optionally interpolate S onto a denser k-grid
-    if n_k_dense > 0:
-        log_k_orig = jnp.log(kmodes)
-        log_k_dense = jnp.linspace(log_k_orig[0], log_k_orig[-1], n_k_dense)
-        kmodes = jnp.exp(log_k_dense)
 
-        def _interp_one_slice(y_slice):
-            spl = spline_interpolation(log_k_orig, y_slice)
-            return spl.evaluate(log_k_dense)
+    tau = jnp.asarray(tau, dtype=jnp.float64)
+    a = jnp.asarray(a, dtype=jnp.float64)
+    y = jnp.asarray(y, dtype=jnp.float64)
 
-        # vmap over time slices: S is (n_k, n_cosmo, n_times), output is (n_k_dense, n_cosmo, n_times)
-        S = jnp.transpose(jax.vmap(_interp_one_slice, in_axes=(1,))(S), (1, 0, 2))
-
-    # Convert from conformal time τ to comoving distance χ = τ₀ - τ
-    chi = tau0[..., None] - tau
-    chi = chi[..., ::-1]  # Reverse to have increasing χ
-    S_chi = S[..., ::-1]  # Reverse S accordingly
-
-    # Find valid chi range (χ > 0)
-    chi_min_val = jnp.maximum(chi[..., 0], 1.0)  # Avoid χ=0
-    chi_max_val = chi[..., -1]
-
-    # Create log-spaced grid in χ for FFTLog
-    log_chi_min = jnp.log(chi_min_val)
-    log_chi_max = jnp.log(chi_max_val)
-
-    # Pad the range to suppress periodic artifacts in FFTLog
-    pad = 2.0
-    log_chi_min_padded = log_chi_min - pad
-    log_chi_max_padded = log_chi_max + pad
-
-    dlog_chi = (log_chi_max_padded - log_chi_min_padded) / n_fftlog
-    chi_fftlog = jnp.exp(log_chi_min_padded + jnp.arange(n_fftlog) [:, None]* dlog_chi)
-
-    # Interpolate S to FFTLog grid for each k
-    def interp_S_to_fftlog(S_k):
-        # Use cubic spline interpolation in log-chi space for robustness
-        log_chi_orig = jnp.log(jnp.maximum(chi[0], 1e-10))
-        spline = spline_interpolation(log_chi_orig.T, S_k.T)
-        log_chi_fft = jnp.log(chi_fftlog)
-        return spline.evaluate(log_chi_fft)
+    # d/dtau of every state variable, differentiating along the tau axis.
+    yprime = jnp.moveaxis(_grad_last(jnp.moveaxis(y, 1, -1), tau), -1, 1)
+    perturb = extract_perturbations(y, yprime)
+    metric = compute_metric_perturbations(perturb, dens, a[None, :], k)
+    vis = _visibility_from_opacity(tau[None, :], jnp.asarray(opacity)[None, :])
+    return compute_source_function(perturb, metric, vis, k, tau[None, :])
 
 
-    S_fftlog = jax.vmap(interp_S_to_fftlog)(S_chi)
-    # S_fftlog has shape (n_k, n_fftlog, n_cosmo)
-
-    # FFTLog decomposition parameters
-    # bias = -1.1 ensures Basis functions decay at large chi
-    bias = -1.1
-
-    # Compute FFT frequencies η_n = 2π n / (N × Δlog(χ))
-    n_freqs = n_fftlog // 2 + 1  # For rfft
-    eta_n = 2.0 * jnp.pi * jnp.arange(n_freqs)[:, None] / (n_fftlog * dlog_chi)
-
-    # Complex power-law indices: p_n = bias + i × η_n
-    p_n = bias + 1j * eta_n
-
-    # Apply bias factor to the source function: f_m = S(χ_m) × χ_m^(-bias)
-    S_biased = S_fftlog * chi_fftlog[None, ...] ** (-bias)
-
-    # Compute FFT coefficients c_n for each k
-    c_n_fft = jnp.fft.rfft(S_biased, axis=1)
-
-    # Phase shift to account for start of interval
-    phase_shift = jnp.exp(-1j * eta_n * log_chi_min_padded)
-
-    # Normalize coefficients using standard discrete expansion
-    c_n = c_n_fft * phase_shift / n_fftlog
-
-    # Precompute the analytical Bessel integral coefficients for all (ℓ, p_n)
-    #ells = ell_modes
-    M_ell_p = jnp.transpose(jax.vmap(_fftlog_bessel_integral_coefficients, in_axes=(None, 1))(ells, p_n), (1, 2, 0))
-    # M_ell_p has shape (ellmax+1, n_freqs)
-
-    # Compute Θ_ℓ(k) by summing over FFTLog coefficients
-    log_k = jnp.log(kmodes)[..., None, None]  # (n_kmodes, 1, 1)
-    k_power = jnp.exp(-(p_n[None, ...] + 1.0) * log_k)  # (n_kmodes, n_freqs)
-
-    # Combine: ck[k, n] = c_n[k, n] * k_power[k, n]
-    ck = c_n * k_power
-
-    # Standard rfft reconstruction sum
-    print(ck.shape, M_ell_p.shape)
-    theta_ell_0 = jnp.einsum('km,lm->klm', ck[:, 0].real, M_ell_p[:, 0].real)
-
-    print("-----")
-    if n_fftlog % 2 == 0:
-        ck_pos = ck[:, 1:-1]
-        M_pos = M_ell_p[:, 1:-1]
-        ck_nyq = ck[:, -1]
-        M_nyq = M_ell_p[:, -1]
-
-        # Split complex GEMM into two real GEMMs for 2x less arithmetic:
-        # Re(sum_n ck[k,n]*M[l,n]) = sum_n (Re(ck)*Re(M) - Im(ck)*Im(M))
-        print("even:",ck_pos.shape, M_pos.shape)
-        theta_ell_pos = 2.0 * (
-            jnp.einsum('knm,lnm->klm', ck_pos.real, M_pos.real)
-            - jnp.einsum('knm,lnm->klm', ck_pos.imag, M_pos.imag)
-        )
-        theta_ell_nyq = jnp.real(jnp.einsum('km,lm->klm', ck_nyq, M_nyq))
-        theta_ell = theta_ell_0 + theta_ell_pos + theta_ell_nyq
-    else:
-        ck_pos = ck[:, 1:]
-        M_pos = M_ell_p[:, 1:]
-        print("odd:",ck_pos.shape, M_pos.shape)
-        # Split complex GEMM into two real GEMMs
-        theta_ell_pos = 2.0 * (
-            jnp.einsum('knm,lnm->klm', ck_pos.real, M_pos.real)
-            - jnp.einsum('knm,lnm->klm', ck_pos.imag, M_pos.imag)
-        )
-        theta_ell = theta_ell_0 + theta_ell_pos
-
-    print(theta_ell.shape, kmodes.shape)
-    return theta_ell, kmodes
+# =============================================================================
+# 3. Bessel projection and the C_l quadrature
+# =============================================================================
 
 
-@jax.jit
-def compute_Cell(theta_ell, kmodes, n_s, k_p):
-    """Compute CMB angular power spectrum C_ℓ from multipole moments.
+def _bessel_row(ell: int, n_x: int, dx: float) -> np.ndarray:
+    """Return ``j_ell`` sampled on the uniform grid ``x = 0, dx, ..., dx (n_x-1)``.
 
-    The angular power spectrum is computed by integrating over k:
-
-        C_ℓ ∝ ∫ k^(n_s-1) |Θ_ℓ(k)|² dk
-
-    where n_s is the primordial spectral index and k_p is the pivot scale.
-
-    Parameters
-    ----------
-    theta_ell : jnp.ndarray
-        Multipole moments Θ_ℓ(k) with shape (n_kmodes, ellmax+1)
-    kmodes : jnp.ndarray
-        Wavenumber grid (shape: n_kmodes)
-    n_s : float
-        Primordial spectral index
-    k_p : float
-        Pivot scale (typically 0.05 Mpc⁻¹)
-
-    Returns
-    -------
-    jnp.ndarray
-        Angular power spectrum C_ℓ (shape: ellmax+1)
+    ``j_ell(x)`` is exponentially small below its turning point ``x ~ ell``, so
+    the row is left at zero until ``ell - 4 ell^{1/3}``.
     """
-    log_kmodes = jnp.log(kmodes)
 
-    # Integrate over k: ∫ (k/k_p)^(n_s-1) |Θ_ℓ(k)|² d(log k)
-    Cell = jnp.trapezoid(
-        (kmodes[:, None, None] / k_p)**(n_s - 1) * theta_ell**2,
-        x=log_kmodes,
-        axis=0
+    x = np.linspace(0.0, dx * (n_x - 1), n_x)
+    x_safe = np.where(x > 1.0e-30, x, 1.0)
+    pref = np.where(x > 1.0e-30, np.sqrt(np.pi / (2.0 * x_safe)), 0.0)
+    values = np.zeros_like(x)
+    x_min = max(0.0, float(ell) - 4.0 * float(ell) ** (1.0 / 3.0))
+    start = max(0, int(x_min / dx) - 1)
+    values[start:] = pref[start:] * special.jv(float(ell) + 0.5, x[start:])
+    if ell == 0:
+        values[0] = 1.0
+    return values
+
+
+def _build_bessel_tables(ells, x_max: float, dx: float):
+    """Return cached uniform ``j_ell`` and ``j_{ell+1}`` interpolation tables."""
+
+    key = (
+        tuple(np.asarray(ells, dtype=np.int64)),
+        float(np.ceil(x_max / 250.0) * 250.0),
+        float(dx),
     )
+    if key in _BESSEL_CACHE:
+        return _BESSEL_CACHE[key]
 
-    return Cell
-
-
-@partial(jax.jit, static_argnames=['ellmax'])
-def compute_Dell(Cell, A_s, Tcmb, ellmax=None):
-    """Convert C_ℓ angular power spectrum to D_ℓ = ℓ(ℓ+1)C_ℓ/(2π) in μK².
-
-    This function converts the dimensionless C_ℓ spectrum to the commonly-used
-    D_ℓ representation that includes the primordial amplitude and temperature
-    normalization.
-
-    Parameters
-    ----------
-    Cell : jnp.ndarray
-        Angular power spectrum C_ℓ (dimensionless, shape: ellmax+1)
-    A_s : float
-        Primordial amplitude (typically ~2.1e-9)
-    Tcmb : float
-        CMB temperature in Kelvin (typically 2.7255 K)
-    ellmax : int, optional
-        Maximum multipole. If None, inferred from Cell.shape[0] - 1
-
-    Returns
-    -------
-    ell : jnp.ndarray
-        Multipole moments starting from ell=2
-    D_ell : jnp.ndarray
-        Temperature power spectrum D_ℓ = ℓ(ℓ+1)C_ℓ/(2π) in μK²
-
-    Examples
-    --------
-    >>> Cell = compute_Cell(theta_ell, kmodes, n_s=0.96, k_p=0.05)
-    >>> ell, D_ell = compute_D_ell(Cell, A_s=2.1e-9, Tcmb=2.7255)
-    >>> # D_ell now contains the power spectrum in μK²
-
-    Notes
-    -----
-    The conversion formula is:
-        D_ℓ = ℓ(ℓ+1) × C_ℓ × A_s × 2 × T_CMB²
-
-    The factor of 2 comes from the convention difference between dimensionless
-    and dimensional power spectra. We start from ell=2 since monopole (ℓ=0)
-    and dipole (ℓ=1) are typically removed or unmeasured in CMB observations.
-    """
-    if ellmax is None:
-        ellmax = Cell.shape[0] - 1
-
-    ell = jnp.arange(ellmax + 1)
-
-    # Apply ell(ell+1) factor, primordial amplitude, and temperature normalization
-    # Start from ell=2 (monopole and dipole not included)
-    # Convert from K² to μK² by multiplying by (10^6)² = 1e12
-    D_ell = ell[2:] * (ell[2:] + 1) * Cell[2:] * A_s * 2 * Tcmb**2 * 1e12
-
-    return ell[2:], D_ell
+    ell_arr = np.asarray(ells, dtype=np.int64)
+    n_x = int(np.ceil(key[1] / dx)) + 2
+    unique = np.unique(np.concatenate([ell_arr, ell_arr + 1]))
+    rows = {int(ell): _bessel_row(int(ell), n_x, dx) for ell in unique}
+    result = (
+        0.0,
+        1.0 / dx,
+        n_x,
+        jnp.asarray(np.stack([rows[int(ell)] for ell in ell_arr])),
+        jnp.asarray(np.stack([rows[int(ell) + 1] for ell in ell_arr])),
+    )
+    _BESSEL_CACHE[key] = result
+    return result
 
 
-@partial(jax.jit, static_argnames=['ellmax', 'nmodes', 'kmin', 'kmax', 'n_k_dense', 'n_fftlog', 'lmaxg', 'lmaxgp', 'lmaxr', 'lmaxnu', 'nqmax'])
-def compute_Cell_spectrum_from_cosmo_params(
-    param_dict,
-    ellmax=2500,
-    nmodes=128,
-    kmin=1e-4,
-    kmax=1.0,
-    n_k_dense=8192,
-    n_fftlog=16384,
-    lmaxg=11,
-    lmaxgp=11,
-    lmaxr=11,
-    lmaxnu=8,
-    nqmax=3
+def _interp_uniform_table(x, x0, inv_dx, n_x, vals):
+    """Linearly interpolate a uniformly sampled table at arbitrary ``x``."""
+
+    u = (x - x0) * inv_dx
+    idx = jnp.clip(jnp.floor(u).astype(jnp.int32), 0, n_x - 2)
+    frac = jnp.clip(u - idx, 0.0, 1.0)
+    return (1.0 - frac) * vals[idx] + frac * vals[idx + 1]
+
+
+def theta_ell_transfer_function(
+    ells, k_values, tau, S, tau0, S_j1=None, S_j2=None, *, bessel_dx: float = 0.03
 ):
-    """Compute CMB C_ell spectrum using DISCO-EB.
+    """Return the temperature transfer function ``Theta_l(k)``, shape ``(n_k, n_ell)``.
 
-    This function follows the same pipeline as DISCOEB_CMB_spectrum_simple.ipynb
-    to compute the temperature power spectrum.
+    Derivatives of ``j_l`` come from the recurrences
+    ``j_l' = (l/x) j_l - j_{l+1}`` and
+    ``j_l'' = -(2/x) j_l' + (l(l+1)/x^2 - 1) j_l``,
+    so only ``j_l`` and ``j_{l+1}`` need tabulating.
 
-    The source function S(k, tau) is cubic-spline-interpolated from the
-    ``nmodes`` perturbation k-modes onto a denser ``n_k_dense``-point grid
-    in log(k) before the line-of-sight integration.  This resolves the
-    oscillatory structure of theta_ell(k) cheaply (S is smooth) and reduces
-    high-ell errors by an order of magnitude compared to integrating on
-    the raw perturbation grid.
-
-    Parameters
-    ----------
-    param_dict : dict
-        Dictionary of cosmological parameters
-    ellmax : int, optional
-        Maximum multipole to compute. Default: 2500
-    nmodes : int, optional
-        Number of k-modes for perturbation evolution. Default: 512
-    kmin : float, optional
-        Minimum wavenumber in 1/Mpc. Default: 1e-4
-    kmax : float, optional
-        Maximum wavenumber in 1/Mpc. Default: 1.0
-    n_k_dense : int, optional
-        Number of k-modes for the dense grid used in the line-of-sight
-        integration.  Set to 0 to skip interpolation and use the raw
-        perturbation grid.  Default: 8192
-    n_fftlog : int, optional
-        Number of FFTLog basis functions used in the line-of-sight
-        integration.  Must be a power of two.  Default: 16384
-    lmaxg : int, optional
-        Maximum photon temperature multipole. Default: 11
-    lmaxgp : int, optional
-        Maximum photon polarization multipole. Default: 11
-    lmaxr : int, optional
-        Maximum massless neutrino multipole. Default: 11
-    lmaxnu : int, optional
-        Maximum massive neutrino multipole. Default: 8
-    nqmax : int, optional
-        Number of neutrino momentum bins. Default: 3
-
-    Returns
-    -------
-    ell : jnp.ndarray
-        Multipole moments (starting from ell=2)
-    C_ell : jnp.ndarray
-        Temperature power spectrum in μK^2
+    Each multipole is restricted to the band of wavenumbers that actually
+    projects onto it. ``j_l(x)`` is exponentially small below its turning point,
+    so modes with ``k chi_max < l - 4 l^{1/3}`` contribute nothing; and modes far
+    above ``k ~ l / chi_star`` only contribute through rapidly oscillating tails
+    that the finite ``tau`` and ``k`` grids cannot resolve, so integrating them
+    injects aliasing noise rather than signal. Without the upper cut the damping
+    tail is inflated by several percent (``+6%`` at ``l = 500``).
     """
-    # 1. Background evolution
-    param = param_dict.copy()
-    param = evolve_background(param=param, thermo_module='RECFAST', num_thermo=1024)
 
-    # 2. Perturbation evolution
-    def _get_aexp_out(n_early=32, n_pre_recomb=64, n_recomb=128, n_post=96):
-        z_break1 = 3000.
-        z_break2 = 1400.
-        z_break3 = 600.
-        a_start = 1e-4
-        a_end = 1.0
+    ell_arr = np.atleast_1d(np.asarray(ells, dtype=np.int64))
+    k = jnp.asarray(k_values, dtype=jnp.float64)
+    tau = jnp.asarray(tau, dtype=jnp.float64)
+    S = jnp.asarray(S, dtype=jnp.float64)
+    S_j1 = jnp.zeros_like(S) if S_j1 is None else jnp.asarray(S_j1, dtype=jnp.float64)
+    S_j2 = jnp.zeros_like(S) if S_j2 is None else jnp.asarray(S_j2, dtype=jnp.float64)
 
-        a_break1 = 1.0 / (1.0 + z_break1)
-        a_break2 = 1.0 / (1.0 + z_break2)
-        a_break3 = 1.0 / (1.0 + z_break3)
-
-        a1 = jnp.geomspace(a_start, a_break1, n_early, endpoint=False)
-        a2 = jnp.geomspace(a_break1, a_break2, n_pre_recomb, endpoint=False)
-        a3 = jnp.geomspace(a_break2, a_break3, n_recomb, endpoint=False)
-        a4 = jnp.geomspace(a_break3, a_end, n_post)
-        return jnp.concatenate([a1, a2, a3, a4])
-
-    aexp_out = _get_aexp_out()
-
-    yout, kmodes, param = evolve_perturbations(
-        param=param,
-        kmin=kmin,
-        kmax=kmax,
-        num_k=nmodes,
-        aexp_out=aexp_out,
-        lmaxg=lmaxg,
-        lmaxgp=lmaxgp,
-        lmaxr=lmaxr,
-        lmaxnu=lmaxnu,
-        nqmax=nqmax,
-        rtol=1e-4,
-        atol=1e-4,
-        return_full=True,
-        k_sampling_method='camb',
+    chi = jnp.asarray(tau0, dtype=jnp.float64) - tau
+    x = k[:, None] * chi
+    x0, inv_dx, n_x, jl_tab, jl1_tab = _build_bessel_tables(
+        ell_arr, float(jnp.max(x)) + 2.0, bessel_dx
     )
 
-    # 3. Static parameters are passed as function arguments above
+    # Comoving distance to the peak of the source (last scattering), which sets
+    # the k -> l mapping k ~ l / chi_star.
+    chi_max = jnp.maximum(jnp.max(chi), 1.0)
+    chi_star = jnp.maximum(chi[jnp.argmax(jnp.max(jnp.abs(S), axis=0))], 1.0)
 
-    # 4. Time derivatives
-    tau = param['tau_out']
-    idxtau = jnp.arange(len(tau))
-    idxk = jnp.arange(len(kmodes))
-    print("->",yout.shape, tau.shape)
-    idxcosmo = jnp.arange(yout.shape[1])
-    yprime = jnp.transpose(jax.vmap(lambda yout, icos: compute_time_derivatives(yout, tau, kmodes, param, lmaxg, lmaxgp, lmaxr, lmaxnu, nqmax, icos), in_axes=(1, 0))(yout, idxcosmo), (1, 0, 2, 3))
-    #yprime = jax.vmap( lambda ik : jax.vmap( lambda itau : model_synchronous( tau=tau[itau], y=y[ik,itau,:], param=param, kmode=kmodes[ik], lmaxg=lmaxg, lmaxgp=lmaxgp, lmaxr=lmaxr, lmaxnu=lmaxnu, nqmax=nqmax ) )(idxtau) )(idxk)
+    def one_ell(i, ell_value):
+        jl = _interp_uniform_table(x, x0, inv_dx, n_x, jl_tab[i])
+        jl1 = _interp_uniform_table(x, x0, inv_dx, n_x, jl1_tab[i])
+        inv_x = jnp.where(x > 1.0e-30, 1.0 / x, 0.0)
+        jld = jnp.where(x > 1.0e-30, ell_value * inv_x * jl - jl1, 0.0)
+        jldd = jnp.where(
+            x > 1.0e-30,
+            -2.0 * inv_x * jld + (ell_value * (ell_value + 1.0) * inv_x * inv_x - 1.0) * jl,
+            0.0,
+        )
+        theta_ell = jnp.trapezoid(S * jl + S_j1 * jld + S_j2 * jldd, tau, axis=1)
 
-    # 5. Compute iq0 for neutrino indexing
-    iq0 = 10 + lmaxg + lmaxgp + lmaxr
+        k_lo = jnp.maximum(0.0, ell_value - 4.0 * ell_value ** (1.0 / 3.0)) / chi_max
+        k_hi = (ell_value + 2500.0) / chi_star
+        return jnp.where((k >= k_lo) & (k <= k_hi), theta_ell, 0.0)
 
-    # 6. Extract perturbations
-    print(yout.shape, yprime.shape)
-    perturbations = extract_perturbations(yout, yprime, lmaxg, lmaxgp, lmaxr)
+    theta = jax.vmap(one_ell)(
+        jnp.arange(ell_arr.size), jnp.asarray(ell_arr, dtype=jnp.float64)
+    )
+    return theta.T
 
-    # 7. Compute background quantities
-    background_quantities = compute_background_quantities(aexp_out, param)
 
-    # 8. Compute visibility functions
-    tau = param['tau_of_a_spline'].evaluate(aexp_out)
-    print("->!",tau.shape)
-    visibility_functions = compute_visibility_functions(tau, param)
+def compute_Cell(theta_ell, kmodes, n_s, k_p):
+    """Return the un-normalized ``C_l = int dln k (k/k_p)^{n_s-1} Theta_l(k)^2``."""
 
-    # 9. Compute neutrino perturbations
-    neutrinos = compute_neutrino_perturbations(
-        yout, yprime, aexp_out, param, nqmax, iq0
+    return jnp.trapezoid(
+        (kmodes[:, None] / k_p) ** (n_s - 1.0) * theta_ell**2,
+        x=jnp.log(kmodes),
+        axis=0,
     )
 
-    # 9. Compute metric perturbations
-    metric = compute_metric_perturbations(perturbations, neutrinos, background_quantities, param, kmodes, aexp_out)
 
-    # 10. Compute source function
-    tau = tau.T[None, ...]
-    source_results = compute_source_function(
-        perturbations, metric, visibility_functions, yout, yprime, kmodes, lmaxg, lmaxgp, tau
+def cl_power_spectrum(theta_ell, k_values, n_s, k_pivot, A_s):
+    """Return the amplitude-normalized ``C_l``."""
+
+    return A_s * compute_Cell(theta_ell, jnp.asarray(k_values), n_s, k_pivot)
+
+
+def dl_power_spectrum(cl, ells, T_cmb):
+    """Return ``D_l = l(l+1) C_l`` in ``muK^2`` (DISCO-EB normalization)."""
+
+    ell = jnp.asarray(ells, dtype=jnp.float64)
+    return ell * (ell + 1.0) * jnp.asarray(cl) * 2.0 * T_cmb**2 * 1.0e12
+
+
+# =============================================================================
+# 4. Adaptive k and tau sampling
+# =============================================================================
+
+
+def _cmb_grid_summary(cosmology) -> dict[str, float]:
+    """Return the characteristic scales that set the adaptive ``k`` / ``tau`` grids.
+
+    ``tau_star`` is the visibility peak and ``delta_tau_rec`` its Gaussian
+    equivalent width; ``r_s`` is the sound horizon at recombination (which sets
+    the acoustic oscillation period in ``k``) and ``k_D`` the Silk damping
+    wavenumber (which sets their envelope). Together they say where the CMB
+    sources have structure, and hence where the grids must be dense.
+    """
+
+    key = (
+        cosmology.omega_b_h2, cosmology.omega_c_h2, cosmology.h, cosmology.T_cmb,
+        cosmology.Y_He, cosmology.N_eff, cosmology.tau_reion, cosmology.n_s,
+        cosmology.Omegak, cosmology.w_DE_0, cosmology.w_DE_a,
+        cosmology.mnu, cosmology.num_massive_neutrinos,
     )
-    S = source_results['S']
+    if key in _CMB_GRID_CACHE:
+        return _CMB_GRID_CACHE[key]
 
-    # 11. Line-of-sight integration (with optional k-interpolation of S)
-    tau0 = param['tau_of_a_spline'].evaluate(1.0)
-    ell_modes = jnp.linspace(0, ellmax, num=int(ellmax/50.))
-    theta_ell, kmodes = compute_theta_ell(
-        ells=ell_modes,
-        kmodes=kmodes,
-        tau=tau,
-        S=S,
-        tau0=tau0,
-        n_k_dense=n_k_dense,
-        n_fftlog=n_fftlog,
+    dens = density_coefficients(cosmology)
+    tau_grid, values, _, tau0 = build_thermo_tables(cosmology)
+    a_vals, opacity = values[0], values[1]
+
+    vis = np.asarray(
+        _visibility_from_opacity(jnp.asarray(tau_grid), jnp.asarray(opacity))["gvis"]
+    )
+    peak = int(np.argmax(vis))
+    tau_star = float(tau_grid[peak])
+    a_star = float(a_vals[peak])
+
+    half = 0.5 * float(vis[peak])
+    left = float(np.interp(half, vis[: peak + 1], tau_grid[: peak + 1]))
+    right = float(np.interp(half, vis[peak:][::-1], tau_grid[peak:][::-1]))
+    delta_tau_rec = max((right - left) / (2.0 * np.sqrt(2.0 * np.log(2.0))), 1.0)
+
+    grhog_v, grhor_v, grhoc_v, grhob_v, _ = dens
+    tau_eq = float(np.interp((grhog_v + grhor_v) / (grhoc_v + grhob_v), a_vals, tau_grid))
+
+    # Comoving sound horizon r_s = int c_s dtau = int_0^{a_star} da / (a' sqrt(3(1+R))),
+    # with a' = a sqrt(grhoa2/3) and R = 3 rho_b / (4 rho_g). Since
+    # grhoa4 = grhoa2 a^2, the a' and the 1/a combine into 1/sqrt(grhoa4).
+    def sound_integrand(ap):
+        r = 0.75 * grhob_v * ap / grhog_v
+        return 1.0 / np.sqrt(grhoa4(ap, *dens) * (1.0 + r))
+
+    r_s = float(integrate.quad(sound_integrand, 0.0, a_star, limit=200)[0])
+
+    # Silk damping scale from the photon diffusion length.
+    a_silk = np.linspace(max(float(a_vals[0]), 1.0e-8), a_star, 5000)
+    opacity_silk = np.maximum(np.interp(a_silk, a_vals, opacity), 1.0e-30)
+    r = 0.75 * grhob_v * a_silk / grhog_v
+    integrand_d = (
+        (r**2 + 16.0 * (1.0 + r) / 15.0)
+        / (6.0 * (1.0 + r) ** 2 * opacity_silk)
+        * np.array([dtau_da(float(ap), *dens) for ap in a_silk])
+    )
+    k_D = float(1.0 / np.sqrt(np.trapezoid(integrand_d, a_silk)))
+
+    # Secondary visibility bump from reionization. Selecting on "after
+    # recombination" is not enough -- the recombination tail still dominates
+    # there -- so restrict to z < Z_REION_SEARCH_MAX, where only reionization
+    # scatters.
+    post_rec = a_vals > 1.0 / (1.0 + Z_REION_SEARCH_MAX)
+    if np.any(post_rec) and np.max(np.where(post_rec, vis, 0.0)) > 0.0:
+        reion_idx = int(np.argmax(np.where(post_rec, vis, 0.0)))
+        tau_reion = float(tau_grid[reion_idx])
+        delta_tau_reion = max(0.03 * tau0, 80.0)
+    else:
+        tau_reion = 0.6 * tau0
+        delta_tau_reion = 0.05 * tau0
+
+    out = {
+        "tau0": float(tau0), "tau_eq": tau_eq, "tau_star": tau_star,
+        "delta_tau_rec": delta_tau_rec, "tau_reion": tau_reion,
+        "delta_tau_reion": delta_tau_reion, "r_s": r_s, "k_D": k_D,
+    }
+    _CMB_GRID_CACHE[key] = out
+    return out
+
+
+def _resample_from_density(x, density, n):
+    """Return ``n`` points drawn from ``x`` in proportion to ``density``."""
+
+    cdf = np.cumsum(density) * (x[1] - x[0])
+    cdf -= cdf[0]
+    cdf /= cdf[-1]
+    return np.interp(np.linspace(0.0, 1.0, n), cdf, x)
+
+
+def cmb_k_grid(
+    cosmology,
+    *,
+    n: int = 200,
+    mode: str = "ode",
+    k_min: float = 1.0e-5,
+    k_max: float = 0.5,
+    ell_min: int = 2,
+    ell_max: int = 2500,
+    n_ell_samples: int = 30,
+    n_eval: int = 5000,
+) -> np.ndarray:
+    """Return a nonuniform wavenumber grid concentrated where the sources vary.
+
+    ``mode="ode"`` resolves the acoustic oscillations of the source itself
+    (period set by ``r_s``, envelope by Silk damping ``k_D``) and is the grid the
+    perturbation solve runs on. ``mode="cl"`` additionally weights each ``k`` by
+    how many multipoles project onto it, ``k ~ l / chi_star``, and is the finer
+    grid the ``C_l`` quadrature uses after the sources are interpolated.
+    """
+
+    summary = _cmb_grid_summary(cosmology)
+    x = np.linspace(np.log(k_min), np.log(k_max), n_eval)
+    k = np.exp(x)
+    primordial = k ** (cosmology.n_s + 2.0)
+    acoustic_curv = (1.0 / summary["r_s"]) ** 2
+    damped = primordial * np.exp(-((k / summary["k_D"]) ** 2))
+
+    if mode == "cl":
+        sigma_k = 1.0 / summary["delta_tau_rec"]
+        chi_star = summary["tau0"] - summary["tau_star"]
+        ell_samples = np.unique(np.geomspace(ell_min, ell_max, n_ell_samples).astype(int))
+        raw_weight = np.zeros_like(k)
+        for ell in ell_samples:
+            envelope = np.exp(-0.5 * ((k - ell / chi_star) / (3.0 * sigma_k)) ** 2)
+            raw_weight += np.maximum(acoustic_curv, sigma_k**2) * envelope * damped
+        floor = 1.0e-6 * np.max(raw_weight)
+    else:
+        smooth_curv = (k * summary["r_s"]) ** 2 / summary["tau_eq"] ** 2
+        raw_weight = np.maximum(acoustic_curv, smooth_curv) * damped
+        floor = 0.005 * np.max(raw_weight)
+
+    grid = np.exp(_resample_from_density(x, (raw_weight + floor) ** (1.0 / 3.0), n))
+    grid[0], grid[-1] = k_min, k_max
+    return grid
+
+
+def cmb_tau_grid(cosmology, k_values, n: int, *, n_eval: int = 10000) -> np.ndarray:
+    """Return a nonuniform conformal-time grid on which to save the sources.
+
+    The sources are sharply peaked at recombination (width ``delta_tau_rec``),
+    modulated on the sound-horizon scale, and have a secondary bump at
+    reionization, so the sampling density is the cube root of the sum of those
+    three weights. Endpoints are pinned to ``[TAU_START, tau0]``, which the
+    solver's save grid requires.
+    """
+
+    k_arr = np.asarray(k_values, dtype=np.float64)
+    s = _cmb_grid_summary(cosmology)
+    tau0 = s["tau0"]
+
+    tau = np.linspace(TAU_START, tau0, n_eval, dtype=np.float64)
+    weight = (
+        np.exp(-0.5 * ((tau - s["tau_star"]) / s["delta_tau_rec"]) ** 2)
+        / s["delta_tau_rec"] ** 2
+    )
+    weight += (
+        np.exp(-0.5 * ((tau - s["tau_star"]) / s["r_s"]) ** 2)
+        * (float(k_arr[-1]) / np.sqrt(3.0)) ** 2
+    )
+    weight += (
+        0.3
+        * np.exp(-0.5 * ((tau - s["tau_reion"]) / s["delta_tau_reion"]) ** 2)
+        / s["delta_tau_reion"] ** 2
     )
 
-    # 12. Compute C_ell
-    Cell = compute_Cell(
-        theta_ell=theta_ell,
-        kmodes=kmodes,
-        n_s=param['n_s'][None, :, None],
-        k_p=param['k_p']
-    )
-    
-    print(Cell.shape)
-    Cell = spline_interpolation(ell_modes, Cell).evaluate(jnp.arange(ellmax, dtype=jnp.float32))
-    print(Cell.shape)
+    tau_save = _resample_from_density(tau, (weight + 0.005 * np.max(weight)) ** (1.0 / 3.0), n)
+    tau_save[0], tau_save[-1] = TAU_START, tau0
+    return tau_save
 
-    return Cell, param
+
+# =============================================================================
+# 5. End-to-end spectrum
+# =============================================================================
+
+
+def _interpolate_sources_to_fine_k(k_values, channels, k_fine):
+    """Akima-interpolate each source channel from the solve grid onto a finer ``k``."""
+
+    log_k = np.log(np.asarray(k_values, dtype=np.float64))
+    log_k_fine = np.log(np.asarray(k_fine, dtype=np.float64))
+    out = []
+    for channel in channels:
+        channel = np.asarray(channel, dtype=np.float64)
+        fine = np.empty((log_k_fine.size, channel.shape[1]), dtype=np.float64)
+        for it in range(channel.shape[1]):
+            fine[:, it] = interpolate.Akima1DInterpolator(log_k, channel[:, it])(log_k_fine)
+        out.append(fine)
+    return out
+
+
+def compute_cl_power_spectrum(
+    cosmology,
+    *,
+    k_values: np.ndarray | None = None,
+    ells: np.ndarray | None = None,
+    n_save: int = 1000,
+    n_k_fine: int = 1500,
+    k_fine_values: np.ndarray | None = None,
+    **solve_kwargs,
+):
+    """Return ``(ells, C_l, D_l)`` for the unlensed scalar TT spectrum.
+
+    Runs the numba-CUDA perturbation solve on ``k_values``, builds the
+    line-of-sight sources on the saved ``tau`` grid, refines them in ``k``, and
+    projects them onto spherical Bessel functions.
+    """
+
+    if k_values is None:
+        k_values = cmb_k_grid(cosmology, n=128, mode="ode")
+    if ells is None:
+        ells = DEFAULT_CMB_ELLS
+    k_values = np.asarray(k_values, dtype=np.float64)
+    ells = np.asarray(ells, dtype=np.int64)
+
+    tau_save = cmb_tau_grid(cosmology, k_values, n_save)
+    hist, _, tables = solve_perturbation_history(
+        k_values, cosmology, tau_save=tau_save, **solve_kwargs
+    )
+    tau_grid, values, _, tau0 = tables
+
+    # a(tau) and kappa'(tau) on the save grid, from the thermodynamics tables.
+    a_save = np.interp(tau_save, tau_grid, values[0])
+    opacity_save = np.interp(tau_save, tau_grid, values[1])
+
+    dens = density_coefficients(cosmology)
+    src = source_functions(hist, tau_save, a_save, k_values, opacity_save, dens)
+
+    if k_fine_values is None:
+        k_fine = cmb_k_grid(
+            cosmology, n=n_k_fine, mode="cl",
+            k_min=float(k_values[0]), k_max=float(k_values[-1]),
+            ell_max=int(np.max(ells)),
+        )
+    else:
+        k_fine = np.asarray(k_fine_values, dtype=np.float64)
+
+    s_j0, s_j1, s_j2 = _interpolate_sources_to_fine_k(
+        k_values, (src["S"], src["S_j1"], src["S_j2"]), k_fine
+    )
+
+    theta = theta_ell_transfer_function(ells, k_fine, tau_save, s_j0, tau0, s_j1, s_j2)
+    cl = cl_power_spectrum(theta, k_fine, cosmology.n_s, cosmology.k_pivot, cosmology.A_s)
+    dl = dl_power_spectrum(cl, ells, cosmology.T_cmb)
+    return ells, np.asarray(cl), np.asarray(dl)

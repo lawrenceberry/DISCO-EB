@@ -58,6 +58,7 @@ from .perturbations import (
     NVAR,
     adiabatic_initial_conditions,
 )
+from .reionization import apply_reionization
 
 # Solver / grid presets (mirror the DISCO2 matter-power defaults).
 N_THERMO_GRID = 2048
@@ -198,7 +199,8 @@ def build_thermo_tables(cosmology, n_grid: int = N_THERMO_GRID):
     RECFAST + rodas5Pjax pipeline); the absolute conformal time ``tau(a)`` comes
     from the background quadrature ``dtau/da`` in :mod:`discoeb.background`. Before
     the RECFAST start (``z > Z_RECOMB_START``) the plasma is treated as fully
-    ionized with ``T_b = T_cmb (1+z)``.
+    ionized with ``T_b = T_cmb (1+z)``; after recombination the tanh reionization
+    history of :mod:`discoeb.reionization` is layered on.
     """
 
     from scipy.integrate import cumulative_trapezoid
@@ -268,13 +270,30 @@ def build_thermo_tables(cosmology, n_grid: int = N_THERMO_GRID):
     )
 
     akthom = float(thomson_normalization(cosmology.omega_b_h2, cosmology.Y_He))
+
+    # Layer reionization onto the recombination history. It leaves the matter
+    # power essentially untouched but sets the CMB damping factor exp(-2 tau).
+    xe_vals = apply_reionization(
+        z_vals,
+        xe_vals,
+        cosmology,
+        akthom,
+        (grhog_v, grhornomass_v, grhoc_v, grhob_v, grhov_v),
+        grhok=grhok,
+        grhomnu=grhomnu,
+    )
     opacity_vals = xe_vals * akthom / a_vals**2
 
-    # Baryon sound speed cs2 = (k_B/(m_H c^2)) T_b (1 - (1/3) dln T_b/dln a).
+    # Baryon sound speed cs2 = (k_B/(mu m_H c^2)) T_b (1 - (1/3) dln T_b/dln a),
+    # where 1/mu = 1 - 3Y_He/4 + (1 - Y_He) x_e counts the free particles per
+    # hydrogen mass (neutral H + He, plus the electrons freed by ionization).
     # Floor T_b to a small positive value: the background_system matter
     # temperature can overshoot slightly negative in the last few z ~ 0 samples
     # (where T_b, and hence cs2, is dynamically negligible for the matter power).
-    barssc = K_B_SI / (M_H * C_SI**2)
+    barssc0 = K_B_SI / (M_H * C_SI**2)
+    barssc = barssc0 * (
+        1.0 - 0.75 * cosmology.Y_He + (1.0 - cosmology.Y_He) * xe_vals
+    )
     tb_safe = np.maximum(tb_vals, 1.0e-2)
     dlnT_dlna = np.gradient(np.log(tb_safe), np.log(a_vals))
     cs2_vals = np.maximum(barssc * tb_safe * (1.0 - dlnT_dlna / 3.0), 0.0)
@@ -882,22 +901,31 @@ def jac(y, tau, p):
     return rhs, make_jac(), time_jac
 
 
-def solve_perturbations(
+def solve_perturbation_history(
     k_values,
     cosmology,
     *,
+    tau_save=None,
     rtol: float = PERTURB_RTOL,
     atol: float = PERTURB_ATOL,
     first_step: float = PERTURB_FIRST_STEP,
     max_steps: int = PERTURB_MAX_STEPS,
 ):
-    """Solve the perturbation hierarchy for each ``k`` and return final states.
+    """Solve the perturbation hierarchy and return the saved state history.
+
+    Parameters
+    ----------
+    tau_save : array_like, optional
+        Strictly increasing conformal times at which to record the state. The
+        first entry must be ``TAU_START`` and the last ``tau0``. Defaults to just
+        the two endpoints, i.e. the final state only. The line-of-sight CMB
+        integration needs a dense grid through recombination instead.
 
     Returns
     -------
-    np.ndarray
-        Final perturbation state for each wave mode, shape ``(n_k, NVAR)``,
-        evaluated at ``tau0`` (today).
+    (history, layout, tables)
+        ``history`` has shape ``(n_k, len(tau_save), nvar)`` in the caller's
+        original ``k`` order; ``tables`` is the ``build_thermo_tables`` tuple.
     """
 
     from .integrators import rodas5Pnumba_solve
@@ -915,10 +943,14 @@ def solve_perturbations(
     order = np.argsort(k_arr, kind="stable")
     k_sorted = k_arr[order]
 
-    tau_grid, values, seconds, tau0 = build_thermo_tables(cosmology)
+    tables = build_thermo_tables(cosmology)
+    tau_grid, values, seconds, tau0 = tables
     params = np.ascontiguousarray(make_params(cosmology, k_sorted, tau0))
     y0 = np.ascontiguousarray(make_initial_states(cosmology, k_sorted, layout))
-    t_span = np.asarray((TAU_START, tau0), dtype=np.float64)
+    if tau_save is None:
+        t_span = np.asarray((TAU_START, tau0), dtype=np.float64)
+    else:
+        t_span = np.ascontiguousarray(np.asarray(tau_save, dtype=np.float64))
 
     rhs, jac, time_jac = build_numba_callbacks(layout, tau_grid, values, seconds)
 
@@ -966,12 +998,25 @@ def solve_perturbations(
         batches_per_block=BATCHES_PER_BLOCK,
         tf_local_idx=IX_TAU_END,
     )
-    hist = np.asarray(sol)  # (n_k, n_save, nvar)
-    y_final_sorted = hist[:, 1, :]
+    hist_sorted = np.asarray(sol)  # (n_k, n_save, nvar)
+    hist = np.empty_like(hist_sorted)
+    hist[order] = hist_sorted
+    return hist, layout, tables
 
-    y_final = np.empty_like(y_final_sorted)
-    y_final[order] = y_final_sorted
-    return y_final
+
+def solve_perturbations(k_values, cosmology, **solve_kwargs):
+    """Solve the perturbation hierarchy for each ``k`` and return final states.
+
+    Returns
+    -------
+    np.ndarray
+        Final perturbation state for each wave mode, shape ``(n_k, nvar)``,
+        evaluated at ``tau0`` (today).
+    """
+
+    solve_kwargs.pop("tau_save", None)
+    hist, _, _ = solve_perturbation_history(k_values, cosmology, **solve_kwargs)
+    return hist[:, -1, :]
 
 
 def solve_matter_power_spectrum(
