@@ -22,6 +22,7 @@ from discoeb.background import (
     grhoc,
     grhog,
     grhornomass,
+    neutrino_density_grho,
     radiation_neutrino_factor,
 )
 from discoeb.background_system import recfast_parameters
@@ -46,7 +47,13 @@ from cosmologies import BENCHMARK_COSMOLOGIES
 DEFAULT_COSMOLOGY = BENCHMARK_COSMOLOGIES["planck_2018_flat_lcdm"]
 
 COSMOLOGY_CASES = [
-    pytest.param(DEFAULT_COSMOLOGY, id="planck_2018_flat_lcdm"),
+    pytest.param(BENCHMARK_COSMOLOGIES[name], id=name)
+    for name in (
+        "planck_2018_flat_lcdm",
+        "planck_2018_curved_lcdm",
+        "desi_2024_dynamical_dark_energy",
+        "planck_2018_flat_lcdm_massive_nu",
+    )
 ]
 
 
@@ -67,6 +74,11 @@ def _param_row(cosmology):
             a["grhoc"],
             a["grhob"],
             a["grhov"],
+            a["grhok"],
+            a["grhomnu"],
+            a["amnu"],
+            a["w_DE_0"],
+            a["w_DE_a"],
         ],
         dtype=jnp.float64,
     )
@@ -95,9 +107,13 @@ def test_recfast_setup_helpers_match_direct_algebra(cosmology):
     assert args["omega_m"] == pytest.approx(
         (cosmology.omega_b_h2 + cosmology.omega_c_h2) / cosmology.h**2
     )
+    # Massive neutrinos count as radiation at equality (they are still
+    # relativistic there), so grhomnu joins the radiation numerator.
+    grhomnu_value = neutrino_density_grho(cosmology.T_cmb) * cosmology.num_massive_neutrinos
+    radiation = grhog_value + grhornomass_value + grhomnu_value
     assert args["z_eq"] > 0.0
     assert args["z_eq"] == pytest.approx(
-        1.0 / ((grhog_value + grhornomass_value) / (grhoc_value + grhob_value)) - 1.0
+        (grhoc_value + grhob_value) / radiation - 1.0
     )
 
 

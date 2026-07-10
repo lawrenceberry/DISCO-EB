@@ -90,7 +90,32 @@ from .constants import (
     ZGAUSS1,
     ZGAUSS2,
 )
-from .background import dtau_dz, hubble_constant_mpc, hubble_z
+from .background import (
+    _dark_energy_density_ratio_jax,
+    dtau_dz,
+    get_neutrino_momentum_bins,
+    hubble_constant_mpc,
+    hubble_z,
+)
+
+# Momentum quadrature for the massive-neutrino background density. Massive
+# neutrinos are still relativistic at recombination (a*amnu/q << 1), so they
+# contribute to the radiation budget that sets H(z) and the equality redshift;
+# ignoring them biases H(z) by several percent for a 0.06 eV species. 15 bins
+# integrate the Fermi-Dirac background to ~1e-6, and the ODE cost is negligible.
+NQMAX_RECFAST = 15
+_Q_NU, _W_NU = (jnp.asarray(a, dtype=jnp.float64) for a in get_neutrino_momentum_bins(NQMAX_RECFAST))
+
+
+def massive_neutrino_density_ratio(a, amnu):
+    """Return ``rho_nu(a) / rho_nu,massless`` for the degenerate massive species.
+
+    ``rho = sum_i w_i sqrt(1 + (a amnu / q_i)^2)``, which tends to ``1`` (fully
+    relativistic) as ``a -> 0`` and grows like ``a`` once ``a amnu >> q``. Pure
+    JAX arithmetic, so it evaluates on floats and on tracers.
+    """
+
+    return jnp.sum(_W_NU * jnp.sqrt(1.0 + (a * amnu / _Q_NU) ** 2))
 
 
 # =============================================================================
@@ -126,10 +151,16 @@ def equality_redshift(
     grhornomass: float,
     grhoc: float,
     grhob: float,
+    grhomnu: float = 0.0,
 ) -> float:
-    """Return the radiation-matter equality redshift from density coefficients."""
+    """Return the radiation-matter equality redshift from density coefficients.
 
-    a_eq = (grhog + grhornomass) / (grhoc + grhob)
+    Massive neutrinos, if present, are counted as radiation via ``grhomnu``: they
+    are still relativistic at equality, so omitting them would place equality too
+    early (e.g. z_eq ~ 3930 instead of ~3405 for the Planck 0.06 eV convention).
+    """
+
+    a_eq = (grhog + grhornomass + grhomnu) / (grhoc + grhob)
     return 1.0 / a_eq - 1.0
 
 
@@ -140,10 +171,28 @@ def hubble_z_si(
     grhoc: float,
     grhob: float,
     grhov: float,
+    *,
+    grhok: float = 0.0,
+    grhomnu: float = 0.0,
+    rhonu: float = 1.0,
+    rho_de: float = 1.0,
 ) -> float:
-    """Return ``H(z)`` in s^-1 from CAMB-style background coefficients."""
+    """Return ``H(z)`` in s^-1 from CAMB-style background coefficients.
 
-    return hubble_z(z, grhog, grhornomass, grhoc, grhob, grhov) * C_SI / MPC_IN_M
+    The keyword arguments carry the extensions beyond flat ``LambdaCDM``: spatial
+    curvature (``grhok``), the massive-neutrino density (``grhomnu`` scaled by the
+    density ratio ``rhonu``), and dynamical dark energy (``rho_de``); see
+    :func:`discoeb.background.hubble_z`.
+    """
+
+    return (
+        hubble_z(
+            z, grhog, grhornomass, grhoc, grhob, grhov,
+            grhok=grhok, grhomnu=grhomnu, rhonu=rhonu, rho_de=rho_de,
+        )
+        * C_SI
+        / MPC_IN_M
+    )
 
 
 # =============================================================================
@@ -616,7 +665,11 @@ def matter_temperature_derivative(
 # transcendentals with ``jnp`` ones. The background/thermodynamic context is
 # supplied as a packed parameter row ``p`` in the order
 #     p = (T_cmb, f_He, Nnow, H0_SI, omega_m, z_eq,
-#          grhog, grhornomass, grhoc, grhob, grhov).
+#          grhog, grhornomass, grhoc, grhob, grhov,
+#          grhok, grhomnu, amnu, w_DE_0, w_DE_a).
+# The last five entries carry the extensions beyond flat massless LambdaCDM
+# (curvature, massive neutrinos, dynamical dark energy) and are all zero /
+# LambdaCDM-inert for the baseline model.
 # =============================================================================
 
 
@@ -636,7 +689,8 @@ def recfast_rhs(z, y, p):
         z: redshift (scalar).
         y: state ``(x_H, x_He, T_mat)``.
         p: packed parameter row ``(T_cmb, f_He, Nnow, H0_SI, omega_m, z_eq,
-            grhog, grhornomass, grhoc, grhob, grhov)``.
+            grhog, grhornomass, grhoc, grhob, grhov, grhok, grhomnu, amnu,
+            w_DE_0, w_DE_a)``.
 
     Returns:
         jax.Array: ``(dx_H/dz, dx_He/dz, dT_mat/dz)``.
@@ -652,8 +706,15 @@ def recfast_rhs(z, y, p):
     omega_m = p[4]
     z_eq = p[5]
     grhog, grhornomass, grhoc, grhob, grhov = p[6], p[7], p[8], p[9], p[10]
+    grhok, grhomnu, amnu, w_DE_0, w_DE_a = p[11], p[12], p[13], p[14], p[15]
 
-    Hz = hubble_z_si(z, grhog, grhornomass, grhoc, grhob, grhov)
+    a = 1.0 / (1.0 + z)
+    rhonu = massive_neutrino_density_ratio(a, amnu)
+    rho_de = _dark_energy_density_ratio_jax(a, w_DE_0, w_DE_a)
+    Hz = hubble_z_si(
+        z, grhog, grhornomass, grhoc, grhob, grhov,
+        grhok=grhok, grhomnu=grhomnu, rhonu=rhonu, rho_de=rho_de,
+    )
     x_total = x_H + f_He * x_He
     T_rad = T_cmb * (1.0 + z)
     n_H = Nnow * (1.0 + z) ** 3
@@ -775,7 +836,14 @@ def recfast_rhs_with_tau(z, y, p):
 
     dxH_dz, dxHe_dz, dTmat_dz = recfast_rhs(z, y, p)
     grhog, grhornomass, grhoc, grhob, grhov = p[6], p[7], p[8], p[9], p[10]
-    dtau = dtau_dz(z, grhog, grhornomass, grhoc, grhob, grhov)
+    grhok, grhomnu, amnu, w_DE_0, w_DE_a = p[11], p[12], p[13], p[14], p[15]
+    a = 1.0 / (1.0 + z)
+    dtau = dtau_dz(
+        z, grhog, grhornomass, grhoc, grhob, grhov,
+        grhok=grhok, grhomnu=grhomnu,
+        rhonu=massive_neutrino_density_ratio(a, amnu),
+        rho_de=_dark_energy_density_ratio_jax(a, w_DE_0, w_DE_a),
+    )
     return jnp.asarray((dxH_dz, dxHe_dz, dTmat_dz, dtau), dtype=jnp.float64)
 
 

@@ -23,18 +23,22 @@ import jax
 import jax.numpy as jnp
 
 from .background import (
+    _dark_energy_density_ratio_jax,
+    critical_density_grho,
     grhob,
     grhoc,
     grhog,
     grhornomass,
-    grhov,
     helium_number_fraction,
+    neutrino_density_grho,
+    neutrino_mass_parameter,
 )
 from .integrators import rodas5Pjax_solve
 from .recfast import (
     equality_redshift,
     hubble_constant_si,
     initial_thermal_state,
+    massive_neutrino_density_ratio,
     matter_density_fraction,
     present_hydrogen_number_density,
     recfast_rhs_with_tau,
@@ -43,29 +47,55 @@ from .recfast import (
 
 
 # Packed-parameter layout consumed by the fused ODE. Index 0 carries the
-# integration anchor ``z_start``; indices 1..11 are the RECFAST parameter row
+# integration anchor ``z_start``; indices 1..16 are the RECFAST parameter row
 # expected by :func:`discoeb.recfast.recfast_rhs_with_tau`.
 #   p = (z_start, T_cmb, f_He, Nnow, H0_SI, omega_m, z_eq,
-#        grhog, grhornomass, grhoc, grhob, grhov)
+#        grhog, grhornomass, grhoc, grhob, grhov,
+#        grhok, grhomnu, amnu, w_DE_0, w_DE_a)
 
 
 def recfast_parameters(cosmology) -> dict:
-    """Return the named scalar RECFAST inputs for a (flat) cosmology.
+    """Return the named scalar RECFAST inputs for a cosmology.
 
-    Uses the massless-neutrino count for the radiation density, matching the
-    high-redshift background that recombination is sensitive to.
+    Covers the full DISCO-EB background: spatial curvature (``grhok``), a
+    degenerate massive-neutrino species (``grhomnu``, ``amnu``) and dynamical
+    dark energy (``w_DE_0``, ``w_DE_a``), in addition to flat massless
+    ``LambdaCDM``. Curvature and dark energy are dynamically negligible at
+    recombination, but a massive neutrino is still relativistic there and shifts
+    ``H(z)`` by several percent, so it must be carried as radiation.
+
+    The dark-energy coefficient ``grhov`` closes the density budget at ``a = 1``
+    against the critical density, reproducing the flat-massless
+    :func:`discoeb.background.grhov` while accounting for curvature and the
+    massive-neutrino density.
     """
 
     grhog_value = grhog(cosmology.T_cmb)
     grhornomass_value = grhornomass(grhog_value, cosmology.Neff_massless)
     grhoc_value = grhoc(cosmology.omega_c_h2)
     grhob_value = grhob(cosmology.omega_b_h2)
-    grhov_value = grhov(
-        cosmology.omega_b_h2,
-        cosmology.omega_c_h2,
-        cosmology.h,
-        cosmology.Neff_massless,
-        cosmology.T_cmb,
+
+    grhom = critical_density_grho(cosmology.H0)
+    grhok_value = grhom * cosmology.Omegak
+    n_mnu = cosmology.num_massive_neutrinos
+    if n_mnu > 0.0:
+        grhomnu_value = neutrino_density_grho(cosmology.T_cmb) * n_mnu
+        amnu_value = neutrino_mass_parameter(cosmology.mnu, cosmology.T_cmb)
+        grho_mnu_today = grhomnu_value * float(
+            massive_neutrino_density_ratio(1.0, amnu_value)
+        )
+    else:
+        grhomnu_value = 0.0
+        amnu_value = 0.0
+        grho_mnu_today = 0.0
+
+    grhov_value = grhom - (
+        grhog_value
+        + grhornomass_value
+        + grho_mnu_today
+        + grhoc_value
+        + grhob_value
+        + grhok_value
     )
     return {
         "T_cmb": cosmology.T_cmb,
@@ -76,13 +106,18 @@ def recfast_parameters(cosmology) -> dict:
             cosmology.omega_b_h2, cosmology.omega_c_h2, cosmology.h
         ),
         "z_eq": equality_redshift(
-            grhog_value, grhornomass_value, grhoc_value, grhob_value
+            grhog_value, grhornomass_value, grhoc_value, grhob_value, grhomnu_value
         ),
         "grhog": grhog_value,
         "grhornomass": grhornomass_value,
         "grhoc": grhoc_value,
         "grhob": grhob_value,
         "grhov": grhov_value,
+        "grhok": grhok_value,
+        "grhomnu": grhomnu_value,
+        "amnu": amnu_value,
+        "w_DE_0": cosmology.w_DE_0,
+        "w_DE_a": cosmology.w_DE_a,
     }
 
 
@@ -103,6 +138,11 @@ def _pack_params(z_start: float, args: dict):
             args["grhoc"],
             args["grhob"],
             args["grhov"],
+            args["grhok"],
+            args["grhomnu"],
+            args["amnu"],
+            args["w_DE_0"],
+            args["w_DE_a"],
         ],
         dtype=jnp.float64,
     )
@@ -192,6 +232,12 @@ def solve_background_system(
             args["grhoc"],
             args["grhob"],
             args["grhov"],
+            grhok=args["grhok"],
+            grhomnu=args["grhomnu"],
+            rhonu=massive_neutrino_density_ratio(1.0 / (1.0 + z), args["amnu"]),
+            rho_de=_dark_energy_density_ratio_jax(
+                1.0 / (1.0 + z), args["w_DE_0"], args["w_DE_a"]
+            ),
         )
     )(z_grid)
 

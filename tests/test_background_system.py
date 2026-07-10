@@ -23,8 +23,18 @@ from cosmologies import BENCHMARK_COSMOLOGIES, cosmology_to_class_params
 
 DEFAULT_COSMOLOGY = BENCHMARK_COSMOLOGIES["planck_2018_flat_lcdm"]
 
+# All four benchmark cosmologies exercise the fused RECFAST solve. Curvature and
+# dark energy leave the recombination background essentially unchanged, but the
+# 0.06 eV neutrino of the massive-nu case is still relativistic at recombination
+# and shifts H(z) by ~3% at z = 3500 unless it is carried in the background.
 COSMOLOGY_CASES = [
-    pytest.param(DEFAULT_COSMOLOGY, id="planck_2018_flat_lcdm"),
+    pytest.param(BENCHMARK_COSMOLOGIES[name], id=name)
+    for name in (
+        "planck_2018_flat_lcdm",
+        "planck_2018_curved_lcdm",
+        "desi_2024_dynamical_dark_energy",
+        "planck_2018_flat_lcdm_massive_nu",
+    )
 ]
 
 _Z_START = 3500.0
