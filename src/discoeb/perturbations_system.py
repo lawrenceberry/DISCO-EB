@@ -365,7 +365,7 @@ def make_initial_states(cosmology, k_values: np.ndarray, layout) -> np.ndarray:
     return y0
 
 
-def build_numba_callbacks(layout, tau_grid, values, seconds):
+def build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds):
     """Return numba-CUDA ``(rhs, jac, time_jac)`` device callbacks for a layout.
 
     The thermodynamics tables are uploaded once and read through a uniform
@@ -375,6 +375,13 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
     ``layout.enable_dark_energy`` is set; because the flag is a compile-time
     constant, numba prunes the DE branches entirely when it is disabled (so the
     flat-LambdaCDM kernel is unchanged).
+
+    The tables are stacked over cosmologies: ``values`` and ``seconds`` have
+    shape ``(n_cosmologies, n_channels, n_grid)`` and ``tau_min`` / ``inv_dtau``
+    are ``(n_cosmologies,)``. The device evaluator selects a cosmology's table by
+    the ``IX_COSMOLOGY`` tag on each trajectory's parameter row, so one compiled
+    kernel solves an arbitrary batch of cosmologies. A single-cosmology solve is
+    just ``n_cosmologies == 1``.
     """
 
     from numba import cuda, float64
@@ -390,18 +397,11 @@ def build_numba_callbacks(layout, tau_grid, values, seconds):
     IX_MNU = layout.ix_massive_nu if ENABLE_MNU else 0
     NPSI = LMAXNU + 1
 
-    n_grid = tau_grid.shape[0]
-    tau_min = np.asarray([np.log(tau_grid[0])], dtype=np.float64)
-    inv_dtau = np.asarray(
-        [(n_grid - 1) / (np.log(tau_grid[-1]) - np.log(tau_grid[0]))], dtype=np.float64
-    )
-    values_t = np.ascontiguousarray(values[None, :, :], dtype=THERMO_TABLE_DTYPE)
-    seconds_t = np.ascontiguousarray(seconds[None, :, :], dtype=THERMO_TABLE_DTYPE)
-
-    tau_min_dev = cuda.to_device(tau_min)
-    inv_dtau_dev = cuda.to_device(inv_dtau)
-    values_dev = cuda.to_device(values_t)
-    seconds_dev = cuda.to_device(seconds_t)
+    n_grid = values.shape[-1]
+    tau_min_dev = cuda.to_device(np.ascontiguousarray(tau_min, dtype=np.float64))
+    inv_dtau_dev = cuda.to_device(np.ascontiguousarray(inv_dtau, dtype=np.float64))
+    values_dev = cuda.to_device(np.ascontiguousarray(values, dtype=THERMO_TABLE_DTYPE))
+    seconds_dev = cuda.to_device(np.ascontiguousarray(seconds, dtype=THERMO_TABLE_DTYPE))
 
     # Massive-neutrino momentum quadrature (device constants).
     q_np, w_np, dlf_np = neutrino_momentum_bins(NQ if ENABLE_MNU else 1)
@@ -903,10 +903,12 @@ def jac(y, tau, p):
 
 
 class _PreparedSolve(NamedTuple):
-    """Compiled, cosmology-specific artifacts reused across solves."""
+    """Compiled artifacts shared by every cosmology of a (possibly batched) solve."""
 
+    cosmologies: tuple
     layout: object
-    tables: tuple
+    tables: tuple  # per-cosmology (tau_grid, values, seconds, tau0)
+    tau0: np.ndarray  # (n_cosmologies,)
     rhs: object
     jac: object
     time_jac: object
@@ -914,53 +916,40 @@ class _PreparedSolve(NamedTuple):
 
 
 _PREPARED_SOLVE_CACHE: dict = {}
+_PACKED_BATCH_CACHE: dict = {}
 
 
-def _prepare_solve(cosmology) -> _PreparedSolve:
-    """Return (and cache) the compiled solve artifacts for ``cosmology``.
+def _stack_thermo_tables(tables):
+    """Stack per-cosmology thermo tables for the multi-cosmology device evaluator.
 
-    The thermodynamics tables, the numba-CUDA right-hand side / Jacobian device
-    functions, and the Schur-EB block-LU depend only on the cosmology (and the
-    module-level grid and quadrature presets), not on the wave modes, the save
-    times, or the solver tolerances. They are also what triggers the *slow*
-    numba-CUDA kernel compilation: the returned ``rhs`` / ``jac`` / ``time_jac``
-    closures and the :class:`SchurEBSolver` instance are the identity keys of
-    :func:`discoeb.integrators.rodas5Pnumba_solve`'s compiled-kernel cache, so
-    reusing the same objects across solves of the same cosmology turns a repeated
-    solve from a full recompile (tens of seconds) into a bare kernel launch.
-
-    The cache is unbounded and holds device memory (one thermodynamics table set
-    plus the compiled kernel per distinct cosmology); sweeping many cosmologies
-    accumulates GPU allocations. Call :func:`clear_prepared_solve_cache` to
-    release them.
+    Returns ``(tau_min, inv_dtau, values, seconds, tau0)`` where ``values`` and
+    ``seconds`` are ``(n_cosmologies, n_channels, n_grid)`` and the rest are
+    ``(n_cosmologies,)``. The device spline evaluator selects a cosmology's row
+    by the per-trajectory ``IX_COSMOLOGY`` tag.
     """
 
-    from .perturbation_layout import PerturbationLayout
+    tau_min = np.array([np.log(t[0][0]) for t in tables], dtype=np.float64)
+    inv_dtau = np.array(
+        [(t[0].shape[0] - 1) / (np.log(t[0][-1]) - np.log(t[0][0])) for t in tables],
+        dtype=np.float64,
+    )
+    values = np.stack([t[1] for t in tables])
+    seconds = np.stack([t[2] for t in tables])
+    tau0 = np.array([t[3] for t in tables], dtype=np.float64)
+    return tau_min, inv_dtau, values, seconds, tau0
+
+
+def _build_schur_solver(layout):
+    """Build the Schur-EB block-LU matching a perturbation layout.
+
+    The state splits into a densely-coupled core (metric / fluid / low multipoles
+    [+ DE fluid] [+ psi0,1,2 per massive-nu bin]) bordered by free-streaming
+    tridiagonal blocks (photon, polarization, massless-nu [+ one tail per bin]),
+    each coupling into the core only through its lowest multipole.
+    """
+
     from .schur_eb import DENSE_IDX, K_BASES, DENSE_C0, A_SIZE, SchurEBSolver
 
-    # Include the presets that change the compiled artifacts, so a caller that
-    # rebinds them (e.g. NQMAX) does not get a stale kernel.
-    key = (cosmology, NQMAX, N_THERMO_GRID, TAU_START, BATCHES_PER_BLOCK)
-    cached = _PREPARED_SOLVE_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    layout = PerturbationLayout.from_cosmology(cosmology, nqmax=NQMAX)
-    if layout.has_massive_neutrinos and layout.lmaxnu - 2 != A_SIZE:
-        raise NotImplementedError(
-            "the Schur-EB solver requires all tridiagonal blocks to share a length; "
-            f"massive-nu needs lmaxnu - 2 == {A_SIZE} (got {layout.lmaxnu})"
-        )
-
-    tables = build_thermo_tables(cosmology)
-    tau_grid, values, seconds, _tau0 = tables
-    rhs, jac, time_jac = build_numba_callbacks(layout, tau_grid, values, seconds)
-
-    # Assemble the bordered-block structure the Schur-EB solver factorizes:
-    #   dense core  = metric/fluid/low multipoles [+ DE fluid] [+ psi0,1,2 per bin]
-    #   tridiagonal = photon, polarization, massless-nu [+ one tail per bin]
-    # Each tridiagonal block couples into the core only through its lowest
-    # multipole (Theta_3<->Theta_2, E_3<->E_2, N_3<->N_2, psi_3(q)<->psi_2(q)).
     dense_idx = list(DENSE_IDX)
     k_bases = list(K_BASES)
     dense_c0 = list(DENSE_C0)
@@ -972,7 +961,7 @@ def _prepare_solve(cosmology) -> _PreparedSolve:
             dense_idx += [layout.ix_psi(l, qi) for l in (0, 1, 2)]
             k_bases.append(layout.ix_psi(3, qi))
 
-    lu_solver = SchurEBSolver(
+    return SchurEBSolver(
         batches_per_block=BATCHES_PER_BLOCK,
         block_dim=(BATCHES_PER_BLOCK, 1, 1),
         dense_idx=tuple(dense_idx),
@@ -982,15 +971,119 @@ def _prepare_solve(cosmology) -> _PreparedSolve:
         nvar=layout.nvar,
     )
 
-    prepared = _PreparedSolve(layout, tables, rhs, jac, time_jac, lu_solver)
+
+def _prepare_solve(cosmologies) -> _PreparedSolve:
+    """Return (and cache) the compiled solve artifacts for a batch of cosmologies.
+
+    The thermodynamics tables, the numba-CUDA right-hand side / Jacobian device
+    functions, and the Schur-EB block-LU depend only on the cosmologies (and the
+    module-level grid and quadrature presets), not on the wave modes, the save
+    times, or the solver tolerances. They are also what triggers the *slow*
+    numba-CUDA kernel compilation: the returned ``rhs`` / ``jac`` / ``time_jac``
+    closures and the :class:`SchurEBSolver` instance are the identity keys of
+    :func:`discoeb.integrators.rodas5Pnumba_solve`'s compiled-kernel cache, so
+    reusing the same objects across solves of the same batch turns a repeated
+    solve from a full recompile (tens of seconds) into a bare kernel launch.
+
+    All cosmologies in a batch must share a perturbation layout (same dark-energy
+    and massive-neutrino settings); one compiled kernel then solves them all,
+    selecting each cosmology's thermodynamics table by the ``IX_COSMOLOGY`` tag.
+
+    The cache is unbounded and holds device memory (one thermodynamics table set
+    plus the compiled kernel per distinct batch); sweeping many batches
+    accumulates GPU allocations. Call :func:`clear_prepared_solve_cache` to
+    release them.
+    """
+
+    from .perturbation_layout import PerturbationLayout
+    from .schur_eb import A_SIZE
+
+    cosmologies = tuple(cosmologies)
+    # Include the presets that change the compiled artifacts, so a caller that
+    # rebinds them (e.g. NQMAX) does not get a stale kernel.
+    key = (cosmologies, NQMAX, N_THERMO_GRID, TAU_START, BATCHES_PER_BLOCK)
+    cached = _PREPARED_SOLVE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    layout = PerturbationLayout.from_cosmology(cosmologies[0], nqmax=NQMAX)
+    for cosmology in cosmologies[1:]:
+        if PerturbationLayout.from_cosmology(cosmology, nqmax=NQMAX) != layout:
+            raise ValueError(
+                "all cosmologies in a batch must share a perturbation layout "
+                "(same dark-energy / massive-neutrino settings)"
+            )
+    if layout.has_massive_neutrinos and layout.lmaxnu - 2 != A_SIZE:
+        raise NotImplementedError(
+            "the Schur-EB solver requires all tridiagonal blocks to share a length; "
+            f"massive-nu needs lmaxnu - 2 == {A_SIZE} (got {layout.lmaxnu})"
+        )
+
+    tables = tuple(build_thermo_tables(c) for c in cosmologies)
+    tau_min, inv_dtau, values, seconds, tau0 = _stack_thermo_tables(tables)
+    rhs, jac, time_jac = build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds)
+    lu_solver = _build_schur_solver(layout)
+
+    prepared = _PreparedSolve(
+        cosmologies, layout, tables, tau0, rhs, jac, time_jac, lu_solver
+    )
     _PREPARED_SOLVE_CACHE[key] = prepared
     return prepared
 
 
+def _pack_batch(prepared, k_values):
+    """Return (and cache) the packed ``(params, y0, t_span, order, k_sorted)``.
+
+    Building the packed inputs means one :func:`make_initial_states` per cosmology
+    -- i.e. ``n_cosmologies * n_k`` scalar :func:`adiabatic_initial_conditions`
+    calls, tens of milliseconds for a large batch. That work depends only on the
+    cosmologies and the wave modes (not the solver tolerances), so it is cached
+    on ``(cosmologies, k)``; a repeated solve of the same batch then skips
+    straight to the kernel launch, matching the DISCO2 prepared-solve behaviour.
+    """
+
+    k_arr = np.ascontiguousarray(np.asarray(k_values, dtype=np.float64))
+    key = (prepared.cosmologies, k_arr.shape, k_arr.tobytes())
+    cached = _PACKED_BATCH_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    layout = prepared.layout
+    n_cosmo = len(prepared.cosmologies)
+    order = np.argsort(k_arr, kind="stable")
+    k_sorted = k_arr[order]
+    n_k = len(k_sorted)
+
+    # Pack trajectories as row = k_idx * n_cosmo + cosmology_idx, so a block of
+    # BATCHES_PER_BLOCK consecutive rows shares one wave mode when
+    # n_cosmo >= BATCHES_PER_BLOCK: neighbouring threads then take near-identical
+    # adaptive steps, minimizing warp divergence.
+    n_traj = n_k * n_cosmo
+    params = np.empty((n_traj, N_PARAM), dtype=np.float64)
+    y0 = np.empty((n_traj, layout.nvar), dtype=np.float64)
+    for ci, cosmology in enumerate(prepared.cosmologies):
+        base = make_params(cosmology, k_sorted, float(prepared.tau0[ci]))
+        base[:, IX_COSMOLOGY] = float(ci)
+        params[ci::n_cosmo] = base
+        y0[ci::n_cosmo] = make_initial_states(cosmology, k_sorted, layout)
+    params = np.ascontiguousarray(params)
+    y0 = np.ascontiguousarray(y0)
+
+    # Each trajectory stops at its own tau0 (IX_TAU_END); the shared save grid
+    # runs to the largest tau0 and the trailing save slot holds each trajectory's
+    # final state.
+    t_span = np.asarray((TAU_START, float(np.max(prepared.tau0))), dtype=np.float64)
+
+    packed = (params, y0, t_span, order, k_sorted)
+    _PACKED_BATCH_CACHE[key] = packed
+    return packed
+
+
 def clear_prepared_solve_cache() -> None:
-    """Drop all cached prepared solves, releasing their device memory."""
+    """Drop all cached prepared and packed solves, releasing their device memory."""
 
     _PREPARED_SOLVE_CACHE.clear()
+    _PACKED_BATCH_CACHE.clear()
 
 
 def solve_perturbation_history(
@@ -1022,9 +1115,9 @@ def solve_perturbation_history(
 
     from .integrators import rodas5Pnumba_solve
 
-    prepared = _prepare_solve(cosmology)
+    prepared = _prepare_solve((cosmology,))
     layout = prepared.layout
-    tau0 = prepared.tables[3]
+    tau0 = float(prepared.tau0[0])
 
     k_arr = np.ascontiguousarray(np.asarray(k_values, dtype=np.float64))
     order = np.argsort(k_arr, kind="stable")
@@ -1058,7 +1151,7 @@ def solve_perturbation_history(
     hist_sorted = np.asarray(sol)  # (n_k, n_save, nvar)
     hist = np.empty_like(hist_sorted)
     hist[order] = hist_sorted
-    return hist, layout, prepared.tables
+    return hist, layout, prepared.tables[0]
 
 
 def solve_perturbations(k_values, cosmology, **solve_kwargs):
@@ -1096,4 +1189,74 @@ def solve_matter_power_spectrum(
         pk[i] = matter_power_spectrum(
             float(k), delta_m, cosmology.A_s, cosmology.n_s, cosmology.k_pivot
         )
+    return pk
+
+
+def solve_matter_power_spectrum_batch(
+    k_values,
+    cosmologies,
+    *,
+    rtol: float = PERTURB_RTOL,
+    atol: float = PERTURB_ATOL,
+    first_step: float = PERTURB_FIRST_STEP,
+    max_steps: int = PERTURB_MAX_STEPS,
+) -> np.ndarray:
+    """Return ``P(k)`` for a batch of cosmologies in one GPU solve.
+
+    All cosmologies must share a perturbation layout. The ``n_cosmologies * n_k``
+    trajectories are integrated by a single ``rodas5Pnumba`` launch, so the whole
+    batch amortizes one kernel compilation and one set of device buffers.
+
+    Returns
+    -------
+    np.ndarray
+        ``P(k)`` in Mpc^3, shape ``(n_cosmologies, n_k)``, in the caller's
+        original cosmology and ``k`` order.
+    """
+
+    from .integrators import rodas5Pnumba_solve
+
+    prepared = _prepare_solve(tuple(cosmologies))
+    cosmologies = prepared.cosmologies
+    layout = prepared.layout
+    n_cosmo = len(cosmologies)
+
+    params, y0, t_span, order, k_sorted = _pack_batch(prepared, k_values)
+    n_k = len(k_sorted)
+
+    sol = rodas5Pnumba_solve(
+        prepared.rhs,
+        prepared.jac,
+        y0,
+        t_span,
+        params,
+        time_jac_fn=prepared.time_jac,
+        lu_precision="fp32",
+        custom_lu_solver=prepared.lu_solver,
+        rtol=rtol,
+        atol=atol,
+        first_step=first_step,
+        max_steps=max_steps,
+        pcoeff=0.3,
+        icoeff=0.4,
+        batches_per_block=BATCHES_PER_BLOCK,
+        tf_local_idx=IX_TAU_END,
+    )
+    y_final = np.asarray(sol)[:, -1, :].reshape(n_k, n_cosmo, layout.nvar)
+
+    pk_sorted = np.empty((n_cosmo, n_k), dtype=np.float64)
+    for ci, cosmology in enumerate(cosmologies):
+        densities = density_coefficients(cosmology)
+        grhoc_val, grhob_val = densities[2], densities[3]
+        for ki in range(n_k):
+            yv = y_final[ki, ci]
+            delta_m = total_matter_density_contrast(
+                grhoc_val, yv[IX_CLXC], grhob_val, yv[IX_CLXB]
+            )
+            pk_sorted[ci, ki] = matter_power_spectrum(
+                float(k_sorted[ki]), delta_m, cosmology.A_s, cosmology.n_s, cosmology.k_pivot
+            )
+
+    pk = np.empty_like(pk_sorted)
+    pk[:, order] = pk_sorted
     return pk
