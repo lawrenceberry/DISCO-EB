@@ -24,6 +24,7 @@ the one-time XLA-FFI launcher shim, and ``jax`` with CUDA support.
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import numpy as np
 from scipy import interpolate
@@ -901,36 +902,48 @@ def jac(y, tau, p):
     return rhs, make_jac(), time_jac
 
 
-def solve_perturbation_history(
-    k_values,
-    cosmology,
-    *,
-    tau_save=None,
-    rtol: float = PERTURB_RTOL,
-    atol: float = PERTURB_ATOL,
-    first_step: float = PERTURB_FIRST_STEP,
-    max_steps: int = PERTURB_MAX_STEPS,
-):
-    """Solve the perturbation hierarchy and return the saved state history.
+class _PreparedSolve(NamedTuple):
+    """Compiled, cosmology-specific artifacts reused across solves."""
 
-    Parameters
-    ----------
-    tau_save : array_like, optional
-        Strictly increasing conformal times at which to record the state. The
-        first entry must be ``TAU_START`` and the last ``tau0``. Defaults to just
-        the two endpoints, i.e. the final state only. The line-of-sight CMB
-        integration needs a dense grid through recombination instead.
+    layout: object
+    tables: tuple
+    rhs: object
+    jac: object
+    time_jac: object
+    lu_solver: object
 
-    Returns
-    -------
-    (history, layout, tables)
-        ``history`` has shape ``(n_k, len(tau_save), nvar)`` in the caller's
-        original ``k`` order; ``tables`` is the ``build_thermo_tables`` tuple.
+
+_PREPARED_SOLVE_CACHE: dict = {}
+
+
+def _prepare_solve(cosmology) -> _PreparedSolve:
+    """Return (and cache) the compiled solve artifacts for ``cosmology``.
+
+    The thermodynamics tables, the numba-CUDA right-hand side / Jacobian device
+    functions, and the Schur-EB block-LU depend only on the cosmology (and the
+    module-level grid and quadrature presets), not on the wave modes, the save
+    times, or the solver tolerances. They are also what triggers the *slow*
+    numba-CUDA kernel compilation: the returned ``rhs`` / ``jac`` / ``time_jac``
+    closures and the :class:`SchurEBSolver` instance are the identity keys of
+    :func:`discoeb.integrators.rodas5Pnumba_solve`'s compiled-kernel cache, so
+    reusing the same objects across solves of the same cosmology turns a repeated
+    solve from a full recompile (tens of seconds) into a bare kernel launch.
+
+    The cache is unbounded and holds device memory (one thermodynamics table set
+    plus the compiled kernel per distinct cosmology); sweeping many cosmologies
+    accumulates GPU allocations. Call :func:`clear_prepared_solve_cache` to
+    release them.
     """
 
-    from .integrators import rodas5Pnumba_solve
     from .perturbation_layout import PerturbationLayout
     from .schur_eb import DENSE_IDX, K_BASES, DENSE_C0, A_SIZE, SchurEBSolver
+
+    # Include the presets that change the compiled artifacts, so a caller that
+    # rebinds them (e.g. NQMAX) does not get a stale kernel.
+    key = (cosmology, NQMAX, N_THERMO_GRID, TAU_START, BATCHES_PER_BLOCK)
+    cached = _PREPARED_SOLVE_CACHE.get(key)
+    if cached is not None:
+        return cached
 
     layout = PerturbationLayout.from_cosmology(cosmology, nqmax=NQMAX)
     if layout.has_massive_neutrinos and layout.lmaxnu - 2 != A_SIZE:
@@ -939,19 +952,8 @@ def solve_perturbation_history(
             f"massive-nu needs lmaxnu - 2 == {A_SIZE} (got {layout.lmaxnu})"
         )
 
-    k_arr = np.ascontiguousarray(np.asarray(k_values, dtype=np.float64))
-    order = np.argsort(k_arr, kind="stable")
-    k_sorted = k_arr[order]
-
     tables = build_thermo_tables(cosmology)
-    tau_grid, values, seconds, tau0 = tables
-    params = np.ascontiguousarray(make_params(cosmology, k_sorted, tau0))
-    y0 = np.ascontiguousarray(make_initial_states(cosmology, k_sorted, layout))
-    if tau_save is None:
-        t_span = np.asarray((TAU_START, tau0), dtype=np.float64)
-    else:
-        t_span = np.ascontiguousarray(np.asarray(tau_save, dtype=np.float64))
-
+    tau_grid, values, seconds, _tau0 = tables
     rhs, jac, time_jac = build_numba_callbacks(layout, tau_grid, values, seconds)
 
     # Assemble the bordered-block structure the Schur-EB solver factorizes:
@@ -980,15 +982,70 @@ def solve_perturbation_history(
         nvar=layout.nvar,
     )
 
+    prepared = _PreparedSolve(layout, tables, rhs, jac, time_jac, lu_solver)
+    _PREPARED_SOLVE_CACHE[key] = prepared
+    return prepared
+
+
+def clear_prepared_solve_cache() -> None:
+    """Drop all cached prepared solves, releasing their device memory."""
+
+    _PREPARED_SOLVE_CACHE.clear()
+
+
+def solve_perturbation_history(
+    k_values,
+    cosmology,
+    *,
+    tau_save=None,
+    rtol: float = PERTURB_RTOL,
+    atol: float = PERTURB_ATOL,
+    first_step: float = PERTURB_FIRST_STEP,
+    max_steps: int = PERTURB_MAX_STEPS,
+):
+    """Solve the perturbation hierarchy and return the saved state history.
+
+    Parameters
+    ----------
+    tau_save : array_like, optional
+        Strictly increasing conformal times at which to record the state. The
+        first entry must be ``TAU_START`` and the last ``tau0``. Defaults to just
+        the two endpoints, i.e. the final state only. The line-of-sight CMB
+        integration needs a dense grid through recombination instead.
+
+    Returns
+    -------
+    (history, layout, tables)
+        ``history`` has shape ``(n_k, len(tau_save), nvar)`` in the caller's
+        original ``k`` order; ``tables`` is the ``build_thermo_tables`` tuple.
+    """
+
+    from .integrators import rodas5Pnumba_solve
+
+    prepared = _prepare_solve(cosmology)
+    layout = prepared.layout
+    tau0 = prepared.tables[3]
+
+    k_arr = np.ascontiguousarray(np.asarray(k_values, dtype=np.float64))
+    order = np.argsort(k_arr, kind="stable")
+    k_sorted = k_arr[order]
+
+    params = np.ascontiguousarray(make_params(cosmology, k_sorted, tau0))
+    y0 = np.ascontiguousarray(make_initial_states(cosmology, k_sorted, layout))
+    if tau_save is None:
+        t_span = np.asarray((TAU_START, tau0), dtype=np.float64)
+    else:
+        t_span = np.ascontiguousarray(np.asarray(tau_save, dtype=np.float64))
+
     sol = rodas5Pnumba_solve(
-        rhs,
-        jac,
+        prepared.rhs,
+        prepared.jac,
         y0,
         t_span,
         params,
-        time_jac_fn=time_jac,
+        time_jac_fn=prepared.time_jac,
         lu_precision="fp32",
-        custom_lu_solver=lu_solver,
+        custom_lu_solver=prepared.lu_solver,
         rtol=rtol,
         atol=atol,
         first_step=first_step,
@@ -1001,7 +1058,7 @@ def solve_perturbation_history(
     hist_sorted = np.asarray(sol)  # (n_k, n_save, nvar)
     hist = np.empty_like(hist_sorted)
     hist[order] = hist_sorted
-    return hist, layout, tables
+    return hist, layout, prepared.tables
 
 
 def solve_perturbations(k_values, cosmology, **solve_kwargs):
