@@ -6,6 +6,7 @@ tests can choose representative models without making the library endorse a
 single default data set.
 """
 
+from discoeb.constants import NEUTRINO_TEMPERATURE_FACTOR
 from discoeb.cosmology import Cosmology
 
 
@@ -171,6 +172,13 @@ def cosmology_to_class_params(cosmology: Cosmology, *, output: str = "tCl") -> d
             "N_ncdm": 1,
             "m_ncdm": cosmology.mnu,
             "deg_ncdm": cosmology.num_massive_neutrinos,
+            # DISCO-EB gives every neutrino the instantaneous-decoupling
+            # temperature T_nu = (4/11)^(1/3) T_cmb, absorbing the non-instantaneous
+            # correction into N_eff = 3.046. CLASS instead defaults its ncdm species
+            # to T_ncdm = 0.71611, which carries that correction in the temperature
+            # and inflates rho_ncdm by (0.71611/0.713766)^4 = 1.0132. Pin CLASS to
+            # our convention or the massive-neutrino density differs by 1.3%.
+            "T_ncdm": NEUTRINO_TEMPERATURE_FACTOR,
         }
 
     if cosmology.w_DE_0 != -1.0 or cosmology.w_DE_a != 0.0:
