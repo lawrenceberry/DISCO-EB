@@ -29,13 +29,32 @@ from cosmologies import BENCHMARK_COSMOLOGIES
 
 DEFAULT_COSMOLOGY = BENCHMARK_COSMOLOGIES["planck_2018_flat_lcdm"]
 
+# The scalar equations in discoeb.perturbations are the flat-massless LambdaCDM
+# hierarchy: they consume only the five coefficients (g, r, c, b, v) and know
+# nothing of curvature, massive neutrinos or dynamical dark energy (those enter
+# the numba solve in perturbations_system and are covered there). Parametrizing
+# over every benchmark therefore exercises the same algebraic identities across
+# the full spread of realistic density coefficients.
 COSMOLOGY_CASES = [
-    pytest.param(DEFAULT_COSMOLOGY, id="planck_2018_flat_lcdm"),
+    pytest.param(BENCHMARK_COSMOLOGIES[name], id=name)
+    for name in (
+        "planck_2018_flat_lcdm",
+        "planck_2018_curved_lcdm",
+        "desi_2024_dynamical_dark_energy",
+        "planck_2018_flat_lcdm_massive_nu",
+    )
 ]
 
 
 def density_coefficients(cosmology) -> tuple[float, float, float, float, float]:
-    """Return the ``grho`` density coefficients ``(g, r, c, b, v)`` for a cosmology."""
+    """Return the ``grho`` density coefficients ``(g, r, c, b, v)`` for a cosmology.
+
+    ``v`` uses the flat-massless flatness closure, so ``g + r + c + b + v`` equals
+    ``3 H_0^2`` and ``hubble_a(1, ...) = H_0`` for every cosmology. This is the
+    coefficient set the flat-massless scalar equations under test are built for;
+    the solver's budget closure (which additionally subtracts the massive-neutrino
+    and curvature densities) is exercised in ``test_perturbations_system.py``.
+    """
 
     grhog_value = grhog(cosmology.T_cmb)
     return (
