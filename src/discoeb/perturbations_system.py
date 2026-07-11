@@ -1091,6 +1091,7 @@ def solve_perturbation_history(
     cosmology,
     *,
     tau_save=None,
+    as_jax: bool = False,
     rtol: float = PERTURB_RTOL,
     atol: float = PERTURB_ATOL,
     first_step: float = PERTURB_FIRST_STEP,
@@ -1105,6 +1106,12 @@ def solve_perturbation_history(
         first entry must be ``TAU_START`` and the last ``tau0``. Defaults to just
         the two endpoints, i.e. the final state only. The line-of-sight CMB
         integration needs a dense grid through recombination instead.
+    as_jax : bool, optional
+        Return the history as a device-resident JAX array instead of copying it
+        back to host NumPy. The solver's output already lives on the GPU (the
+        numba kernel is invoked through a JAX FFI custom call), so this keeps the
+        whole downstream pipeline -- e.g. the CMB source construction and
+        line-of-sight projection -- on device with no host round-trip.
 
     Returns
     -------
@@ -1148,10 +1155,17 @@ def solve_perturbation_history(
         batches_per_block=BATCHES_PER_BLOCK,
         tf_local_idx=IX_TAU_END,
     )
+    # The solver returns trajectories in ascending-k order; undo the sort. The
+    # inverse permutation is a host-side constant, so the reorder is a plain
+    # gather that works equally on device (JAX) or host (NumPy).
+    inv_order = np.argsort(order)
+    if as_jax:
+        import jax.numpy as jnp
+
+        return jnp.asarray(sol)[jnp.asarray(inv_order)], layout, prepared.tables[0]
+
     hist_sorted = np.asarray(sol)  # (n_k, n_save, nvar)
-    hist = np.empty_like(hist_sorted)
-    hist[order] = hist_sorted
-    return hist, layout, prepared.tables[0]
+    return hist_sorted[inv_order], layout, prepared.tables[0]
 
 
 def solve_perturbations(k_values, cosmology, **solve_kwargs):

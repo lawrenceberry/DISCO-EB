@@ -32,10 +32,12 @@ host. Ported from the DISCO2 prototype's ``cmb.py``.
 
 from __future__ import annotations
 
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
-from scipy import integrate, interpolate, special
+from scipy import integrate, special
 
 from .background import dtau_da, grhoa4
 from .perturbations import (
@@ -61,6 +63,7 @@ from .perturbations_system import (
     density_coefficients,
     solve_perturbation_history,
 )
+from .spline_interpolation import spline_interpolation
 
 DEFAULT_CMB_K = np.geomspace(1.0e-4, 1.0, 128, dtype=np.float64)
 """Default perturbation wave modes (Mpc^-1) for a CMB solve."""
@@ -323,10 +326,8 @@ def _interp_uniform_table(x, x0, inv_dx, n_x, vals):
     return (1.0 - frac) * vals[idx] + frac * vals[idx + 1]
 
 
-def theta_ell_transfer_function(
-    ells, k_values, tau, S, tau0, S_j1=None, S_j2=None, *, bessel_dx: float = 0.03
-):
-    """Return the temperature transfer function ``Theta_l(k)``, shape ``(n_k, n_ell)``.
+def theta_ell_from_tables(ells, k_values, tau, S, tau0, S_j1, S_j2, bessel):
+    """Return ``Theta_l(k)`` given prebuilt Bessel tables. Pure JAX, jittable.
 
     Derivatives of ``j_l`` come from the recurrences
     ``j_l' = (l/x) j_l - j_{l+1}`` and
@@ -340,20 +341,22 @@ def theta_ell_transfer_function(
     that the finite ``tau`` and ``k`` grids cannot resolve, so integrating them
     injects aliasing noise rather than signal. Without the upper cut the damping
     tail is inflated by several percent (``+6%`` at ``l = 500``).
+
+    ``ells`` is a float array (the multipole values enter the recurrences
+    arithmetically); ``bessel`` is the tuple returned by
+    :func:`_build_bessel_tables`.
     """
 
-    ell_arr = np.atleast_1d(np.asarray(ells, dtype=np.int64))
+    x0, inv_dx, n_x, jl_tab, jl1_tab = bessel
     k = jnp.asarray(k_values, dtype=jnp.float64)
     tau = jnp.asarray(tau, dtype=jnp.float64)
     S = jnp.asarray(S, dtype=jnp.float64)
-    S_j1 = jnp.zeros_like(S) if S_j1 is None else jnp.asarray(S_j1, dtype=jnp.float64)
-    S_j2 = jnp.zeros_like(S) if S_j2 is None else jnp.asarray(S_j2, dtype=jnp.float64)
+    S_j1 = jnp.asarray(S_j1, dtype=jnp.float64)
+    S_j2 = jnp.asarray(S_j2, dtype=jnp.float64)
+    ells = jnp.asarray(ells, dtype=jnp.float64)
 
     chi = jnp.asarray(tau0, dtype=jnp.float64) - tau
     x = k[:, None] * chi
-    x0, inv_dx, n_x, jl_tab, jl1_tab = _build_bessel_tables(
-        ell_arr, float(jnp.max(x)) + 2.0, bessel_dx
-    )
 
     # Comoving distance to the peak of the source (last scattering), which sets
     # the k -> l mapping k ~ l / chi_star.
@@ -376,10 +379,31 @@ def theta_ell_transfer_function(
         k_hi = (ell_value + 2500.0) / chi_star
         return jnp.where((k >= k_lo) & (k <= k_hi), theta_ell, 0.0)
 
-    theta = jax.vmap(one_ell)(
-        jnp.arange(ell_arr.size), jnp.asarray(ell_arr, dtype=jnp.float64)
-    )
+    theta = jax.vmap(one_ell)(jnp.arange(ells.shape[0]), ells)
     return theta.T
+
+
+def theta_ell_transfer_function(
+    ells, k_values, tau, S, tau0, S_j1=None, S_j2=None, *, bessel_dx: float = 0.03
+):
+    """Return the temperature transfer function ``Theta_l(k)``, shape ``(n_k, n_ell)``.
+
+    Convenience wrapper: builds (and caches) the spherical-Bessel tables sized to
+    the data, then calls the jittable :func:`theta_ell_from_tables`.
+    """
+
+    ell_arr = np.atleast_1d(np.asarray(ells, dtype=np.int64))
+    S = jnp.asarray(S, dtype=jnp.float64)
+    S_j1 = jnp.zeros_like(S) if S_j1 is None else S_j1
+    S_j2 = jnp.zeros_like(S) if S_j2 is None else S_j2
+
+    chi = jnp.asarray(tau0, dtype=jnp.float64) - jnp.asarray(tau, dtype=jnp.float64)
+    x_max = float(jnp.max(jnp.asarray(k_values, dtype=jnp.float64)[:, None] * chi)) + 2.0
+    bessel = _build_bessel_tables(ell_arr, x_max, bessel_dx)
+
+    return theta_ell_from_tables(
+        ell_arr.astype(np.float64), k_values, tau, S, tau0, S_j1, S_j2, bessel
+    )
 
 
 def compute_Cell(theta_ell, kmodes, n_s, k_p):
@@ -585,19 +609,61 @@ def cmb_tau_grid(cosmology, k_values, n: int, *, n_eval: int = 10000) -> np.ndar
 # =============================================================================
 
 
-def _interpolate_sources_to_fine_k(k_values, channels, k_fine):
-    """Akima-interpolate each source channel from the solve grid onto a finer ``k``."""
+def interpolate_sources_to_fine_k(k_values, channels, k_fine):
+    """Cubic-spline each source channel from the solve grid onto a finer ``k``.
 
-    log_k = np.log(np.asarray(k_values, dtype=np.float64))
-    log_k_fine = np.log(np.asarray(k_fine, dtype=np.float64))
-    out = []
-    for channel in channels:
-        channel = np.asarray(channel, dtype=np.float64)
-        fine = np.empty((log_k_fine.size, channel.shape[1]), dtype=np.float64)
-        for it in range(channel.shape[1]):
-            fine[:, it] = interpolate.Akima1DInterpolator(log_k, channel[:, it])(log_k_fine)
-        out.append(fine)
-    return out
+    Runs entirely on device: :class:`discoeb.spline_interpolation.spline_interpolation`
+    builds one natural cubic spline per conformal-time sample in a single batched
+    call (the spline's second axis is the batch), so a channel of shape
+    ``(n_k, n_tau)`` is resampled to ``(n_k_fine, n_tau)`` without any host loop.
+    Interpolating in ``log k`` matches the geometric spacing of both grids.
+    """
+
+    log_k = jnp.log(jnp.asarray(k_values, dtype=jnp.float64))
+    log_k_fine = jnp.log(jnp.asarray(k_fine, dtype=jnp.float64))
+    return [
+        spline_interpolation(log_k, jnp.asarray(channel, dtype=jnp.float64)).evaluate(
+            log_k_fine
+        )
+        for channel in channels
+    ]
+
+
+@partial(jax.jit, static_argnames=["n_s", "k_pivot", "A_s", "T_cmb"])
+def cmb_spectrum_from_sources(
+    hist,
+    tau_save,
+    a_save,
+    opacity_save,
+    k_values,
+    k_fine,
+    dens,
+    tau0,
+    ells,
+    bessel,
+    *,
+    n_s,
+    k_pivot,
+    A_s,
+    T_cmb,
+):
+    """Return ``(C_l, D_l)`` from a device-resident perturbation history.
+
+    This is the whole numerical pipeline downstream of the perturbation solve --
+    source construction, the ``log k`` cubic-spline refinement, the line-of-sight
+    Bessel projection, and the ``C_l`` quadrature -- as a single jitted JAX
+    function. Every argument is a device array (or a static scalar), so the graph
+    is compiled once and runs entirely on the GPU; it composes into a larger JAX
+    program without a host round-trip.
+    """
+
+    src = source_functions(hist, tau_save, a_save, k_values, opacity_save, dens)
+    s_j0, s_j1, s_j2 = interpolate_sources_to_fine_k(
+        k_values, (src["S"], src["S_j1"], src["S_j2"]), k_fine
+    )
+    theta = theta_ell_from_tables(ells, k_fine, tau_save, s_j0, tau0, s_j1, s_j2, bessel)
+    cl = cl_power_spectrum(theta, k_fine, n_s, k_pivot, A_s)
+    return cl, dl_power_spectrum(cl, ells, T_cmb)
 
 
 def compute_cl_power_spectrum(
@@ -615,6 +681,17 @@ def compute_cl_power_spectrum(
     Runs the numba-CUDA perturbation solve on ``k_values``, builds the
     line-of-sight sources on the saved ``tau`` grid, refines them in ``k``, and
     projects them onto spherical Bessel functions.
+
+    Everything numerical happens on the GPU and ``C_l`` / ``D_l`` are returned as
+    device-resident JAX arrays: the perturbation history stays on device (the
+    numba kernel is invoked through a JAX FFI custom call) and is consumed by the
+    jitted :func:`cmb_spectrum_from_sources`, so the spectrum can be embedded in a
+    larger JAX program without a host round-trip.
+
+    The *setup* -- the adaptive ``k`` and ``tau`` grids, the thermodynamics
+    tables, and the spherical-Bessel tables -- is host-side, cosmology-dependent
+    precomputation (it uses SciPy quadrature and the RECFAST solve). It is cached,
+    so it is paid once per cosmology rather than per evaluation.
     """
 
     if k_values is None:
@@ -626,16 +703,9 @@ def compute_cl_power_spectrum(
 
     tau_save = cmb_tau_grid(cosmology, k_values, n_save)
     hist, _, tables = solve_perturbation_history(
-        k_values, cosmology, tau_save=tau_save, **solve_kwargs
+        k_values, cosmology, tau_save=tau_save, as_jax=True, **solve_kwargs
     )
     tau_grid, values, _, tau0 = tables
-
-    # a(tau) and kappa'(tau) on the save grid, from the thermodynamics tables.
-    a_save = np.interp(tau_save, tau_grid, values[0])
-    opacity_save = np.interp(tau_save, tau_grid, values[1])
-
-    dens = density_coefficients(cosmology)
-    src = source_functions(hist, tau_save, a_save, k_values, opacity_save, dens)
 
     if k_fine_values is None:
         k_fine = cmb_k_grid(
@@ -646,11 +716,32 @@ def compute_cl_power_spectrum(
     else:
         k_fine = np.asarray(k_fine_values, dtype=np.float64)
 
-    s_j0, s_j1, s_j2 = _interpolate_sources_to_fine_k(
-        k_values, (src["S"], src["S_j1"], src["S_j2"]), k_fine
+    # a(tau) and kappa'(tau) on the save grid, from the thermodynamics tables.
+    a_save = jnp.interp(
+        jnp.asarray(tau_save), jnp.asarray(tau_grid), jnp.asarray(values[0])
+    )
+    opacity_save = jnp.interp(
+        jnp.asarray(tau_save), jnp.asarray(tau_grid), jnp.asarray(values[1])
     )
 
-    theta = theta_ell_transfer_function(ells, k_fine, tau_save, s_j0, tau0, s_j1, s_j2)
-    cl = cl_power_spectrum(theta, k_fine, cosmology.n_s, cosmology.k_pivot, cosmology.A_s)
-    dl = dl_power_spectrum(cl, ells, cosmology.T_cmb)
-    return ells, np.asarray(cl), np.asarray(dl)
+    # Bessel tables are cached per (ells, x_max, dx) and uploaded once.
+    chi_max = float(tau0 - tau_save[0])
+    bessel = _build_bessel_tables(ells, float(np.max(k_fine)) * chi_max + 2.0, 0.03)
+
+    cl, dl = cmb_spectrum_from_sources(
+        hist,
+        jnp.asarray(tau_save),
+        a_save,
+        opacity_save,
+        jnp.asarray(k_values),
+        jnp.asarray(k_fine),
+        tuple(float(d) for d in density_coefficients(cosmology)),
+        float(tau0),
+        jnp.asarray(ells, dtype=jnp.float64),
+        bessel,
+        n_s=float(cosmology.n_s),
+        k_pivot=float(cosmology.k_pivot),
+        A_s=float(cosmology.A_s),
+        T_cmb=float(cosmology.T_cmb),
+    )
+    return ells, cl, dl
