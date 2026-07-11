@@ -32,8 +32,6 @@ host. Ported from the DISCO2 prototype's ``cmb.py``.
 
 from __future__ import annotations
 
-from functools import partial
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -51,6 +49,7 @@ from .perturbations import (
     LMAX_G,
     LMAX_NR,
     LMAX_POL,
+    NVAR,
     anisotropic_stress,
     comoving_densities,
     density_perturbation,
@@ -61,7 +60,6 @@ from .perturbations_system import (
     TAU_START,
     build_thermo_tables,
     density_coefficients,
-    solve_perturbation_history,
 )
 from .spline_interpolation import spline_interpolation
 
@@ -570,19 +568,25 @@ def cmb_k_grid(
     return grid
 
 
-def cmb_tau_grid(cosmology, k_values, n: int, *, n_eval: int = 10000) -> np.ndarray:
+def cmb_tau_grid(
+    cosmology, k_values, n: int, *, tau_end: float | None = None, n_eval: int = 10000
+) -> np.ndarray:
     """Return a nonuniform conformal-time grid on which to save the sources.
 
     The sources are sharply peaked at recombination (width ``delta_tau_rec``),
     modulated on the sound-horizon scale, and have a secondary bump at
     reionization, so the sampling density is the cube root of the sum of those
-    three weights. Endpoints are pinned to ``[TAU_START, tau0]``, which the
+    three weights. Endpoints are pinned to ``[TAU_START, tau_end]``, which the
     solver's save grid requires.
+
+    ``tau_end`` defaults to this cosmology's ``tau0``. A batch of cosmologies
+    passes the *largest* ``tau0`` of the batch so that no trajectory's save grid
+    is cut short; the shaping weights still come from ``cosmology``.
     """
 
     k_arr = np.asarray(k_values, dtype=np.float64)
     s = _cmb_grid_summary(cosmology)
-    tau0 = s["tau0"]
+    tau0 = s["tau0"] if tau_end is None else float(tau_end)
 
     tau = np.linspace(TAU_START, tau0, n_eval, dtype=np.float64)
     weight = (
@@ -629,7 +633,7 @@ def interpolate_sources_to_fine_k(k_values, channels, k_fine):
     ]
 
 
-@partial(jax.jit, static_argnames=["n_s", "k_pivot", "A_s", "T_cmb"])
+@jax.jit
 def cmb_spectrum_from_sources(
     hist,
     tau_save,
@@ -641,7 +645,6 @@ def cmb_spectrum_from_sources(
     tau0,
     ells,
     bessel,
-    *,
     n_s,
     k_pivot,
     A_s,
@@ -652,15 +655,26 @@ def cmb_spectrum_from_sources(
     This is the whole numerical pipeline downstream of the perturbation solve --
     source construction, the ``log k`` cubic-spline refinement, the line-of-sight
     Bessel projection, and the ``C_l`` quadrature -- as a single jitted JAX
-    function. Every argument is a device array (or a static scalar), so the graph
-    is compiled once and runs entirely on the GPU; it composes into a larger JAX
-    program without a host round-trip.
+    function. Every argument is a device array, so the graph is compiled once and
+    runs entirely on the GPU; it composes into a larger JAX program without a host
+    round-trip.
+
+    ``tau_save`` may extend past this cosmology's ``tau0`` (a batch of cosmologies
+    shares one save grid, sized to the largest ``tau0``). Beyond ``tau0`` the
+    solver holds each trajectory's frozen final state, which is not physical
+    source data, so the opacity is zeroed there first -- making the optical depth
+    integrate backwards from *this* cosmology's ``tau0``, where ``kappa = 0`` by
+    definition -- and the sources are zeroed before the projection.
     """
 
+    live = tau_save <= tau0
+    opacity_save = jnp.where(live, opacity_save, 0.0)
+
     src = source_functions(hist, tau_save, a_save, k_values, opacity_save, dens)
-    s_j0, s_j1, s_j2 = interpolate_sources_to_fine_k(
-        k_values, (src["S"], src["S_j1"], src["S_j2"]), k_fine
-    )
+    mask = live[None, :]
+    channels = tuple(jnp.where(mask, src[name], 0.0) for name in ("S", "S_j1", "S_j2"))
+
+    s_j0, s_j1, s_j2 = interpolate_sources_to_fine_k(k_values, channels, k_fine)
     theta = theta_ell_from_tables(ells, k_fine, tau_save, s_j0, tau0, s_j1, s_j2, bessel)
     cl = cl_power_spectrum(theta, k_fine, n_s, k_pivot, A_s)
     return cl, dl_power_spectrum(cl, ells, T_cmb)
@@ -701,47 +715,137 @@ def compute_cl_power_spectrum(
     k_values = np.asarray(k_values, dtype=np.float64)
     ells = np.asarray(ells, dtype=np.int64)
 
-    tau_save = cmb_tau_grid(cosmology, k_values, n_save)
-    hist, _, tables = solve_perturbation_history(
-        k_values, cosmology, tau_save=tau_save, as_jax=True, **solve_kwargs
+    ells_out, cl, dl = compute_cl_power_spectrum_batch(
+        [cosmology],
+        k_values=k_values,
+        ells=ells,
+        n_save=n_save,
+        n_k_fine=n_k_fine,
+        k_fine_values=k_fine_values,
+        **solve_kwargs,
     )
-    tau_grid, values, _, tau0 = tables
+    return ells_out, cl[0], dl[0]
+
+
+CMB_HISTORY_BUDGET_BYTES = 2.0e9
+"""Peak device memory allowed for one chunk's saved perturbation history.
+
+The CMB records the full hierarchy at every ``tau`` sample, so the history is
+``n_cosmologies * n_k * n_tau * nvar * 8`` bytes -- 6.5 GB for 128 cosmologies at
+128 modes and 1000 save points, which alone exhausts a 12 GB GPU. Cosmologies are
+therefore solved in chunks sized to this budget.
+"""
+
+
+def _cmb_chunk_size(n_cosmologies, n_k, n_tau, nvar) -> int:
+    """Return how many cosmologies can share one solve without blowing the budget."""
+
+    per_cosmology = n_k * n_tau * nvar * 8
+    chunk = int(CMB_HISTORY_BUDGET_BYTES // max(per_cosmology, 1))
+    return max(1, min(n_cosmologies, chunk))
+
+
+def compute_cl_power_spectrum_batch(
+    cosmologies,
+    *,
+    k_values: np.ndarray | None = None,
+    ells: np.ndarray | None = None,
+    n_save: int = 1000,
+    n_k_fine: int = 1500,
+    k_fine_values: np.ndarray | None = None,
+    chunk_size: int | None = None,
+    **solve_kwargs,
+):
+    """Return ``(ells, C_l, D_l)`` for a batch of cosmologies, shape ``(N, n_ell)``.
+
+    Cosmologies are solved in chunks; within a chunk all ``n_chunk * n_k``
+    trajectories are integrated by a *single* GPU launch on a shared ``tau`` save
+    grid (sized to the largest ``tau0`` in the batch, with each cosmology's own
+    ``tau0`` respected by the mask in :func:`cmb_spectrum_from_sources`). The
+    wave-mode and fine-``k`` grids come from the first cosmology, so the whole
+    batch shares one set of Bessel tables.
+
+    Two things are deliberately *not* done batch-wide, both for memory:
+
+    * the saved history is chunked (see :data:`CMB_HISTORY_BUDGET_BYTES`) --
+      unlike the matter power spectrum, which saves 2 time points, the CMB saves
+      ~1000, so a 128-cosmology history is 6.5 GB;
+    * the line-of-sight projection runs one cosmology at a time rather than
+      vmapped, because it materializes ``(n_ell, n_k_fine, n_tau)`` Bessel
+      intermediates -- tens of GB if batched. At ~10 ms per cosmology the solve
+      still dominates.
+    """
+
+    from .perturbations_system import solve_perturbation_history_batch
+
+    cosmologies = tuple(cosmologies)
+    base = cosmologies[0]
+
+    if k_values is None:
+        k_values = cmb_k_grid(base, n=128, mode="ode")
+    if ells is None:
+        ells = DEFAULT_CMB_ELLS
+    k_values = np.asarray(k_values, dtype=np.float64)
+    ells = np.asarray(ells, dtype=np.int64)
+
+    # One save grid for the whole batch, shaped by the first cosmology but
+    # extended to the largest tau0 so no trajectory's grid is cut short.
+    tau0_all = np.array([build_thermo_tables(c)[3] for c in cosmologies])
+    tau_save = cmb_tau_grid(base, k_values, n_save, tau_end=float(np.max(tau0_all)))
 
     if k_fine_values is None:
         k_fine = cmb_k_grid(
-            cosmology, n=n_k_fine, mode="cl",
+            base, n=n_k_fine, mode="cl",
             k_min=float(k_values[0]), k_max=float(k_values[-1]),
             ell_max=int(np.max(ells)),
         )
     else:
         k_fine = np.asarray(k_fine_values, dtype=np.float64)
 
-    # a(tau) and kappa'(tau) on the save grid, from the thermodynamics tables.
-    a_save = jnp.interp(
-        jnp.asarray(tau_save), jnp.asarray(tau_grid), jnp.asarray(values[0])
-    )
-    opacity_save = jnp.interp(
-        jnp.asarray(tau_save), jnp.asarray(tau_grid), jnp.asarray(values[1])
-    )
-
-    # Bessel tables are cached per (ells, x_max, dx) and uploaded once.
-    chi_max = float(tau0 - tau_save[0])
+    # Bessel tables are cached per (ells, x_max, dx) and shared by the batch.
+    chi_max = float(np.max(tau0_all) - tau_save[0])
     bessel = _build_bessel_tables(ells, float(np.max(k_fine)) * chi_max + 2.0, 0.03)
 
-    cl, dl = cmb_spectrum_from_sources(
-        hist,
-        jnp.asarray(tau_save),
-        a_save,
-        opacity_save,
-        jnp.asarray(k_values),
-        jnp.asarray(k_fine),
-        tuple(float(d) for d in density_coefficients(cosmology)),
-        float(tau0),
-        jnp.asarray(ells, dtype=jnp.float64),
-        bessel,
-        n_s=float(cosmology.n_s),
-        k_pivot=float(cosmology.k_pivot),
-        A_s=float(cosmology.A_s),
-        T_cmb=float(cosmology.T_cmb),
-    )
-    return ells, cl, dl
+    tau_save_d = jnp.asarray(tau_save)
+    k_fine_d = jnp.asarray(k_fine)
+    ells_d = jnp.asarray(ells, dtype=jnp.float64)
+
+    if chunk_size is None:
+        chunk_size = _cmb_chunk_size(
+            len(cosmologies), len(k_values), len(tau_save), NVAR
+        )
+
+    cls, dls = [], []
+    for start in range(0, len(cosmologies), chunk_size):
+        chunk = cosmologies[start : start + chunk_size]
+
+        # hist is (n_k, n_chunk, n_tau, nvar) with k ascending; slicing one
+        # cosmology out copies ~50 MB, versus GBs to transpose the whole history.
+        hist, k_sorted, prepared = solve_perturbation_history_batch(
+            k_values, chunk, tau_save=tau_save, **solve_kwargs
+        )
+        k_sorted_d = jnp.asarray(k_sorted)
+
+        for ci, cosmology in enumerate(chunk):
+            tau_grid, values, _, tau0 = prepared.tables[ci]
+            cl, dl = cmb_spectrum_from_sources(
+                hist[:, ci],
+                tau_save_d,
+                jnp.interp(tau_save_d, jnp.asarray(tau_grid), jnp.asarray(values[0])),
+                jnp.interp(tau_save_d, jnp.asarray(tau_grid), jnp.asarray(values[1])),
+                k_sorted_d,
+                k_fine_d,
+                tuple(float(d) for d in density_coefficients(cosmology)),
+                float(tau0),
+                ells_d,
+                bessel,
+                float(cosmology.n_s),
+                float(cosmology.k_pivot),
+                float(cosmology.A_s),
+                float(cosmology.T_cmb),
+            )
+            cls.append(cl)
+            dls.append(dl)
+        del hist  # release the chunk's history before the next launch
+
+    return ells, jnp.stack(cls), jnp.stack(dls)

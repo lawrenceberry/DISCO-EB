@@ -190,7 +190,28 @@ N_RECOMB_Z = 2048
 """Number of redshift samples for the background_system recombination solve."""
 
 
+_THERMO_TABLE_CACHE: dict = {}
+
+
 def build_thermo_tables(cosmology, n_grid: int = N_THERMO_GRID):
+    """Cached wrapper around :func:`_build_thermo_tables`.
+
+    Each call runs a full RECFAST recombination solve plus the background
+    quadrature, so it is far too expensive to repeat per evaluation -- a CMB batch
+    needs every cosmology's ``tau0`` up front *and* again inside the solve
+    preparation. The tables depend only on ``(cosmology, n_grid)``, so memoize
+    them.
+    """
+
+    key = (cosmology, n_grid)
+    cached = _THERMO_TABLE_CACHE.get(key)
+    if cached is None:
+        cached = _build_thermo_tables(cosmology, n_grid)
+        _THERMO_TABLE_CACHE[key] = cached
+    return cached
+
+
+def _build_thermo_tables(cosmology, n_grid: int = N_THERMO_GRID):
     """Return ``(tau_grid, values, seconds, tau0)`` thermodynamics spline tables.
 
     ``values`` has rows ``(a, kappa', c_s,b^2)`` sampled on a uniform ``log(tau)``
@@ -1031,19 +1052,25 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
     return prepared
 
 
-def _pack_batch(prepared, k_values):
+def _pack_batch(prepared, k_values, tau_save=None):
     """Return (and cache) the packed ``(params, y0, t_span, order, k_sorted)``.
 
     Building the packed inputs means one :func:`make_initial_states` per cosmology
     -- i.e. ``n_cosmologies * n_k`` scalar :func:`adiabatic_initial_conditions`
     calls, tens of milliseconds for a large batch. That work depends only on the
     cosmologies and the wave modes (not the solver tolerances), so it is cached
-    on ``(cosmologies, k)``; a repeated solve of the same batch then skips
-    straight to the kernel launch, matching the DISCO2 prepared-solve behaviour.
+    on ``(cosmologies, k, tau_save)``; a repeated solve of the same batch then
+    skips straight to the kernel launch, matching the DISCO2 prepared-solve
+    behaviour.
+
+    ``tau_save`` is the shared grid of conformal times at which every trajectory
+    is recorded (the CMB line-of-sight integration needs a dense one). It
+    defaults to just the two endpoints, i.e. the final state only.
     """
 
     k_arr = np.ascontiguousarray(np.asarray(k_values, dtype=np.float64))
-    key = (prepared.cosmologies, k_arr.shape, k_arr.tobytes())
+    tau_key = None if tau_save is None else np.asarray(tau_save, np.float64).tobytes()
+    key = (prepared.cosmologies, k_arr.shape, k_arr.tobytes(), tau_key)
     cached = _PACKED_BATCH_CACHE.get(key)
     if cached is not None:
         return cached
@@ -1072,7 +1099,10 @@ def _pack_batch(prepared, k_values):
     # Each trajectory stops at its own tau0 (IX_TAU_END); the shared save grid
     # runs to the largest tau0 and the trailing save slot holds each trajectory's
     # final state.
-    t_span = np.asarray((TAU_START, float(np.max(prepared.tau0))), dtype=np.float64)
+    if tau_save is None:
+        t_span = np.asarray((TAU_START, float(np.max(prepared.tau0))), dtype=np.float64)
+    else:
+        t_span = np.ascontiguousarray(np.asarray(tau_save, dtype=np.float64))
 
     packed = (params, y0, t_span, order, k_sorted)
     _PACKED_BATCH_CACHE[key] = packed
@@ -1084,6 +1114,7 @@ def clear_prepared_solve_cache() -> None:
 
     _PREPARED_SOLVE_CACHE.clear()
     _PACKED_BATCH_CACHE.clear()
+    _THERMO_TABLE_CACHE.clear()
 
 
 def solve_perturbation_history(
@@ -1166,6 +1197,75 @@ def solve_perturbation_history(
 
     hist_sorted = np.asarray(sol)  # (n_k, n_save, nvar)
     return hist_sorted[inv_order], layout, prepared.tables[0]
+
+
+def solve_perturbation_history_batch(
+    k_values,
+    cosmologies,
+    *,
+    tau_save,
+    rtol: float = PERTURB_RTOL,
+    atol: float = PERTURB_ATOL,
+    first_step: float = PERTURB_FIRST_STEP,
+    max_steps: int = PERTURB_MAX_STEPS,
+):
+    """Solve a batch of cosmologies on a shared ``tau_save`` grid in one launch.
+
+    All ``n_cosmologies * n_k`` trajectories are integrated by a single
+    ``rodas5Pnumba`` launch. Each trajectory still stops at its *own* ``tau0``
+    (via ``IX_TAU_END``), so save times beyond a cosmology's ``tau0`` simply hold
+    its frozen final state -- consumers must mask them (see
+    :func:`discoeb.cmb.cmb_spectrum_from_sources`).
+
+    Returns
+    -------
+    (history, k_sorted, prepared)
+        ``history`` is a device-resident JAX array of shape
+        ``(n_k, n_cosmologies, len(tau_save), nvar)``, with the wave modes in
+        **ascending** order (``k_sorted``).
+
+        The history is deliberately left in this layout: it is the solver's own
+        packing, so the reshape is a free view. Transposing to a cosmology-major
+        layout, or gathering the wave modes back into the caller's order, would
+        each need a full second copy of the array -- 6.5 GB for a 128-cosmology,
+        1000-save-point batch, enough to exhaust a 12 GB GPU on its own. Ascending
+        ``k`` is what the downstream spline and the ``dln k`` quadrature want
+        anyway.
+    """
+
+    import jax.numpy as jnp
+
+    from .integrators import rodas5Pnumba_solve
+
+    prepared = _prepare_solve(tuple(cosmologies))
+    layout = prepared.layout
+    n_cosmo = len(prepared.cosmologies)
+
+    params, y0, t_span, order, k_sorted = _pack_batch(prepared, k_values, tau_save)
+    n_k = len(k_sorted)
+
+    sol = rodas5Pnumba_solve(
+        prepared.rhs,
+        prepared.jac,
+        y0,
+        t_span,
+        params,
+        time_jac_fn=prepared.time_jac,
+        lu_precision="fp32",
+        custom_lu_solver=prepared.lu_solver,
+        rtol=rtol,
+        atol=atol,
+        first_step=first_step,
+        max_steps=max_steps,
+        pcoeff=0.3,
+        icoeff=0.4,
+        batches_per_block=BATCHES_PER_BLOCK,
+        tf_local_idx=IX_TAU_END,
+    )
+    # Rows are packed k-major (row = k_idx * n_cosmo + cosmology_idx), so this
+    # reshape is a free view -- no copy of the (potentially multi-GB) history.
+    hist = jnp.asarray(sol).reshape(n_k, n_cosmo, len(t_span), layout.nvar)
+    return hist, k_sorted, prepared
 
 
 def solve_perturbations(k_values, cosmology, **solve_kwargs):

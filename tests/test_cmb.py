@@ -12,7 +12,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from cosmologies import BENCHMARK_COSMOLOGIES, cosmology_to_class_params
+from cosmologies import (
+    BENCHMARK_COSMOLOGIES,
+    cosmology_to_class_params,
+    perturbed_planck_cosmologies,
+)
 
 from discoeb.cmb import (
     cl_power_spectrum,
@@ -33,6 +37,9 @@ TT_ELLS = np.asarray([2, 10, 20, 40, 80, 120, 180, 240, 320, 500], dtype=np.int6
 # Wave modes the perturbation hierarchy is solved on before the sources are
 # interpolated onto the finer line-of-sight grid.
 CMB_N_K = 128
+
+# Batch sizes for the multi-cosmology spectrum, matching the matter-power test.
+BATCH_SIZE_CASES = [pytest.param(1, id="N1"), pytest.param(128, id="N128")]
 
 # Relative-error gate on D_ell vs CLASS (matches the DISCO2 CAMB gate).
 DL_GATE = 1.0e-2
@@ -187,32 +194,41 @@ def test_cmb_tau_grid_concentrates_around_recombination():
 
 
 @pytest.mark.skipif(not _cuda_available(), reason="numba-CUDA requires a CUDA GPU")
-def test_tt_power_spectrum_matches_class(benchmark):
-    """Unlensed scalar TT D_ell vs CLASS for flat LambdaCDM, timed.
+@pytest.mark.parametrize("n_cosmologies", BATCH_SIZE_CASES)
+def test_tt_power_spectrum_matches_class(n_cosmologies, benchmark):
+    """Batched unlensed scalar TT D_ell vs CLASS, timed over the batch size.
 
-    The full spectrum (perturbation solve over ``CMB_N_K`` wave modes, source
-    construction, and the line-of-sight Bessel projection) is timed with
-    ``benchmark.pedantic``. The warmup round absorbs the one-time costs -- the
-    numba-CUDA kernel compilation and the spherical-Bessel table build -- both of
-    which are cached, so the single timed round measures the steady-state spectrum
-    evaluation. The timed round reuses the same ``k_values`` and ``n_save``, which
-    are part of the compiled-kernel cache key, so no recompilation occurs.
+    ``N`` slightly-perturbed flat-LCDM cosmologies are solved together (see
+    :func:`compute_cl_power_spectrum_batch`) and each is checked against its own
+    CLASS reference.
+
+    The whole spectrum -- perturbation solve over ``CMB_N_K`` wave modes, source
+    construction, and the line-of-sight Bessel projection -- is timed with
+    ``benchmark.pedantic``. The warmup round absorbs the one-time costs (numba-CUDA
+    kernel compilation and the spherical-Bessel table build, both cached), and the
+    timed round reuses the same ``k_values`` and ``n_save``, which are part of the
+    compiled-kernel cache key, so no recompilation leaks into it.
+
+    The CMB batches less cheaply than the matter power spectrum: it saves the full
+    hierarchy at ~1000 conformal times rather than 2, so the history is GBs
+    (6.5 GB at ``N = 128``) and has to be solved in chunks rather than one launch.
     """
 
-    from discoeb.cmb import compute_cl_power_spectrum
+    from discoeb.cmb import compute_cl_power_spectrum_batch
 
+    cosmologies = perturbed_planck_cosmologies(n_cosmologies)
     k_values = cmb_k_grid(
-        DEFAULT_COSMOLOGY, n=CMB_N_K, mode="ode", k_min=1.0e-5, k_max=0.5
+        cosmologies[0], n=CMB_N_K, mode="ode", k_min=1.0e-5, k_max=0.5
     )
     _, _, dl_ours = benchmark.pedantic(
-        compute_cl_power_spectrum,
-        args=(DEFAULT_COSMOLOGY,),
+        compute_cl_power_spectrum_batch,
+        args=(cosmologies,),
         kwargs=dict(k_values=k_values, ells=TT_ELLS, n_save=1000, n_k_fine=1500),
         rounds=1,
         warmup_rounds=1,
         iterations=1,
     )
-    dl_class = _class_unlensed_tt(DEFAULT_COSMOLOGY, TT_ELLS)
+    dl_class = np.stack([_class_unlensed_tt(c, TT_ELLS) for c in cosmologies])
 
-    rel = np.abs(dl_ours / dl_class - 1.0)
+    rel = np.abs(np.asarray(dl_ours) / dl_class - 1.0)
     assert float(np.max(rel)) < DL_GATE
