@@ -30,6 +30,10 @@ DEFAULT_COSMOLOGY = BENCHMARK_COSMOLOGIES["planck_2018_flat_lcdm"]
 # onset of Silk damping.
 TT_ELLS = np.asarray([2, 10, 20, 40, 80, 120, 180, 240, 320, 500], dtype=np.int64)
 
+# Wave modes the perturbation hierarchy is solved on before the sources are
+# interpolated onto the finer line-of-sight grid.
+CMB_N_K = 128
+
 # Relative-error gate on D_ell vs CLASS (matches the DISCO2 CAMB gate).
 DL_GATE = 1.0e-2
 
@@ -183,14 +187,30 @@ def test_cmb_tau_grid_concentrates_around_recombination():
 
 
 @pytest.mark.skipif(not _cuda_available(), reason="numba-CUDA requires a CUDA GPU")
-def test_tt_power_spectrum_matches_class():
-    """Unlensed scalar TT D_ell vs CLASS for flat LambdaCDM."""
+def test_tt_power_spectrum_matches_class(benchmark):
+    """Unlensed scalar TT D_ell vs CLASS for flat LambdaCDM, timed.
+
+    The full spectrum (perturbation solve over ``CMB_N_K`` wave modes, source
+    construction, and the line-of-sight Bessel projection) is timed with
+    ``benchmark.pedantic``. The warmup round absorbs the one-time costs -- the
+    numba-CUDA kernel compilation and the spherical-Bessel table build -- both of
+    which are cached, so the single timed round measures the steady-state spectrum
+    evaluation. The timed round reuses the same ``k_values`` and ``n_save``, which
+    are part of the compiled-kernel cache key, so no recompilation occurs.
+    """
 
     from discoeb.cmb import compute_cl_power_spectrum
 
-    k_values = cmb_k_grid(DEFAULT_COSMOLOGY, n=128, mode="ode", k_min=1.0e-5, k_max=0.5)
-    _, _, dl_ours = compute_cl_power_spectrum(
-        DEFAULT_COSMOLOGY, k_values=k_values, ells=TT_ELLS, n_save=1000, n_k_fine=1500
+    k_values = cmb_k_grid(
+        DEFAULT_COSMOLOGY, n=CMB_N_K, mode="ode", k_min=1.0e-5, k_max=0.5
+    )
+    _, _, dl_ours = benchmark.pedantic(
+        compute_cl_power_spectrum,
+        args=(DEFAULT_COSMOLOGY,),
+        kwargs=dict(k_values=k_values, ells=TT_ELLS, n_save=1000, n_k_fine=1500),
+        rounds=1,
+        warmup_rounds=1,
+        iterations=1,
     )
     dl_class = _class_unlensed_tt(DEFAULT_COSMOLOGY, TT_ELLS)
 
