@@ -632,12 +632,21 @@ def compute_thermal_history( *, a0 : float, a1 : float, N : int, rtol : float = 
   return jax.vmap(sol.evaluate)(jnp.log(a)), jax.vmap(sol.derivative)(jnp.log(a)), a
 
 
-@partial(jax.jit, static_argnames=("num_thermo",))
-def evaluate_thermo( *, param : dict, num_thermo = 2048 ) -> jax.Array:
+@partial(jax.jit, static_argnames=("num_thermo", "rtol", "atol"))
+def evaluate_thermo(
+    *, param: dict, num_thermo=2048, rtol=1e-3, atol=1e-6
+) -> jax.Array:
     
     param['fHe'] = param['YHe']/(const_mHe_mH*(1.0-param['YHe']))
     
-    y, dy, a = compute_thermal_history( a0=param['amin'], a1=param['amax'], N=num_thermo, param=param )
+    y, dy, a = compute_thermal_history(
+        a0=param['amin'],
+        a1=param['amax'],
+        N=num_thermo,
+        rtol=rtol,
+        atol=atol,
+        param=param,
+    )
     
     print(y.shape, dy.shape)
 
@@ -683,4 +692,3 @@ def evaluate_thermo( *, param : dict, num_thermo = 2048 ) -> jax.Array:
 
     #return param, tau, a, cs2, Tm, mu, xe, xeHI, xeHeI, xeHeII, dxedtau
     return a, cs2, Tm, mu, xe, dxeda
-

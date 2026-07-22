@@ -260,7 +260,12 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
     if thermo_module == 'RECFAST':
         # Compute the thermal history
         #param, tau, aexp, cs2, Tm, mu, xe, xeHI, xeHeI, xeHeII, xeprime_recfast = evaluate_thermo_recfast( param=param, num_thermo=num_thermo )
-        aexp, cs2, Tm, mu, xe, dxeda = evaluate_thermo_recfast( param=param, num_thermo=num_thermo )
+        aexp, cs2, Tm, mu, xe, dxeda = evaluate_thermo_recfast(
+            param=param,
+            num_thermo=num_thermo,
+            rtol=rtol,
+            atol=atol,
+        )
 
         param['aexp'] = aexp
         #param['tau'] = tau
@@ -433,4 +438,3 @@ def compute_background_quantities(aexp, param):
         'rho_Q': rho_Q,
         'w_Q': w_Q,
     }
-

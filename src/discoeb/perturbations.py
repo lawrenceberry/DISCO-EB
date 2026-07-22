@@ -1,5 +1,11 @@
+import math
+from dataclasses import dataclass
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
+import numpy as np
+from scipy import integrate, interpolate
 
 from .util import lngamma_complex_e, root_find_bisect, root_find_bisect_nocond, savgol_filter
 
@@ -23,7 +29,7 @@ from .approximations import (
 )
 
 # Import background functions
-from .background import get_aprimeoa, get_neutrino_momentum_bins
+from .background import dtauda, evolve_background, get_aprimeoa, get_neutrino_momentum_bins
 
 
 
@@ -2166,4 +2172,2243 @@ def power_multipoles( *, y : jnp.ndarray, kmodes : jnp.ndarray, b : float, param
     P4 = 8/35 * thetam**2
 
     return P0, P2, P4
+# Hierarchy truncations. These are module-level integers (not runtime arguments)
+# so the state-vector layout and the accelerator-compiled right-hand side treat
+# them as compile-time constants. The current flat-LambdaCDM + massless-neutrino
+# layout has NVAR == 50 (11-var dense core + 3x13 free-streaming hierarchies),
+# matching the hand-tuned Schur-EB LU solver in :mod:`discoeb.schur_eb`.
+LMAX_G = 15
+"""Photon temperature hierarchy truncation (``Theta_0 ... Theta_LMAX_G``)."""
 
+LMAX_POL = 15
+"""Photon E-mode polarization hierarchy truncation (``E_2 ... E_LMAX_POL``)."""
+
+LMAX_NR = 15
+"""Massless-neutrino hierarchy truncation (``N_0 ... N_LMAX_NR``)."""
+
+IX_ETAK = 0
+"""State-vector index of the metric perturbation ``etak = k eta``."""
+
+IX_CLXC = 1
+"""State-vector index of the CDM density contrast ``clxc``."""
+
+IX_CLXB = 2
+"""State-vector index of the baryon density contrast ``clxb``."""
+
+IX_VB = 3
+"""State-vector index of the baryon velocity ``vb``."""
+
+IX_G = 4
+"""Base index of the photon temperature hierarchy (``Theta_l`` at ``IX_G + l``)."""
+
+IX_POL = IX_G + LMAX_G + 1
+"""Base index of the photon polarization hierarchy (``E_l`` at ``IX_POL + (l-2)``)."""
+
+IX_R = IX_POL + LMAX_POL - 1
+"""Base index of the massless-neutrino hierarchy (``N_l`` at ``IX_R + l``)."""
+
+NVAR = IX_R + LMAX_NR + 1
+"""Total length of the perturbation state vector."""
+
+
+# ============================================================
+# EINSTEIN CONSTRAINTS AND BACKGROUND TERMS
+# ============================================================
+
+
+def comoving_densities(
+    a: float,
+    grhog: float,
+    grhornomass: float,
+    grhoc: float,
+    grhob: float,
+    grhov: float,
+) -> tuple[float, float, float, float, float]:
+    """Return the ``8*pi*G*rho_i a^2`` density coefficients at scale factor ``a``.
+
+    The CAMB ``grho`` coefficients satisfy ``grhoa4 = 8*pi*G*rho_i a^4``. Dividing
+    by ``a^2`` gives the combinations that appear in the synchronous-gauge
+    Einstein equations:
+
+    ``rho_gamma, rho_nu ~ a^-4`` give ``grho_i a^2 = grho_i / a^2``;
+    ``rho_c, rho_b ~ a^-3`` give ``grho_i a^2 = grho_i / a``;
+    ``rho_Lambda ~ a^0`` gives ``grhov a^2 = grhov * a^2``.
+
+    Returns ``(grhog_t, grhor_t, grhoc_t, grhob_t, grhov_t)``.
+    """
+
+    a2 = a * a
+    return (grhog / a2, grhornomass / a2, grhoc / a, grhob / a, grhov * a2)
+
+
+def expansion_rate(
+    grhog_t: float,
+    grhor_t: float,
+    grhoc_t: float,
+    grhob_t: float,
+    grhov_t: float,
+) -> float:
+    """Return the conformal Hubble rate ``adotoa = a'/a = aH``.
+
+    ``adotoa = sqrt((Sum grho_i a^2) / 3)``. Written as ``** 0.5`` so the helper
+    traces unchanged on Python floats and CUDA device values.
+    """
+
+    return ((grhog_t + grhor_t + grhoc_t + grhob_t + grhov_t) / 3.0) ** 0.5
+
+
+def density_perturbation(
+    grhob_t: float,
+    clxb: float,
+    grhoc_t: float,
+    clxc: float,
+    grhog_t: float,
+    clxg: float,
+    grhor_t: float,
+    clxr: float,
+) -> float:
+    """Return the total density perturbation ``dgrho = Sum grho_i a^2 delta_i``."""
+
+    return grhob_t * clxb + grhoc_t * clxc + grhog_t * clxg + grhor_t * clxr
+
+
+def momentum_perturbation(
+    grhob_t: float,
+    vb: float,
+    grhog_t: float,
+    qg: float,
+    grhor_t: float,
+    qr: float,
+) -> float:
+    """Return the total momentum-density source ``dgq = Sum grho_i a^2 (rho+p) v_i``."""
+
+    return grhob_t * vb + grhog_t * qg + grhor_t * qr
+
+
+def anisotropic_stress(
+    grhog_t: float,
+    pig: float,
+    grhor_t: float,
+    pir: float,
+) -> float:
+    """Return the total anisotropic-stress source ``dgpi``."""
+
+    return grhog_t * pig + grhor_t * pir
+
+
+def metric_z(dgrho: float, etak: float, adotoa: float, k: float) -> float:
+    """Return the synchronous-gauge metric variable ``z = (dgrho/(2k) + k eta)/aH``."""
+
+    return (0.5 * dgrho / k + etak) / adotoa
+
+
+def shear_sigma(z: float, dgq: float, k: float) -> float:
+    """Return the metric shear ``sigma = z + (3/2) dgq / k^2``."""
+
+    return z + 1.5 * dgq / (k * k)
+
+
+def newtonian_potential(
+    dgrho: float,
+    dgq: float,
+    dgpi: float,
+    adotoa: float,
+    k: float,
+) -> float:
+    """Return the Newtonian-gauge curvature potential ``Phi`` (diagnostic).
+
+    ``Phi = -[(dgrho + 3 aH dgq / k) + dgpi] / (2 k^2)``.
+    """
+
+    return -((dgrho + 3.0 * dgq * adotoa / k) + dgpi) / (2.0 * k * k)
+
+
+# ============================================================
+# ADIABATIC INITIAL CONDITIONS
+# Deep in radiation domination (k tau << 1), following CAMB's initial().
+# ============================================================
+
+
+def neutrino_radiation_fraction(grhog: float, grhornomass: float) -> float:
+    """Return the neutrino fraction of the radiation density ``R_nu``."""
+
+    return grhornomass / (grhog + grhornomass)
+
+
+def matter_radiation_parameter(
+    grhob: float,
+    grhoc: float,
+    grhog: float,
+    grhornomass: float,
+) -> float:
+    """Return the matter-to-radiation initial-condition parameter ``om``."""
+
+    return (grhob + grhoc) / (3.0 * (grhog + grhornomass)) ** 0.5
+
+
+def adiabatic_photon_density(k: float, tau: float, om: float) -> float:
+    """Return the initial photon density contrast ``delta_gamma``."""
+
+    x2 = (k * tau) ** 2
+    return x2 / 3.0 * (1.0 - om * tau / 5.0)
+
+
+def adiabatic_photon_velocity(k: float, tau: float, om: float) -> float:
+    """Return the initial photon dipole ``q_gamma``."""
+
+    x = k * tau
+    return x**3 / 27.0 * (1.0 - om * tau / 5.0)
+
+
+def adiabatic_initial_conditions(
+    k: float,
+    tau: float,
+    grhog: float,
+    grhornomass: float,
+    grhoc: float,
+    grhob: float,
+) -> tuple[float, ...]:
+    """Return the adiabatic initial state vector deep in radiation domination.
+
+    Implements CAMB's ``initial()`` series for the adiabatic growing mode at
+    ``k tau << 1``, normalized so the comoving curvature perturbation is unity.
+    The returned tuple has length :data:`NVAR`; all multipoles above those set
+    explicitly start at zero.
+    """
+
+    x = k * tau
+    x2 = x * x
+
+    Rv = neutrino_radiation_fraction(grhog, grhornomass)
+    Rp15 = 4.0 * Rv + 15.0
+    om = matter_radiation_parameter(grhob, grhoc, grhog, grhornomass)
+    omtau = om * tau
+
+    clxg = adiabatic_photon_density(k, tau, om)
+    qg = adiabatic_photon_velocity(k, tau, om)
+
+    y0 = [0.0] * NVAR
+
+    # Metric perturbation: etak = k eta ~ -k at leading order.
+    y0[IX_ETAK] = -k * (1.0 - x2 / 12.0 * (-10.0 / Rp15 + 1.0))
+
+    # Photon monopole and dipole.
+    y0[IX_G] = clxg
+    y0[IX_G + 1] = qg
+
+    # CDM and baryons share the photon density (3/4 factor for adiabatic mode).
+    y0[IX_CLXC] = 0.75 * clxg
+    y0[IX_CLXB] = 0.75 * clxg
+    y0[IX_VB] = 0.75 * qg
+
+    # Massless neutrinos.
+    y0[IX_R] = clxg
+    y0[IX_R + 1] = (4.0 * Rv + 23.0) / Rp15 * x2 * x / 27.0
+    y0[IX_R + 2] = (
+        -4.0
+        / 3.0
+        * x2
+        / Rp15
+        * (1.0 + omtau / 4.0 * (4.0 * Rv - 5.0) / (2.0 * Rv + 15.0))
+    )
+    if LMAX_NR >= 3:
+        y0[IX_R + 3] = -4.0 / 21.0 / Rp15 * x2 * x
+
+    return tuple(y0)
+
+
+# ============================================================
+# FLUID AND METRIC DERIVATIVES
+# ============================================================
+
+
+def metric_etak_derivative(dgq: float) -> float:
+    """Return ``etak' = (1/2) dgq`` from the momentum Einstein constraint."""
+
+    return 0.5 * dgq
+
+
+def cdm_density_derivative(z: float, k: float) -> float:
+    """Return ``clxc' = -k z`` (CDM is pressureless, at rest in synchronous gauge)."""
+
+    return -k * z
+
+
+def baryon_density_derivative(z: float, vb: float, k: float) -> float:
+    """Return ``clxb' = -k (z + v_b)`` from baryon number conservation."""
+
+    return -k * (z + vb)
+
+
+def baryon_velocity_derivative(
+    adotoa: float,
+    vb: float,
+    k: float,
+    delta_p_b: float,
+    photbar: float,
+    opacity: float,
+    qg: float,
+) -> float:
+    """Return ``v_b'`` from the full (non-tight-coupling) baryon Euler equation.
+
+    ``v_b' = -aH v_b + k delta_p_b - (rho_gamma/rho_b) kappa' (4/3 v_b - q_gamma)``.
+    """
+
+    return -adotoa * vb + k * delta_p_b - photbar * opacity * (4.0 / 3.0 * vb - qg)
+
+
+def photon_monopole_derivative(z: float, qg: float, k: float) -> float:
+    """Return ``Theta_0' = -k (4/3 z + q_gamma)`` (photon continuity)."""
+
+    return -k * (4.0 / 3.0 * z + qg)
+
+
+def photon_dipole_derivative(
+    vbdot: float,
+    adotoa: float,
+    vb: float,
+    k: float,
+    delta_p_b: float,
+    pb43: float,
+    clxg: float,
+    pig: float,
+) -> float:
+    """Return the photon dipole derivative ``Theta_1' = q_gamma'``.
+
+    ``q_gamma' = (4/3)(-v_b' - aH v_b + k delta_p_b)/R_gamma + (k/3) delta_gamma
+    - (2k/3) pi_gamma``, with ``pb43 = R_gamma = (4/3) rho_gamma/rho_b``.
+    """
+
+    return (
+        4.0 / 3.0 * (-vbdot - adotoa * vb + k * delta_p_b) / pb43
+        + k / 3.0 * clxg
+        - 2.0 * k / 3.0 * pig
+    )
+
+
+def polarization_source(pig: float, e2: float) -> float:
+    """Return the polarization source ``Pi = pi_gamma/10 + (9/15) E_2``."""
+
+    return pig / 10.0 + 9.0 / 15.0 * e2
+
+
+def photon_quadrupole_derivative(
+    qg: float,
+    theta3: float,
+    pig: float,
+    polter: float,
+    sigma: float,
+    k: float,
+    opacity: float,
+) -> float:
+    """Return ``Theta_2' = (2k/5) q - (3k/5) Theta_3 - kappa'(pi - Pi) + (8/15) k sigma``."""
+
+    return (
+        2.0 * k / 5.0 * qg
+        - 3.0 * k / 5.0 * theta3
+        - opacity * (pig - polter)
+        + 8.0 / 15.0 * k * sigma
+    )
+
+
+def photon_temperature_multipole_derivative(
+    l: int,
+    theta_lm1: float,
+    theta_l: float,
+    theta_lp1: float,
+    k: float,
+    opacity: float,
+) -> float:
+    """Return ``Theta_l'`` for an interior multipole ``3 <= l < LMAX_G``."""
+
+    return (
+        k * l / (2 * l + 1) * theta_lm1
+        - k * (l + 1) / (2 * l + 1) * theta_lp1
+        - opacity * theta_l
+    )
+
+
+def photon_temperature_truncation(
+    theta_lm1: float,
+    theta_l: float,
+    k: float,
+    opacity: float,
+    tau: float,
+    lmax: int,
+) -> float:
+    """Return the truncated photon temperature derivative at ``l = LMAX_G``."""
+
+    return k * theta_lm1 - (lmax + 1) / tau * theta_l - opacity * theta_l
+
+
+def polarization_quadrupole_derivative(
+    e2: float,
+    e3: float,
+    polter: float,
+    k: float,
+    opacity: float,
+) -> float:
+    """Return ``E_2' = -kappa'(E_2 - Pi) - (k/3) E_3``."""
+
+    return -opacity * (e2 - polter) - k / 3.0 * e3
+
+
+def polarization_multipole_derivative(
+    l: int,
+    e_lm1: float,
+    e_l: float,
+    e_lp1: float,
+    k: float,
+    opacity: float,
+) -> float:
+    """Return ``E_l'`` for an interior multipole ``3 <= l < LMAX_POL``."""
+
+    polfac = (l + 3) * (l - 1) / (l + 1)
+    return (
+        -opacity * e_l + k * l / (2 * l + 1) * e_lm1 - polfac * k / (2 * l + 1) * e_lp1
+    )
+
+
+def polarization_truncation(
+    e_lm1: float,
+    e_l: float,
+    k: float,
+    opacity: float,
+    tau: float,
+    lmax: int,
+) -> float:
+    """Return the truncated E-mode derivative at ``l = LMAX_POL``."""
+
+    return -opacity * e_l + k * lmax / (2 * lmax + 1) * e_lm1 - (lmax + 3) / tau * e_l
+
+
+def neutrino_monopole_derivative(z: float, qr: float, k: float) -> float:
+    """Return ``N_0' = -k (4/3 z + q_nu)`` (neutrino continuity)."""
+
+    return -k * (4.0 / 3.0 * z + qr)
+
+
+def neutrino_dipole_derivative(clxr: float, pir: float, k: float) -> float:
+    """Return ``N_1' = (k/3)(delta_nu - 2 pi_nu)`` (neutrino momentum)."""
+
+    return k / 3.0 * (clxr - 2.0 * pir)
+
+
+def neutrino_quadrupole_derivative(
+    qr: float,
+    n3: float,
+    sigma: float,
+    k: float,
+) -> float:
+    """Return ``N_2' = (2k/5) q_nu - (3k/5) N_3 + (8/15) k sigma``."""
+
+    return 2.0 * k / 5.0 * qr - 3.0 * k / 5.0 * n3 + 8.0 / 15.0 * k * sigma
+
+
+def neutrino_multipole_derivative(
+    l: int,
+    n_lm1: float,
+    n_l: float,
+    n_lp1: float,
+    k: float,
+) -> float:
+    """Return ``N_l'`` for an interior multipole ``3 <= l < LMAX_NR``."""
+
+    return k * l / (2 * l + 1) * n_lm1 - k * (l + 1) / (2 * l + 1) * n_lp1
+
+
+def neutrino_truncation(
+    n_lm1: float,
+    n_l: float,
+    k: float,
+    tau: float,
+    lmax: int,
+) -> float:
+    """Return the truncated neutrino derivative ``N_L' = k N_{L-1} - (L+1) N_L / tau``."""
+
+    return k * n_lm1 - (lmax + 1) / tau * n_l
+
+
+# ============================================================
+# DYNAMICAL DARK ENERGY (CPL fluid perturbations)
+#
+# Optional extension (enabled when w_0 != -1 or w_a != 0). The DE fluid is a
+# clustering fluid with rest-frame sound speed cs2_DE, carrying two extra state
+# variables clxq (density contrast) and thetaq (velocity divergence) that join
+# the densely-coupled metric core. Synchronous-gauge equations follow Ballesteros
+# & Lesgourgues 2010; the metric enters through ``0.5 h' = k z`` (see
+# :func:`cdm_density_derivative`, where ``clxc' = -k z = -h'/2``).
+# ============================================================
+
+
+def dark_energy_equation_of_state(a: float, w_DE_0: float, w_DE_a: float) -> float:
+    """Return the CPL equation of state ``w_Q(a) = w_0 + w_a (1 - a)``."""
+
+    return w_DE_0 + w_DE_a * (1.0 - a)
+
+
+def dark_energy_adiabatic_sound_speed(
+    w_Q: float, w_Q_prime: float, adotoa: float
+) -> float:
+    """Return the adiabatic sound speed ``c_a^2 = w - w'/(3(1+w) aH)``."""
+
+    return w_Q - w_Q_prime / (3.0 * (1.0 + w_Q) * adotoa)
+
+
+def dark_energy_density_coefficient(grhov: float, rho_Q: float, a: float) -> float:
+    """Return the comoving DE density coefficient ``8*pi*G*rho_Q a^2``.
+
+    ``grhov = grhom * OmegaDE`` is the present DE density coefficient and
+    ``rho_Q = rho_Q(a)/rho_Q(1)`` its normalized evolution, so the comoving
+    coefficient is ``grhov * rho_Q * a^2`` (reducing to the flat ``grhov a^2``
+    when ``rho_Q = 1``).
+    """
+
+    return grhov * rho_Q * a * a
+
+
+def dark_energy_fluid_derivatives(
+    clxq: float,
+    thetaq: float,
+    z: float,
+    adotoa: float,
+    k: float,
+    a: float,
+    w_DE_0: float,
+    w_DE_a: float,
+    cs2_Q: float,
+) -> tuple[float, float]:
+    """Return the DE fluid derivatives ``(clxq', thetaq')`` in synchronous gauge.
+
+    ``clxq' = -(1+w)(thetaq + k z) - 3(cs2 - w) aH clxq
+              - 9(1+w)(cs2 - c_a^2)(aH)^2 thetaq / k^2``,
+    ``thetaq' = -(1 - 3 cs2) aH thetaq + cs2 k^2 clxq / (1+w)``,
+
+    with ``w = w(a)``, ``w' = -w_a aH a``, and ``c_a^2`` the adiabatic sound
+    speed. Valid only for ``w != -1`` (a cosmological constant carries no fluid
+    perturbations and is excluded from the state layout).
+    """
+
+    w_Q = dark_energy_equation_of_state(a, w_DE_0, w_DE_a)
+    w_Q_prime = -w_DE_a * adotoa * a
+    ca2_Q = dark_energy_adiabatic_sound_speed(w_Q, w_Q_prime, adotoa)
+
+    clxq_prime = (
+        -(1.0 + w_Q) * (thetaq + k * z)
+        - 3.0 * (cs2_Q - w_Q) * adotoa * clxq
+        - 9.0 * (1.0 + w_Q) * (cs2_Q - ca2_Q) * adotoa**2 / k**2 * thetaq
+    )
+    thetaq_prime = (
+        -(1.0 - 3.0 * cs2_Q) * adotoa * thetaq + cs2_Q / (1.0 + w_Q) * k**2 * clxq
+    )
+    return clxq_prime, thetaq_prime
+
+
+# ============================================================
+# FULL RIGHT-HAND SIDE
+# ============================================================
+
+
+def boltzmann_rhs(
+    tau: float,
+    y,
+    k: float,
+    a: float,
+    opacity: float,
+    cs2_b: float,
+    grhog: float,
+    grhornomass: float,
+    grhoc: float,
+    grhob: float,
+    grhov: float,
+) -> tuple[float, ...]:
+    """Return the Einstein-Boltzmann right-hand side ``dy/dtau``.
+
+    Assembles the synchronous-gauge hierarchy from the scalar helpers above. The
+    background scale factor ``a``, Thomson opacity ``kappa' = opacity``, and
+    baryon sound speed ``cs2_b`` are supplied as scalars evaluated at ``tau`` by
+    the caller (typically from precomputed splines). The full photon,
+    polarization, and neutrino hierarchies are integrated at all times; the
+    early-time photon-baryon scattering enters through the exact Thomson drag
+    terms, so a stiff ODE solver handles the high-opacity regime directly without
+    a tight-coupling approximation.
+
+    ``y`` is indexed positionally; the returned tuple has length :data:`NVAR`.
+    """
+
+    grhog_t, grhor_t, grhoc_t, grhob_t, grhov_t = comoving_densities(
+        a, grhog, grhornomass, grhoc, grhob, grhov
+    )
+    adotoa = expansion_rate(grhog_t, grhor_t, grhoc_t, grhob_t, grhov_t)
+
+    etak = y[IX_ETAK]
+    clxc = y[IX_CLXC]
+    clxb = y[IX_CLXB]
+    vb = y[IX_VB]
+    clxg = y[IX_G]
+    qg = y[IX_G + 1]
+    pig = y[IX_G + 2]
+    clxr = y[IX_R]
+    qr = y[IX_R + 1]
+    pir = y[IX_R + 2]
+    e2 = y[IX_POL] if LMAX_POL >= 2 else 0.0
+
+    dgrho = density_perturbation(
+        grhob_t, clxb, grhoc_t, clxc, grhog_t, clxg, grhor_t, clxr
+    )
+    dgq = momentum_perturbation(grhob_t, vb, grhog_t, qg, grhor_t, qr)
+    z = metric_z(dgrho, etak, adotoa, k)
+    sigma = shear_sigma(z, dgq, k)
+
+    photbar = grhog_t / grhob_t
+    pb43 = 4.0 / 3.0 * photbar
+    delta_p_b = cs2_b * clxb
+
+    dy = [0.0] * NVAR
+
+    # Metric, CDM, baryon density.
+    dy[IX_ETAK] = metric_etak_derivative(dgq)
+    dy[IX_CLXC] = cdm_density_derivative(z, k)
+    dy[IX_CLXB] = baryon_density_derivative(z, vb, k)
+
+    polter = polarization_source(pig, e2)
+    vbdot = baryon_velocity_derivative(adotoa, vb, k, delta_p_b, photbar, opacity, qg)
+    dy[IX_VB] = vbdot
+    dy[IX_G] = photon_monopole_derivative(z, qg, k)
+    dy[IX_G + 1] = photon_dipole_derivative(
+        vbdot, adotoa, vb, k, delta_p_b, pb43, clxg, pig
+    )
+
+    theta3 = y[IX_G + 3] if LMAX_G >= 3 else 0.0
+    dy[IX_G + 2] = photon_quadrupole_derivative(
+        qg, theta3, pig, polter, sigma, k, opacity
+    )
+    for l in range(3, LMAX_G):
+        dy[IX_G + l] = photon_temperature_multipole_derivative(
+            l, y[IX_G + l - 1], y[IX_G + l], y[IX_G + l + 1], k, opacity
+        )
+    dy[IX_G + LMAX_G] = photon_temperature_truncation(
+        y[IX_G + LMAX_G - 1], y[IX_G + LMAX_G], k, opacity, tau, LMAX_G
+    )
+
+    # Photon polarization.
+    e3 = y[IX_POL + 1] if LMAX_POL >= 3 else 0.0
+    dy[IX_POL] = polarization_quadrupole_derivative(e2, e3, polter, k, opacity)
+    for l in range(3, LMAX_POL):
+        idx = IX_POL + l - 2
+        dy[idx] = polarization_multipole_derivative(
+            l, y[idx - 1], y[idx], y[idx + 1], k, opacity
+        )
+    idx_last = IX_POL + LMAX_POL - 2
+    dy[idx_last] = polarization_truncation(
+        y[idx_last - 1], y[idx_last], k, opacity, tau, LMAX_POL
+    )
+
+    # Massless neutrinos (collisionless).
+    dy[IX_R] = neutrino_monopole_derivative(z, qr, k)
+    dy[IX_R + 1] = neutrino_dipole_derivative(clxr, pir, k)
+    n3 = y[IX_R + 3] if LMAX_NR >= 3 else 0.0
+    dy[IX_R + 2] = neutrino_quadrupole_derivative(qr, n3, sigma, k)
+    for l in range(3, LMAX_NR):
+        dy[IX_R + l] = neutrino_multipole_derivative(
+            l, y[IX_R + l - 1], y[IX_R + l], y[IX_R + l + 1], k
+        )
+    dy[IX_R + LMAX_NR] = neutrino_truncation(
+        y[IX_R + LMAX_NR - 1], y[IX_R + LMAX_NR], k, tau, LMAX_NR
+    )
+
+    return tuple(dy)
+def total_matter_density_contrast(
+    grhoc_t: float,
+    clxc: float,
+    grhob_t: float,
+    clxb: float,
+) -> float:
+    """Return the total-matter density contrast ``delta_m``.
+
+    Density-weighted combination of the CDM and baryon contrasts,
+
+    ``delta_m = (rho_c delta_c + rho_b delta_b) / (rho_c + rho_b)``,
+
+    using the comoving density coefficients (the ``a`` factors cancel).
+    """
+
+    return (grhoc_t * clxc + grhob_t * clxb) / (grhoc_t + grhob_t)
+
+
+def primordial_curvature_power(
+    k: float,
+    A_s: float,
+    n_s: float,
+    k_pivot: float,
+) -> float:
+    """Return the dimensionless primordial curvature power ``P_R(k)``.
+
+    Power-law spectrum ``P_R(k) = A_s (k / k_pivot)^(n_s - 1)``.
+    """
+
+    return A_s * (k / k_pivot) ** (n_s - 1.0)
+
+
+def matter_power_spectrum(
+    k: float,
+    delta_m: float,
+    A_s: float,
+    n_s: float,
+    k_pivot: float,
+) -> float:
+    """Return the linear matter power spectrum ``P(k)`` in Mpc^3.
+
+    With initial conditions normalized to unit comoving curvature, the evolved
+    total-matter contrast ``delta_m(k)`` acts as a transfer function and
+
+    ``P(k) = (2 pi^2 / k^3) P_R(k) delta_m(k)^2``,
+
+    where ``P_R(k)`` is the dimensionless primordial curvature power. The contrast
+    ``delta_m`` must be evaluated at the output time (e.g. ``a = 1``).
+    """
+
+    return (
+        2.0
+        * math.pi**2
+        / k**3
+        * primordial_curvature_power(k, A_s, n_s, k_pivot)
+        * delta_m**2
+    )
+@dataclass(frozen=True)
+class PerturbationLayout:
+    """Enabled components and state-vector indices of the perturbation hierarchy.
+
+    Attributes
+    ----------
+    lmaxg, lmaxpol, lmaxr : int
+        Photon-temperature, E-mode-polarization, and massless-neutrino hierarchy
+        truncations.
+    nqmax : int
+        Number of massive-neutrino momentum bins. ``0`` disables massive
+        neutrinos entirely (no state variables allocated).
+    lmaxnu : int
+        Massive-neutrino multipole-hierarchy truncation (used only when
+        ``nqmax > 0``).
+    enable_dark_energy : bool
+        Whether the dynamical dark-energy fluid perturbations are evolved.
+    """
+
+    lmaxg: int = 15
+    lmaxpol: int = 15
+    lmaxr: int = 15
+    nqmax: int = 0
+    lmaxnu: int = 15
+    enable_dark_energy: bool = False
+
+    def __post_init__(self):
+        if self.lmaxg < 2 or self.lmaxpol < 2 or self.lmaxr < 2:
+            raise ValueError("lmaxg, lmaxpol, lmaxr must each be >= 2")
+        if self.nqmax < 0:
+            raise ValueError("nqmax must be non-negative")
+        if self.nqmax > 0 and self.lmaxnu < 2:
+            raise ValueError("lmaxnu must be >= 2 when massive neutrinos are enabled")
+
+    # --- Core (always present) -------------------------------------------------
+
+    @property
+    def ix_etak(self) -> int:
+        """Index of the synchronous-gauge metric perturbation ``etak = k eta``."""
+        return 0
+
+    @property
+    def ix_clxc(self) -> int:
+        """Index of the CDM density contrast."""
+        return 1
+
+    @property
+    def ix_clxb(self) -> int:
+        """Index of the baryon density contrast."""
+        return 2
+
+    @property
+    def ix_vb(self) -> int:
+        """Index of the baryon velocity."""
+        return 3
+
+    @property
+    def ix_g(self) -> int:
+        """Base index of the photon temperature hierarchy (``Theta_l`` at ix_g + l)."""
+        return 4
+
+    @property
+    def ix_pol(self) -> int:
+        """Base index of the polarization hierarchy (``E_l`` at ix_pol + (l - 2))."""
+        return self.ix_g + self.lmaxg + 1
+
+    @property
+    def ix_r(self) -> int:
+        """Base index of the massless-neutrino hierarchy (``N_l`` at ix_r + l)."""
+        return self.ix_pol + self.lmaxpol - 1
+
+    @property
+    def _ix_after_massless(self) -> int:
+        """First index after the always-present core hierarchies."""
+        return self.ix_r + self.lmaxr + 1
+
+    # --- Optional: dynamical dark energy --------------------------------------
+
+    @property
+    def has_dark_energy(self) -> bool:
+        return self.enable_dark_energy
+
+    @property
+    def ix_clxq(self) -> int:
+        """Index of the dark-energy density contrast (only if dark energy enabled)."""
+        if not self.enable_dark_energy:
+            raise AttributeError("dark energy is not enabled in this layout")
+        return self._ix_after_massless
+
+    @property
+    def ix_thetaq(self) -> int:
+        """Index of the dark-energy velocity (only if dark energy enabled)."""
+        if not self.enable_dark_energy:
+            raise AttributeError("dark energy is not enabled in this layout")
+        return self._ix_after_massless + 1
+
+    @property
+    def _ix_after_dark_energy(self) -> int:
+        return self._ix_after_massless + (2 if self.enable_dark_energy else 0)
+
+    # --- Optional: massive neutrinos ------------------------------------------
+
+    @property
+    def has_massive_neutrinos(self) -> bool:
+        return self.nqmax > 0
+
+    @property
+    def ix_massive_nu(self) -> int:
+        """Base index of the massive-neutrino momentum-bin hierarchies.
+
+        The multipole ``psi_l`` of momentum bin ``q`` is stored at
+        ``ix_massive_nu + q * (lmaxnu + 1) + l`` (**bin-major, multipole-minor**),
+        so that each bin's free-streaming tail ``psi_3 ... psi_lmaxnu`` is
+        contiguous and can be treated as one tridiagonal block by the Schur-EB
+        block-LU solver.
+        """
+        if self.nqmax == 0:
+            raise AttributeError("massive neutrinos are not enabled in this layout")
+        return self._ix_after_dark_energy
+
+    def ix_psi_base(self, q: int) -> int:
+        """Return the state index of ``psi_0`` for momentum bin ``q``."""
+        if self.nqmax == 0:
+            raise AttributeError("massive neutrinos are not enabled in this layout")
+        if not (0 <= q < self.nqmax):
+            raise IndexError(f"momentum bin q={q} out of range [0, {self.nqmax})")
+        return self.ix_massive_nu + q * (self.lmaxnu + 1)
+
+    def ix_psi(self, l: int, q: int) -> int:
+        """Return the state index of massive-neutrino multipole ``psi_l`` of bin ``q``."""
+        if not (0 <= l <= self.lmaxnu):
+            raise IndexError(f"multipole l={l} out of range [0, {self.lmaxnu}]")
+        return self.ix_psi_base(q) + l
+
+    # --- Total size -----------------------------------------------------------
+
+    @property
+    def nvar(self) -> int:
+        """Total length of the trimmed perturbation state vector."""
+        n = self._ix_after_dark_energy
+        if self.nqmax > 0:
+            n += self.nqmax * (self.lmaxnu + 1)
+        return n
+
+    @classmethod
+    def from_cosmology(
+        cls,
+        cosmology,
+        *,
+        lmaxg: int = 15,
+        lmaxpol: int = 15,
+        lmaxr: int = 15,
+        lmaxnu: int = 15,
+        nqmax: int = 5,
+    ) -> "PerturbationLayout":
+        """Return the trimmed layout implied by a cosmology's enabled components.
+
+        Dynamical dark energy is enabled when ``w_DE_0 != -1`` or ``w_DE_a != 0``;
+        massive neutrinos are enabled (with ``nqmax`` momentum bins) when
+        ``num_massive_neutrinos > 0``. Curvature does not affect the layout.
+        """
+
+        enable_de = (cosmology.w_DE_0 != -1.0) or (cosmology.w_DE_a != 0.0)
+        nqmax_massive = nqmax if cosmology.num_massive_neutrinos > 0 else 0
+        return cls(
+            lmaxg=lmaxg,
+            lmaxpol=lmaxpol,
+            lmaxr=lmaxr,
+            nqmax=nqmax_massive,
+            lmaxnu=lmaxnu,
+            enable_dark_energy=enable_de,
+        )
+
+
+FLAT_MASSLESS_LAYOUT = PerturbationLayout()
+"""Default flat-LambdaCDM + massless-neutrino layout (NVAR == 50).
+
+Reproduces the fixed index constants of :mod:`discoeb.perturbations`.
+"""
+class _ParamCosmology(NamedTuple):
+    """Hashable view of the historical DISCO-EB parameter dictionary."""
+
+    Omegam: float
+    Omegab: float
+    w_DE_0: float
+    w_DE_a: float
+    cs2_DE: float
+    Omegak: float
+    A_s: float
+    n_s: float
+    H0: float
+    T_cmb: float
+    Y_He: float
+    Neff_massless: float
+    num_massive_neutrinos: float
+    mnu: float
+    k_pivot: float
+
+    @property
+    def h(self):
+        return self.H0 / 100.0
+
+    @property
+    def Omegac(self):
+        return self.Omegam - self.Omegab
+
+    @property
+    def omega_b_h2(self):
+        return self.Omegab * self.h**2
+
+    @property
+    def omega_c_h2(self):
+        return self.Omegac * self.h**2
+
+    @property
+    def tau_reion(self):
+        return 0.0
+
+    @property
+    def N_eff(self):
+        return self.Neff_massless + self.num_massive_neutrinos
+
+    def to_background_params(self):
+        return {
+            "Omegam": self.Omegam,
+            "Omegab": self.Omegab,
+            "w_DE_0": self.w_DE_0,
+            "w_DE_a": self.w_DE_a,
+            "cs2_DE": self.cs2_DE,
+            "Omegak": self.Omegak,
+            "A_s": self.A_s,
+            "n_s": self.n_s,
+            "H0": self.H0,
+            "Tcmb": self.T_cmb,
+            "YHe": self.Y_He,
+            "Neff": self.Neff_massless,
+            "Nmnu": self.num_massive_neutrinos,
+            "mnu": self.mnu,
+        }
+
+
+def _as_cosmology(cosmology):
+    """Normalize a legacy parameter dictionary for the accelerator path."""
+
+    if not isinstance(cosmology, dict):
+        return cosmology
+    return _ParamCosmology(
+        Omegam=float(cosmology["Omegam"]),
+        Omegab=float(cosmology["Omegab"]),
+        w_DE_0=float(cosmology.get("w_DE_0", -1.0)),
+        w_DE_a=float(cosmology.get("w_DE_a", 0.0)),
+        cs2_DE=float(cosmology.get("cs2_DE", 1.0)),
+        Omegak=float(cosmology.get("Omegak", 0.0)),
+        A_s=float(cosmology["A_s"]),
+        n_s=float(cosmology["n_s"]),
+        H0=float(cosmology["H0"]),
+        T_cmb=float(cosmology["Tcmb"]),
+        Y_He=float(cosmology["YHe"]),
+        Neff_massless=float(cosmology["Neff"]),
+        num_massive_neutrinos=float(cosmology.get("Nmnu", 0.0)),
+        mnu=float(cosmology.get("mnu", 0.0)),
+        k_pivot=float(cosmology.get("k_p", 0.05)),
+    )
+
+# Solver and grid presets for the accelerated matter-power path.
+N_THERMO_GRID = 2048
+N_BACKGROUND_GRID = 4096
+PERTURB_RTOL = 1.0e-4
+PERTURB_ATOL = 1.0e-4
+PERTURB_FIRST_STEP = 1.0e-2
+PERTURB_MAX_STEPS = 20000
+TAU_START = 0.1
+
+# Packed-parameter row layout consumed by the device rhs/jac.
+#   p = (grhog, grhornomass, grhoc, grhob, grhov,
+#        tau_start, tau_end, k, cosmology_idx, save_index,
+#        w_DE_0, w_DE_a, cs2_DE, grhok)
+# grhok = grhom * Omega_k is the (constant) comoving curvature density
+# coefficient 8*pi*G*rho_K a^2; it is 0 for a flat cosmology.
+IX_TAU_START = 5
+IX_TAU_END = 6
+IX_K = 7
+IX_COSMOLOGY = 8
+IX_SAVE_INDEX = 9
+IX_W_DE_0 = 10
+IX_W_DE_A = 11
+IX_CS2_DE = 12
+IX_GRHOK = 13
+IX_GRHOR_NU = 14
+IX_NMNU = 15
+IX_AMNU = 16
+N_PARAM = 17
+
+THERMO_TABLE_DTYPE = np.float32
+BATCHES_PER_BLOCK = 32
+
+NQMAX = 3
+"""Massive-neutrino momentum bins used by both the background and the hierarchy.
+
+Each bin adds ``lmaxnu + 1 == 16`` state variables and the generated dense
+Jacobian scales as ``nvar^2``, so this sets the numba compile time: 3 bins give
+``nvar = 98``, 5 bins give ``nvar = 130`` and compile ~4x slower for no gain in
+P(k) accuracy against CLASS.
+"""
+
+
+def neutrino_momentum_bins(nqmax: int = NQMAX):
+    """Return ``(q, w, dlnf0_dlnq)`` momentum bins as NumPy arrays.
+
+    ``w`` are normalized so a single massless flavour integrates to unit density,
+    and ``dlnf0/dlnq = -q/(1 + exp(-q))`` is the log-derivative of the
+    Fermi-Dirac background distribution that sources the ``psi`` hierarchy.
+    """
+
+    q, w = get_neutrino_momentum_bins(nqmax)
+    q = np.asarray(q, dtype=np.float64)
+    w = np.asarray(w, dtype=np.float64)
+    dlfdlq = -q / (1.0 + np.exp(-q))
+    return q, w, dlfdlq
+
+
+def massive_neutrino_density_ratio(a, amnu: float, q, w) -> np.ndarray:
+    """Return ``rho_nu(a)/rho_nu0_massless`` on the same momentum quadrature.
+
+    ``rho = sum_i w_i / v_i`` with ``v_i = 1/sqrt(1 + (a amnu/q_i)^2)``, i.e.
+    ``rho = sum_i w_i sqrt(1 + (a amnu/q_i)^2)``. It tends to 1 (relativistic)
+    as ``a -> 0``. Using the *same* quadrature as the perturbation hierarchy
+    keeps ``drho_nu/rho_nu`` consistent.
+    """
+
+    a = np.atleast_1d(np.asarray(a, dtype=np.float64))[:, None]
+    return np.sum(w[None, :] * np.sqrt(1.0 + (a * amnu / q[None, :]) ** 2), axis=1)
+
+
+def massive_neutrino_parameters(cosmology) -> tuple[float, float, float]:
+    """Return ``(grhor_nu, N_mnu, amnu)`` for the massive-neutrino species."""
+
+    grhor_nu = 3.39739477e-14 * cosmology.T_cmb**4
+    n_mnu = float(cosmology.num_massive_neutrinos)
+    amnu = 1.62581581e4 * cosmology.mnu / cosmology.T_cmb if n_mnu > 0.0 else 0.0
+    return grhor_nu, n_mnu, amnu
+
+
+def density_coefficients(cosmology) -> tuple[float, float, float, float, float]:
+    """Return the background ``grho`` density coefficients for ``cosmology``.
+
+    ``grhornomass`` uses the *massless* neutrino count. The dark-energy
+    coefficient is fixed by closing the density budget at ``a = 1``,
+
+    ``grhov = grhom - (grhog + grhornomass + grho_mnu(1) + grhoc + grhob + grhok)``,
+
+    which reproduces the flat massless value and automatically accounts for
+    spatial curvature and the massive-neutrino density.
+    """
+
+    grhom = 3.33795017e-11 * cosmology.H0**2
+    grhog_value = 1.49594245e-13 * cosmology.T_cmb**4
+    grhornomass_value = 3.39739477e-14 * cosmology.T_cmb**4 * cosmology.Neff_massless
+    grhoc_value = grhom * cosmology.Omegac
+    grhob_value = grhom * cosmology.Omegab
+    grhok = grhom * cosmology.Omegak
+
+    grhor_nu, n_mnu, amnu = massive_neutrino_parameters(cosmology)
+    if n_mnu > 0.0:
+        q, w, _ = neutrino_momentum_bins()
+        grho_mnu_today = grhor_nu * n_mnu * float(
+            massive_neutrino_density_ratio(1.0, amnu, q, w)[0]
+        )
+    else:
+        grho_mnu_today = 0.0
+
+    grhov_value = grhom - (
+        grhog_value
+        + grhornomass_value
+        + grho_mnu_today
+        + grhoc_value
+        + grhob_value
+        + grhok
+    )
+    return (grhog_value, grhornomass_value, grhoc_value, grhob_value, grhov_value)
+
+
+_THERMO_TABLE_CACHE: dict = {}
+
+
+def build_thermo_tables(cosmology, n_grid: int = N_THERMO_GRID):
+    """Cached wrapper around :func:`_build_thermo_tables`.
+
+    Each call runs a full RECFAST recombination solve plus the background
+    quadrature, so it is far too expensive to repeat per evaluation -- a CMB batch
+    needs every cosmology's ``tau0`` up front *and* again inside the solve
+    preparation. The tables depend only on ``(cosmology, n_grid)``, so memoize
+    them.
+    """
+
+    key = (cosmology, n_grid)
+    cached = _THERMO_TABLE_CACHE.get(key)
+    if cached is None:
+        cached = _build_thermo_tables(cosmology, n_grid)
+        _THERMO_TABLE_CACHE[key] = cached
+    return cached
+
+
+def _build_thermo_tables(cosmology, n_grid: int = N_THERMO_GRID):
+    """Return ``(tau_grid, values, seconds, tau0)`` thermodynamics spline tables.
+
+    ``values`` has rows ``(a, kappa', c_s,b^2, rho_nu)`` sampled on a uniform
+    ``log(tau)`` grid over ``[TAU_START, tau0]``. The background and RECFAST
+    histories come directly from :func:`discoeb.background.evolve_background`;
+    this function only resamples its existing splines into the layout required by
+    the numba-CUDA callbacks. ``seconds`` contains the matching cubic second
+    derivatives with respect to ``log(tau)``.
+    """
+
+    background = evolve_background(
+        param=cosmology.to_background_params(),
+        thermo_module="RECFAST",
+        num_thermo=n_grid,
+    )
+    a_background = np.geomspace(1.0e-9, 1.0, N_BACKGROUND_GRID)
+    dtauda_values = np.asarray(
+        dtauda(jnp.asarray(a_background), background)
+    )[:, 0]
+    tau_background = integrate.cumulative_trapezoid(
+        dtauda_values, a_background, initial=0.0
+    )
+    tau_background += float(np.asarray(background["taumin"]).reshape(-1)[0])
+    tau0 = float(tau_background[-1])
+    log_tau_grid = np.linspace(np.log(TAU_START), np.log(tau0), n_grid)
+    tau_grid = np.exp(log_tau_grid)
+    a_vals = np.interp(tau_grid, tau_background, a_background)
+    loga_eval = jnp.log(jnp.asarray(a_vals))
+
+    xe_vals = np.asarray(background["xe_of_loga_spline"].evaluate(loga_eval))[:, 0]
+    a_recfast_start = 1.0 / 3501.0
+    xe_recfast_start = float(
+        np.asarray(
+            background["xe_of_loga_spline"].evaluate(
+                jnp.log(jnp.asarray([a_recfast_start]))
+            )
+        ).reshape(-1)[0]
+    )
+    xe_vals = np.where(a_vals < a_recfast_start, xe_recfast_start, xe_vals)
+    akthom = (
+        2.3038921003709498e-9
+        * (1.0 - cosmology.Y_He)
+        * cosmology.Omegab
+        * cosmology.H0**2
+    )
+    opacity_vals = xe_vals * akthom / a_vals**2
+    cs2a_vals = np.asarray(
+        background["cs2a_of_loga_spline"].evaluate(loga_eval)
+    )[:, 0]
+    cs2_vals = cs2a_vals / a_vals
+    rhonu_vals = np.exp(
+        np.asarray(
+            background["logrhonu_of_loga_spline"].evaluate(jnp.log(a_vals))
+        )[:, 0]
+    )
+
+    values = np.stack((a_vals, opacity_vals, cs2_vals, rhonu_vals))
+    seconds = np.stack(
+        [interpolate.CubicSpline(log_tau_grid, row)(log_tau_grid, 2) for row in values]
+    )
+    return tau_grid, values, seconds, tau0
+
+
+def make_params(cosmology, k_values: np.ndarray, tau_end: float) -> np.ndarray:
+    """Return per-mode packed perturbation parameters for the device rhs."""
+
+    densities = density_coefficients(cosmology)
+    n = len(k_values)
+    rows = np.repeat(np.asarray(densities)[None, :], n, axis=0)
+    tau_start = np.full(n, TAU_START, dtype=np.float64)
+    tau_end_col = np.full(n, tau_end, dtype=np.float64)
+    cosmology_idx = np.zeros(n, dtype=np.float64)
+    save_index = np.ones(n, dtype=np.float64)
+    w_de_0 = np.full(n, cosmology.w_DE_0, dtype=np.float64)
+    w_de_a = np.full(n, cosmology.w_DE_a, dtype=np.float64)
+    cs2_de = np.full(n, cosmology.cs2_DE, dtype=np.float64)
+    grhok = 3.33795017e-11 * cosmology.H0**2 * cosmology.Omegak
+    grhok_col = np.full(n, grhok, dtype=np.float64)
+    grhor_nu, n_mnu, amnu = massive_neutrino_parameters(cosmology)
+    grhor_nu_col = np.full(n, grhor_nu, dtype=np.float64)
+    n_mnu_col = np.full(n, n_mnu, dtype=np.float64)
+    amnu_col = np.full(n, amnu, dtype=np.float64)
+    return np.column_stack(
+        (rows, tau_start, tau_end_col, np.asarray(k_values, dtype=np.float64),
+         cosmology_idx, save_index, w_de_0, w_de_a, cs2_de, grhok_col,
+         grhor_nu_col, n_mnu_col, amnu_col)
+    )
+
+
+def make_initial_states(cosmology, k_values: np.ndarray, layout) -> np.ndarray:
+    """Return adiabatic initial states for every wave mode, shape ``(n_k, nvar)``.
+
+    The always-present core (metric + fluid + photon/polarization/massless-nu
+    hierarchies) is set by :func:`adiabatic_initial_conditions`; when dark energy
+    is enabled, the DE fluid is given its adiabatic value
+    ``clxq = (1 + w_0) clxc``, ``thetaq = 0``.
+    """
+
+    densities = density_coefficients(cosmology)
+    y0 = np.zeros((len(k_values), layout.nvar), dtype=np.float64)
+    if layout.has_massive_neutrinos:
+        _, _, dlfdlq = neutrino_momentum_bins(layout.nqmax)
+    for i, k in enumerate(k_values):
+        core = adiabatic_initial_conditions(float(k), TAU_START, *densities[:4])
+        y0[i, : len(core)] = core
+        if layout.enable_dark_energy:
+            y0[i, layout.ix_clxq] = (1.0 + cosmology.w_DE_0) * core[IX_CLXC]
+            y0[i, layout.ix_thetaq] = 0.0
+        if layout.has_massive_neutrinos:
+            # Deep in radiation domination the massive neutrinos are still
+            # relativistic (a*amnu/q << 1, v -> 1), so their phase-space
+            # perturbation reduces to the massless hierarchy:
+            #   psi_l = -(1/4) N_l dln f0/dln q      (Ma & Bertschinger)
+            for qi in range(layout.nqmax):
+                for l in range(0, min(3, LMAX_NR) + 1):
+                    y0[i, layout.ix_psi(l, qi)] = -0.25 * core[IX_R + l] * dlfdlq[qi]
+    return y0
+
+
+def build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds, schur_solver):
+    """Return numba-CUDA ``(rhs, jac, time_jac)`` device callbacks for a layout.
+
+    The thermodynamics tables are uploaded once and read through a uniform
+    ``log(tau)`` cubic-spline device evaluator; the perturbation RHS and its
+    (linear, sparse) Jacobian are compiled as ``cuda.jit(device=True)`` functions.
+    The dynamical-dark-energy fluid equations are included when
+    ``layout.enable_dark_energy`` is set; because the flag is a compile-time
+    constant, numba prunes the DE branches entirely when it is disabled (so the
+    flat-LambdaCDM kernel is unchanged).
+
+    The tables are stacked over cosmologies: ``values`` and ``seconds`` have
+    shape ``(n_cosmologies, n_channels, n_grid)`` and ``tau_min`` / ``inv_dtau``
+    are ``(n_cosmologies,)``. The device evaluator selects a cosmology's table by
+    the ``IX_COSMOLOGY`` tag on each trajectory's parameter row, so one compiled
+    kernel solves an arbitrary batch of cosmologies. A single-cosmology solve is
+    just ``n_cosmologies == 1``.
+    """
+
+    from numba import cuda, float64
+
+    NVAR = layout.nvar
+    ENABLE_DE = layout.enable_dark_energy
+    IX_CLXQ = layout.ix_clxq if ENABLE_DE else 0
+    IX_THETAQ = layout.ix_thetaq if ENABLE_DE else 0
+
+    ENABLE_MNU = layout.has_massive_neutrinos
+    NQ = layout.nqmax if ENABLE_MNU else 0
+    LMAXNU = layout.lmaxnu
+    IX_MNU = layout.ix_massive_nu if ENABLE_MNU else 0
+    NPSI = LMAXNU + 1
+
+    n_grid = values.shape[-1]
+    tau_min_dev = cuda.to_device(np.ascontiguousarray(tau_min, dtype=np.float64))
+    inv_dtau_dev = cuda.to_device(np.ascontiguousarray(inv_dtau, dtype=np.float64))
+    values_dev = cuda.to_device(np.ascontiguousarray(values, dtype=THERMO_TABLE_DTYPE))
+    seconds_dev = cuda.to_device(np.ascontiguousarray(seconds, dtype=THERMO_TABLE_DTYPE))
+
+    # Massive-neutrino momentum quadrature (device constants).
+    q_np, w_np, dlf_np = neutrino_momentum_bins(NQ if ENABLE_MNU else 1)
+    q_dev = cuda.to_device(np.ascontiguousarray(q_np))
+    w_dev = cuda.to_device(np.ascontiguousarray(w_np))
+    dlf_dev = cuda.to_device(np.ascontiguousarray(dlf_np))
+
+    @cuda.jit(device=True)
+    def spline_eval(x, p, channel):
+        cosmology_idx = int(p[IX_COSMOLOGY])
+        x_min = tau_min_dev[cosmology_idx]
+        inv_dx = inv_dtau_dev[cosmology_idx]
+        idx = int((x - x_min) * inv_dx)
+        if idx < 0:
+            idx = 0
+        if idx > n_grid - 2:
+            idx = n_grid - 2
+        h = 1.0 / inv_dx
+        x0 = x_min + idx * h
+        x1 = x0 + h
+        left = x1 - x
+        right = x - x0
+        y0 = values_dev[cosmology_idx, channel, idx]
+        y1 = values_dev[cosmology_idx, channel, idx + 1]
+        m0 = seconds_dev[cosmology_idx, channel, idx]
+        m1 = seconds_dev[cosmology_idx, channel, idx + 1]
+        return (
+            m0 * left**3 / (6.0 * h)
+            + m1 * right**3 / (6.0 * h)
+            + (y0 - m0 * h**2 / 6.0) * left / h
+            + (y1 - m1 * h**2 / 6.0) * right / h
+        )
+
+    @cuda.jit(device=True)
+    def rhs(y, tau, p, out):
+        k = p[IX_K]
+        log_tau = math.log(tau)
+        a = spline_eval(log_tau, p, 0)
+        opacity = spline_eval(log_tau, p, 1)
+        cs2 = spline_eval(log_tau, p, 2)
+        if opacity < 1.0e-30:
+            opacity = 1.0e-30
+        if cs2 < 0.0:
+            cs2 = 0.0
+
+        a2 = a * a
+        grhog_t = p[0] / a2
+        grhor_t = p[1] / a2
+        grhoc_t = p[2] / a
+        grhob_t = p[3] / a
+        if ENABLE_DE:
+            w0 = p[IX_W_DE_0]
+            wa = p[IX_W_DE_A]
+            w_Q = w0 + wa * (1.0 - a)
+            rho_Q = a ** (-3.0 * (1.0 + w0 + wa)) * math.exp(3.0 * (a - 1.0) * wa)
+            grhov_t = p[4] * rho_Q * a2
+        else:
+            grhov_t = p[4] * a2
+        if ENABLE_MNU:
+            grhor_nu = p[IX_GRHOR_NU]
+            n_mnu = p[IX_NMNU]
+            amnu = p[IX_AMNU]
+            rhonu = spline_eval(log_tau, p, 3)
+            grho_mnu_t = grhor_nu * n_mnu * rhonu / a2
+        else:
+            grho_mnu_t = 0.0
+        grhok = p[IX_GRHOK]
+        adotoa = math.sqrt(
+            (grhog_t + grhor_t + grho_mnu_t + grhoc_t + grhob_t + grhov_t + grhok) / 3.0
+        )
+
+        etak = y[IX_ETAK]
+        clxc = y[IX_CLXC]
+        clxb = y[IX_CLXB]
+        vb = y[IX_VB]
+        clxg = y[IX_G]
+        qg = y[IX_G + 1]
+        pig = y[IX_G + 2]
+        e2 = y[IX_POL]
+        clxr = y[IX_R]
+        qr = y[IX_R + 1]
+        pir = y[IX_R + 2]
+        dgrho = grhob_t * clxb + grhoc_t * clxc + grhog_t * clxg + grhor_t * clxr
+        dgq = grhob_t * vb + grhog_t * qg + grhor_t * qr
+        if ENABLE_DE:
+            clxq = y[IX_CLXQ]
+            thetaq = y[IX_THETAQ]
+            dgrho = dgrho + grhov_t * clxq
+            dgq = dgq + grhov_t * (1.0 + w_Q) * thetaq / k
+        if ENABLE_MNU:
+            # Momentum integrals of the phase-space perturbation:
+            #   drho_nu = sum_i w_i psi0_i / v_i ,   f_nu = sum_i w_i psi1_i
+            drhonu = 0.0
+            fnu = 0.0
+            for qi in range(NQ):
+                b = IX_MNU + qi * NPSI
+                vq = 1.0 / math.sqrt(1.0 + (a * amnu / q_dev[qi]) ** 2)
+                drhonu += w_dev[qi] * y[b] / vq
+                fnu += w_dev[qi] * y[b + 1]
+            dgrho = dgrho + grhor_nu * n_mnu * drhonu / a2
+            dgq = dgq + grhor_nu * n_mnu * fnu / a2
+        # Curved-geometry metric relations (CLASS perturbations.c, synchronous):
+        #   h'    = (k^2 s2^2 eta + 1.5 a^2 delta_rho)/(0.5 aH),   z = h'/(2k)
+        #   eta'  = (1.5 a^2 (rho+p)theta + 0.5 K h')/(k^2 s2^2)
+        #   sigma = k alpha = (z + 1.5 dgq/k^2)/s2^2
+        # with K = -grhok/3 and s2^2 = 1 - 3K/k^2 = 1 + grhok/k^2 (= 1 when flat).
+        s2 = 1.0 + grhok / (k * k)
+        Kcurv = -grhok / 3.0
+        z = (0.5 * dgrho / k + s2 * etak) / adotoa
+        sigma = (z + 1.5 * dgq / (k * k)) / s2
+        photbar = grhog_t / grhob_t
+        pb43 = 4.0 / 3.0 * photbar
+        delta_p_b = cs2 * clxb
+        polter = pig / 10.0 + 9.0 * e2 / 15.0
+        vbdot = -adotoa * vb + k * delta_p_b - photbar * opacity * (4.0 * vb / 3.0 - qg)
+
+        for i in range(NVAR):
+            out[i] = 0.0
+        out[IX_ETAK] = (0.5 * dgq + Kcurv * z) / s2
+        out[IX_CLXC] = -k * z
+        out[IX_CLXB] = -k * (z + vb)
+        out[IX_VB] = vbdot
+        out[IX_G] = -k * (4.0 * z / 3.0 + qg)
+        out[IX_G + 1] = (
+            4.0 * (-vbdot - adotoa * vb + k * delta_p_b) / (3.0 * pb43)
+            + k * clxg / 3.0
+            - 2.0 * k * pig / 3.0
+        )
+        out[IX_G + 2] = (
+            2.0 * k * qg / 5.0
+            - 3.0 * k * y[IX_G + 3] / 5.0
+            - opacity * (pig - polter)
+            + 8.0 * k * sigma / 15.0
+        )
+        for ell in range(3, LMAX_G):
+            out[IX_G + ell] = (
+                k * ell * y[IX_G + ell - 1] / (2 * ell + 1)
+                - k * (ell + 1) * y[IX_G + ell + 1] / (2 * ell + 1)
+                - opacity * y[IX_G + ell]
+            )
+        out[IX_G + LMAX_G] = (
+            k * y[IX_G + LMAX_G - 1]
+            - (LMAX_G + 1) * y[IX_G + LMAX_G] / tau
+            - opacity * y[IX_G + LMAX_G]
+        )
+
+        out[IX_POL] = -opacity * (e2 - polter) - k * y[IX_POL + 1] / 3.0
+        for ell in range(3, LMAX_POL):
+            idx = IX_POL + ell - 2
+            polfac = (ell + 3) * (ell - 1) / (ell + 1)
+            out[idx] = (
+                -opacity * y[idx]
+                + k * ell * y[idx - 1] / (2 * ell + 1)
+                - polfac * k * y[idx + 1] / (2 * ell + 1)
+            )
+        idx_last = IX_POL + LMAX_POL - 2
+        out[idx_last] = (
+            -opacity * y[idx_last]
+            + k * LMAX_POL * y[idx_last - 1] / (2 * LMAX_POL + 1)
+            - (LMAX_POL + 3) * y[idx_last] / tau
+        )
+
+        out[IX_R] = -k * (4.0 * z / 3.0 + qr)
+        out[IX_R + 1] = k * (clxr - 2.0 * pir) / 3.0
+        out[IX_R + 2] = (
+            2.0 * k * qr / 5.0 - 3.0 * k * y[IX_R + 3] / 5.0 + 8.0 * k * sigma / 15.0
+        )
+        for ell in range(3, LMAX_NR):
+            out[IX_R + ell] = k * ell * y[IX_R + ell - 1] / (2 * ell + 1) - k * (
+                ell + 1
+            ) * y[IX_R + ell + 1] / (2 * ell + 1)
+        out[IX_R + LMAX_NR] = (
+            k * y[IX_R + LMAX_NR - 1] - (LMAX_NR + 1) * y[IX_R + LMAX_NR] / tau
+        )
+
+        if ENABLE_DE:
+            cs2_Q = p[IX_CS2_DE]
+            w_Q_prime = -wa * adotoa * a
+            ca2_Q = w_Q - w_Q_prime / (3.0 * (1.0 + w_Q) * adotoa)
+            out[IX_CLXQ] = (
+                -(1.0 + w_Q) * (thetaq + k * z)
+                - 3.0 * (cs2_Q - w_Q) * adotoa * clxq
+                - 9.0 * (1.0 + w_Q) * (cs2_Q - ca2_Q) * adotoa**2 / k**2 * thetaq
+            )
+            out[IX_THETAQ] = (
+                -(1.0 - 3.0 * cs2_Q) * adotoa * thetaq
+                + cs2_Q / (1.0 + w_Q) * k**2 * clxq
+            )
+
+        if ENABLE_MNU:
+            # Massive-neutrino phase-space hierarchy (Ma & Bertschinger; CLASS
+            # perturbations.c, synchronous gauge with metric_continuity = h'/2,
+            # metric_euler = 0, metric_shear = k*sigma, and h' = 2 k z):
+            #   psi0' = -k v psi1 + (k z / 3) dlnf0
+            #   psi1' = (k v / 3) (psi0 - 2 psi2)
+            #   psi2' = (k v / 5) (2 psi1 - 3 psi3) - (2/15) k sigma dlnf0
+            #   psi_l' = (k v / (2l+1)) (l psi_{l-1} - (l+1) psi_{l+1})
+            #   psi_L' = k v psi_{L-1} - (L+1) psi_L / tau
+            for qi in range(NQ):
+                b = IX_MNU + qi * NPSI
+                vq = 1.0 / math.sqrt(1.0 + (a * amnu / q_dev[qi]) ** 2)
+                kv = k * vq
+                dl = dlf_dev[qi]
+                out[b] = -kv * y[b + 1] + (k * z / 3.0) * dl
+                out[b + 1] = kv / 3.0 * (y[b] - 2.0 * y[b + 2])
+                out[b + 2] = (
+                    kv / 5.0 * (2.0 * y[b + 1] - 3.0 * y[b + 3])
+                    - (2.0 / 15.0) * k * sigma * dl
+                )
+                for ell in range(3, LMAXNU):
+                    out[b + ell] = (
+                        kv
+                        / (2.0 * ell + 1.0)
+                        * (ell * y[b + ell - 1] - (ell + 1.0) * y[b + ell + 1])
+                    )
+                out[b + LMAXNU] = (
+                    kv * y[b + LMAXNU - 1] - (LMAXNU + 1.0) * y[b + LMAXNU] / tau
+                )
+
+    dense_position = {
+        state_index: dense_index
+        for dense_index, state_index in enumerate(schur_solver.dense_idx)
+    }
+    D_ETAK = dense_position[IX_ETAK]
+    D_CLXC = dense_position[IX_CLXC]
+    D_CLXB = dense_position[IX_CLXB]
+    D_VB = dense_position[IX_VB]
+    D_G = dense_position[IX_G]
+    D_QG = dense_position[IX_G + 1]
+    D_PIG = dense_position[IX_G + 2]
+    D_POL = dense_position[IX_POL]
+    D_R = dense_position[IX_R]
+    D_QR = dense_position[IX_R + 1]
+    D_PIR = dense_position[IX_R + 2]
+    D_CLXQ = dense_position[IX_CLXQ] if ENABLE_DE else 0
+    D_THETAQ = dense_position[IX_THETAQ] if ENABLE_DE else 0
+    D_MNU = dense_position[layout.ix_psi(0, 0)] if ENABLE_MNU else 0
+
+    B_G = schur_solver.k_bases.index(IX_G + 3)
+    B_POL = schur_solver.k_bases.index(IX_POL + 1)
+    B_R = schur_solver.k_bases.index(IX_R + 3)
+    B_MNU = (
+        schur_solver.k_bases.index(layout.ix_psi(3, 0)) if ENABLE_MNU else 0
+    )
+
+    D_SIZE = schur_solver.d_size
+    TL = schur_solver.tridiag_len
+    JAC_SIZE = schur_solver.jac_size
+    J_DENSE = schur_solver.jac_dense_off
+    J_DIAG = schur_solver.jac_diag_off
+    J_UPPER = schur_solver.jac_upper_off
+    J_LOWER = schur_solver.jac_lower_off
+    J_C0 = schur_solver.jac_c0_off
+
+    @cuda.jit(device=True)
+    def jac(y, tau, p, out):
+        # The system is linear in y, so only background-dependent coefficients
+        # are required. Curvature corrections are intentionally omitted here:
+        # Rodas5P is a Rosenbrock-W method and accepts this approximate Jacobian.
+        for i in range(JAC_SIZE):
+            out[i] = 0.0
+
+        k = p[IX_K]
+        log_tau = math.log(tau)
+        a = spline_eval(log_tau, p, 0)
+        opacity = spline_eval(log_tau, p, 1)
+        cs2 = spline_eval(log_tau, p, 2)
+        if opacity < 1.0e-30:
+            opacity = 1.0e-30
+        if cs2 < 0.0:
+            cs2 = 0.0
+
+        a2 = a * a
+        grhog_t = p[0] / a2
+        grhor_t = p[1] / a2
+        grhoc_t = p[2] / a
+        grhob_t = p[3] / a
+        if ENABLE_DE:
+            w0 = p[IX_W_DE_0]
+            wa = p[IX_W_DE_A]
+            cs2_Q = p[IX_CS2_DE]
+            w_Q = w0 + wa * (1.0 - a)
+            rho_Q = a ** (-3.0 * (1.0 + w0 + wa)) * math.exp(
+                3.0 * (a - 1.0) * wa
+            )
+            grhov_t = p[4] * rho_Q * a2
+        else:
+            grhov_t = p[4] * a2
+
+        if ENABLE_MNU:
+            grhor_nu = p[IX_GRHOR_NU]
+            n_mnu = p[IX_NMNU]
+            amnu = p[IX_AMNU]
+            rhonu = spline_eval(log_tau, p, 3)
+            grho_mnu_t = grhor_nu * n_mnu * rhonu / a2
+        else:
+            grho_mnu_t = 0.0
+
+        grhok = p[IX_GRHOK]
+        adotoa = math.sqrt(
+            (
+                grhog_t
+                + grhor_t
+                + grho_mnu_t
+                + grhoc_t
+                + grhob_t
+                + grhov_t
+                + grhok
+            )
+            / 3.0
+        )
+        photbar = grhog_t / grhob_t
+        pb43 = 4.0 * photbar / 3.0
+
+        zc = cuda.local.array(D_SIZE, float64)
+        sigc = cuda.local.array(D_SIZE, float64)
+        for i in range(D_SIZE):
+            zc[i] = 0.0
+            sigc[i] = 0.0
+
+        zc[D_ETAK] = 1.0 / adotoa
+        zc[D_CLXB] = 0.5 * grhob_t / (k * adotoa)
+        zc[D_CLXC] = 0.5 * grhoc_t / (k * adotoa)
+        zc[D_G] = 0.5 * grhog_t / (k * adotoa)
+        zc[D_R] = 0.5 * grhor_t / (k * adotoa)
+        if ENABLE_DE:
+            zc[D_CLXQ] = 0.5 * grhov_t / (k * adotoa)
+        if ENABLE_MNU:
+            for qi in range(NQ):
+                d0 = D_MNU + 3 * qi
+                vq = 1.0 / math.sqrt(1.0 + (a * amnu / q_dev[qi]) ** 2)
+                zc[d0] = (
+                    0.5
+                    * (grhor_nu * n_mnu * w_dev[qi] / (vq * a2))
+                    / (k * adotoa)
+                )
+
+        for i in range(D_SIZE):
+            sigc[i] = zc[i]
+        sigc[D_VB] = 1.5 * grhob_t / (k * k)
+        sigc[D_QG] = 1.5 * grhog_t / (k * k)
+        sigc[D_QR] = 1.5 * grhor_t / (k * k)
+        if ENABLE_DE:
+            sigc[D_THETAQ] = 1.5 * grhov_t * (1.0 + w_Q) / k**3
+        if ENABLE_MNU:
+            for qi in range(NQ):
+                d0 = D_MNU + 3 * qi
+                velmnu = grhor_nu * n_mnu * w_dev[qi] / a2
+                sigc[d0 + 1] = 1.5 * velmnu / (k * k)
+
+        # Metric row and the z/sigma outer-product couplings.
+        out[J_DENSE + D_ETAK * D_SIZE + D_VB] = 0.5 * grhob_t
+        out[J_DENSE + D_ETAK * D_SIZE + D_QG] = 0.5 * grhog_t
+        out[J_DENSE + D_ETAK * D_SIZE + D_QR] = 0.5 * grhor_t
+        if ENABLE_DE:
+            out[J_DENSE + D_ETAK * D_SIZE + D_THETAQ] = (
+                0.5 * grhov_t * (1.0 + w_Q) / k
+            )
+        if ENABLE_MNU:
+            for qi in range(NQ):
+                d0 = D_MNU + 3 * qi
+                velmnu = grhor_nu * n_mnu * w_dev[qi] / a2
+                out[J_DENSE + D_ETAK * D_SIZE + d0 + 1] = 0.5 * velmnu
+
+        for c in range(D_SIZE):
+            z_coeff = zc[c]
+            sigma_coeff = sigc[c]
+            out[J_DENSE + D_CLXC * D_SIZE + c] += -k * z_coeff
+            out[J_DENSE + D_CLXB * D_SIZE + c] += -k * z_coeff
+            out[J_DENSE + D_G * D_SIZE + c] += -(4.0 * k / 3.0) * z_coeff
+            out[J_DENSE + D_R * D_SIZE + c] += -(4.0 * k / 3.0) * z_coeff
+            out[J_DENSE + D_PIG * D_SIZE + c] += (
+                8.0 * k / 15.0
+            ) * sigma_coeff
+            out[J_DENSE + D_PIR * D_SIZE + c] += (
+                8.0 * k / 15.0
+            ) * sigma_coeff
+            if ENABLE_DE:
+                out[J_DENSE + D_CLXQ * D_SIZE + c] += (
+                    -(1.0 + w_Q) * k * z_coeff
+                )
+            if ENABLE_MNU:
+                for qi in range(NQ):
+                    d0 = D_MNU + 3 * qi
+                    dlf = dlf_dev[qi]
+                    out[J_DENSE + d0 * D_SIZE + c] += (
+                        k * dlf / 3.0
+                    ) * z_coeff
+                    out[J_DENSE + (d0 + 2) * D_SIZE + c] += (
+                        -(2.0 / 15.0) * k * dlf
+                    ) * sigma_coeff
+
+        out[J_DENSE + D_CLXB * D_SIZE + D_VB] += -k
+        out[J_DENSE + D_G * D_SIZE + D_QG] += -k
+        out[J_DENSE + D_R * D_SIZE + D_QR] += -k
+
+        # Baryon velocity and photon dipole.
+        vbf_vb = -adotoa - 4.0 * photbar * opacity / 3.0
+        vbf_clxb = k * cs2
+        vbf_qg = photbar * opacity
+        dipole_factor = -4.0 / (3.0 * pb43)
+
+        out[J_DENSE + D_VB * D_SIZE + D_VB] += vbf_vb
+        out[J_DENSE + D_VB * D_SIZE + D_CLXB] += vbf_clxb
+        out[J_DENSE + D_VB * D_SIZE + D_QG] += vbf_qg
+        out[J_DENSE + D_QG * D_SIZE + D_VB] += dipole_factor * vbf_vb
+        out[J_DENSE + D_QG * D_SIZE + D_CLXB] += dipole_factor * vbf_clxb
+        out[J_DENSE + D_QG * D_SIZE + D_QG] += dipole_factor * vbf_qg
+        out[J_DENSE + D_QG * D_SIZE + D_VB] += (
+            -4.0 * adotoa / (3.0 * pb43)
+        )
+        out[J_DENSE + D_QG * D_SIZE + D_CLXB] += (
+            4.0 * k * cs2 / (3.0 * pb43)
+        )
+        out[J_DENSE + D_QG * D_SIZE + D_G] += k / 3.0
+        out[J_DENSE + D_QG * D_SIZE + D_PIG] += -2.0 * k / 3.0
+
+        # Photon shear and temperature hierarchy.
+        out[J_DENSE + D_PIG * D_SIZE + D_QG] += 2.0 * k / 5.0
+        out[J_DENSE + D_PIG * D_SIZE + D_PIG] += -0.9 * opacity
+        out[J_DENSE + D_PIG * D_SIZE + D_POL] += 0.6 * opacity
+        out[J_C0 + B_G] = -3.0 * k / 5.0
+        for ell in range(3, LMAX_G):
+            i = ell - 3
+            out[J_LOWER + B_G * TL + i] = k * ell / (2 * ell + 1)
+            out[J_DIAG + B_G * TL + i] = -opacity
+            out[J_UPPER + B_G * (TL - 1) + i] = (
+                -k * (ell + 1) / (2 * ell + 1)
+            )
+        out[J_LOWER + B_G * TL + TL - 1] = k
+        out[J_DIAG + B_G * TL + TL - 1] = -(LMAX_G + 1.0) / tau - opacity
+
+        # E-mode polarization hierarchy.
+        out[J_DENSE + D_POL * D_SIZE + D_PIG] += 0.1 * opacity
+        out[J_DENSE + D_POL * D_SIZE + D_POL] += -0.4 * opacity
+        out[J_C0 + B_POL] = -k / 3.0
+        for ell in range(3, LMAX_POL):
+            i = ell - 3
+            polfac = (ell + 3.0) * (ell - 1.0) / (ell + 1.0)
+            out[J_LOWER + B_POL * TL + i] = k * ell / (2 * ell + 1)
+            out[J_DIAG + B_POL * TL + i] = -opacity
+            out[J_UPPER + B_POL * (TL - 1) + i] = (
+                -polfac * k / (2 * ell + 1)
+            )
+        out[J_LOWER + B_POL * TL + TL - 1] = (
+            k * LMAX_POL / (2 * LMAX_POL + 1)
+        )
+        out[J_DIAG + B_POL * TL + TL - 1] = (
+            -opacity - (LMAX_POL + 3.0) / tau
+        )
+
+        # Massless-neutrino hierarchy.
+        out[J_DENSE + D_QR * D_SIZE + D_R] = k / 3.0
+        out[J_DENSE + D_QR * D_SIZE + D_PIR] = -2.0 * k / 3.0
+        out[J_DENSE + D_PIR * D_SIZE + D_QR] += 2.0 * k / 5.0
+        out[J_C0 + B_R] = -3.0 * k / 5.0
+        for ell in range(3, LMAX_NR):
+            i = ell - 3
+            out[J_LOWER + B_R * TL + i] = k * ell / (2 * ell + 1)
+            out[J_UPPER + B_R * (TL - 1) + i] = (
+                -k * (ell + 1) / (2 * ell + 1)
+            )
+        out[J_LOWER + B_R * TL + TL - 1] = k
+        out[J_DIAG + B_R * TL + TL - 1] = -(LMAX_NR + 1.0) / tau
+
+        if ENABLE_DE:
+            w_Q_prime = -wa * adotoa * a
+            ca2_Q = w_Q - w_Q_prime / (3.0 * (1.0 + w_Q) * adotoa)
+            out[J_DENSE + D_CLXQ * D_SIZE + D_CLXQ] += (
+                -3.0 * (cs2_Q - w_Q) * adotoa
+            )
+            out[J_DENSE + D_CLXQ * D_SIZE + D_THETAQ] += (
+                -(1.0 + w_Q)
+                - 9.0
+                * (1.0 + w_Q)
+                * (cs2_Q - ca2_Q)
+                * adotoa**2
+                / k**2
+            )
+            out[J_DENSE + D_THETAQ * D_SIZE + D_CLXQ] = (
+                cs2_Q * k**2 / (1.0 + w_Q)
+            )
+            out[J_DENSE + D_THETAQ * D_SIZE + D_THETAQ] = (
+                -(1.0 - 3.0 * cs2_Q) * adotoa
+            )
+
+        if ENABLE_MNU:
+            for qi in range(NQ):
+                d0 = D_MNU + 3 * qi
+                block = B_MNU + qi
+                vq = 1.0 / math.sqrt(1.0 + (a * amnu / q_dev[qi]) ** 2)
+                kv = k * vq
+
+                out[J_DENSE + d0 * D_SIZE + d0 + 1] += -kv
+                out[J_DENSE + (d0 + 1) * D_SIZE + d0] = kv / 3.0
+                out[J_DENSE + (d0 + 1) * D_SIZE + d0 + 2] = -2.0 * kv / 3.0
+                out[J_DENSE + (d0 + 2) * D_SIZE + d0 + 1] += 2.0 * kv / 5.0
+                out[J_C0 + block] = -3.0 * kv / 5.0
+
+                for ell in range(3, LMAXNU):
+                    i = ell - 3
+                    out[J_LOWER + block * TL + i] = (
+                        kv * ell / (2 * ell + 1)
+                    )
+                    out[J_UPPER + block * (TL - 1) + i] = (
+                        -kv * (ell + 1) / (2 * ell + 1)
+                    )
+                out[J_LOWER + block * TL + TL - 1] = kv
+                out[J_DIAG + block * TL + TL - 1] = -(LMAXNU + 1.0) / tau
+
+    @cuda.jit(device=True)
+    def time_jac(y, tau, p, out):
+        eps = 1.0e-6 * max(abs(tau), 1.0)
+        fp = cuda.local.array(NVAR, float64)
+        fm = cuda.local.array(NVAR, float64)
+        rhs(y, tau + eps, p, fp)
+        rhs(y, tau - eps, p, fm)
+        inv = 1.0 / (2.0 * eps)
+        for i in range(NVAR):
+            out[i] = (fp[i] - fm[i]) * inv
+
+    return rhs, jac, time_jac
+
+
+class _PreparedSolve(NamedTuple):
+    """Compiled artifacts shared by every cosmology of a (possibly batched) solve."""
+
+    cosmologies: tuple
+    layout: object
+    tables: tuple  # per-cosmology (tau_grid, values, seconds, tau0)
+    tau0: np.ndarray  # (n_cosmologies,)
+    rhs: object
+    jac: object
+    time_jac: object
+    lu_solver: object
+
+
+_PREPARED_SOLVE_CACHE: dict = {}
+_PACKED_BATCH_CACHE: dict = {}
+
+
+def _stack_thermo_tables(tables):
+    """Stack per-cosmology thermo tables for the multi-cosmology device evaluator.
+
+    Returns ``(tau_min, inv_dtau, values, seconds, tau0)`` where ``values`` and
+    ``seconds`` are ``(n_cosmologies, n_channels, n_grid)`` and the rest are
+    ``(n_cosmologies,)``. The device spline evaluator selects a cosmology's row
+    by the per-trajectory ``IX_COSMOLOGY`` tag.
+    """
+
+    tau_min = np.array([np.log(t[0][0]) for t in tables], dtype=np.float64)
+    inv_dtau = np.array(
+        [(t[0].shape[0] - 1) / (np.log(t[0][-1]) - np.log(t[0][0])) for t in tables],
+        dtype=np.float64,
+    )
+    values = np.stack([t[1] for t in tables])
+    seconds = np.stack([t[2] for t in tables])
+    tau0 = np.array([t[3] for t in tables], dtype=np.float64)
+    return tau_min, inv_dtau, values, seconds, tau0
+
+
+def _build_schur_solver(layout):
+    """Build the Schur-EB block-LU matching a perturbation layout.
+
+    The state splits into a densely-coupled core (metric / fluid / low multipoles
+    [+ DE fluid] [+ psi0,1,2 per massive-nu bin]) bordered by free-streaming
+    tridiagonal blocks (photon, polarization, massless-nu [+ one tail per bin]),
+    each coupling into the core only through its lowest multipole.
+    """
+
+    from .schur_eb import DENSE_IDX, K_BASES, DENSE_C0, A_SIZE, SchurEBSolver
+
+    dense_idx = list(DENSE_IDX)
+    k_bases = list(K_BASES)
+    dense_c0 = list(DENSE_C0)
+    if layout.enable_dark_energy:
+        dense_idx += [layout.ix_clxq, layout.ix_thetaq]
+    if layout.has_massive_neutrinos:
+        for qi in range(layout.nqmax):
+            dense_c0.append(len(dense_idx) + 2)  # position of psi2(q) in the core
+            dense_idx += [layout.ix_psi(l, qi) for l in (0, 1, 2)]
+            k_bases.append(layout.ix_psi(3, qi))
+
+    return SchurEBSolver(
+        batches_per_block=BATCHES_PER_BLOCK,
+        block_dim=(BATCHES_PER_BLOCK, 1, 1),
+        dense_idx=tuple(dense_idx),
+        k_bases=tuple(k_bases),
+        dense_c0=tuple(dense_c0),
+        tridiag_len=A_SIZE,
+        nvar=layout.nvar,
+    )
+
+
+def _prepare_solve(cosmologies) -> _PreparedSolve:
+    """Return (and cache) the compiled solve artifacts for a batch of cosmologies.
+
+    The thermodynamics tables, the numba-CUDA right-hand side / Jacobian device
+    functions, and the Schur-EB block-LU depend only on the cosmologies (and the
+    module-level grid and quadrature presets), not on the wave modes, the save
+    times, or the solver tolerances. They are also what triggers the *slow*
+    numba-CUDA kernel compilation: the returned ``rhs`` / ``jac`` / ``time_jac``
+    closures and the :class:`SchurEBSolver` instance are the identity keys of
+    :func:`discoeb.integrators.rodas5Pnumba_solve`'s compiled-kernel cache, so
+    reusing the same objects across solves of the same batch turns a repeated
+    solve from a full recompile (tens of seconds) into a bare kernel launch.
+
+    All cosmologies in a batch must share a perturbation layout (same dark-energy
+    and massive-neutrino settings); one compiled kernel then solves them all,
+    selecting each cosmology's thermodynamics table by the ``IX_COSMOLOGY`` tag.
+
+    The cache is unbounded and holds device memory (one thermodynamics table set
+    plus the compiled kernel per distinct batch); sweeping many batches
+    accumulates GPU allocations. Call :func:`clear_prepared_solve_cache` to
+    release them.
+    """
+
+    from .schur_eb import A_SIZE
+
+    cosmologies = tuple(_as_cosmology(cosmology) for cosmology in cosmologies)
+    # Include the presets that change the compiled artifacts, so a caller that
+    # rebinds them (e.g. NQMAX) does not get a stale kernel.
+    key = (cosmologies, NQMAX, N_THERMO_GRID, TAU_START, BATCHES_PER_BLOCK)
+    cached = _PREPARED_SOLVE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    layout = PerturbationLayout.from_cosmology(cosmologies[0], nqmax=NQMAX)
+    for cosmology in cosmologies[1:]:
+        if PerturbationLayout.from_cosmology(cosmology, nqmax=NQMAX) != layout:
+            raise ValueError(
+                "all cosmologies in a batch must share a perturbation layout "
+                "(same dark-energy / massive-neutrino settings)"
+            )
+    if layout.has_massive_neutrinos and layout.lmaxnu - 2 != A_SIZE:
+        raise NotImplementedError(
+            "the Schur-EB solver requires all tridiagonal blocks to share a length; "
+            f"massive-nu needs lmaxnu - 2 == {A_SIZE} (got {layout.lmaxnu})"
+        )
+
+    tables = tuple(build_thermo_tables(c) for c in cosmologies)
+    tau_min, inv_dtau, values, seconds, tau0 = _stack_thermo_tables(tables)
+    lu_solver = _build_schur_solver(layout)
+    rhs, jac, time_jac = build_numba_callbacks(
+        layout, tau_min, inv_dtau, values, seconds, lu_solver
+    )
+
+    prepared = _PreparedSolve(
+        cosmologies, layout, tables, tau0, rhs, jac, time_jac, lu_solver
+    )
+    _PREPARED_SOLVE_CACHE[key] = prepared
+    return prepared
+
+
+def _pack_batch(prepared, k_values, tau_save=None):
+    """Return (and cache) the packed ``(params, y0, t_span, order, k_sorted)``.
+
+    Building the packed inputs means one :func:`make_initial_states` per cosmology
+    -- i.e. ``n_cosmologies * n_k`` scalar :func:`adiabatic_initial_conditions`
+    calls, tens of milliseconds for a large batch. That work depends only on the
+    cosmologies and the wave modes (not the solver tolerances), so it is cached
+    on ``(cosmologies, k, tau_save)``; a repeated solve of the same batch then
+    skips straight to the kernel launch.
+
+    ``tau_save`` is the shared grid of conformal times at which every trajectory
+    is recorded (the CMB line-of-sight integration needs a dense one). It
+    defaults to just the two endpoints, i.e. the final state only.
+    """
+
+    k_arr = np.ascontiguousarray(np.asarray(k_values, dtype=np.float64))
+    tau_key = None if tau_save is None else np.asarray(tau_save, np.float64).tobytes()
+    key = (prepared.cosmologies, k_arr.shape, k_arr.tobytes(), tau_key)
+    cached = _PACKED_BATCH_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    layout = prepared.layout
+    n_cosmo = len(prepared.cosmologies)
+    order = np.argsort(k_arr, kind="stable")
+    k_sorted = k_arr[order]
+    n_k = len(k_sorted)
+
+    # Pack trajectories as row = k_idx * n_cosmo + cosmology_idx, so a block of
+    # BATCHES_PER_BLOCK consecutive rows shares one wave mode when
+    # n_cosmo >= BATCHES_PER_BLOCK: neighbouring threads then take near-identical
+    # adaptive steps, minimizing warp divergence.
+    n_traj = n_k * n_cosmo
+    params = np.empty((n_traj, N_PARAM), dtype=np.float64)
+    y0 = np.empty((n_traj, layout.nvar), dtype=np.float64)
+    for ci, cosmology in enumerate(prepared.cosmologies):
+        base = make_params(cosmology, k_sorted, float(prepared.tau0[ci]))
+        base[:, IX_COSMOLOGY] = float(ci)
+        params[ci::n_cosmo] = base
+        y0[ci::n_cosmo] = make_initial_states(cosmology, k_sorted, layout)
+    params = np.ascontiguousarray(params)
+    y0 = np.ascontiguousarray(y0)
+
+    # Each trajectory stops at its own tau0 (IX_TAU_END); the shared save grid
+    # runs to the largest tau0 and the trailing save slot holds each trajectory's
+    # final state.
+    if tau_save is None:
+        t_span = np.asarray((TAU_START, float(np.max(prepared.tau0))), dtype=np.float64)
+    else:
+        t_span = np.ascontiguousarray(np.asarray(tau_save, dtype=np.float64))
+
+    packed = (params, y0, t_span, order, k_sorted)
+    _PACKED_BATCH_CACHE[key] = packed
+    return packed
+
+
+def clear_prepared_solve_cache() -> None:
+    """Drop all cached prepared and packed solves, releasing their device memory."""
+
+    _PREPARED_SOLVE_CACHE.clear()
+    _PACKED_BATCH_CACHE.clear()
+    _THERMO_TABLE_CACHE.clear()
+
+
+def solve_perturbation_history(
+    k_values,
+    cosmology,
+    *,
+    tau_save=None,
+    as_jax: bool = False,
+    rtol: float = PERTURB_RTOL,
+    atol: float = PERTURB_ATOL,
+    first_step: float = PERTURB_FIRST_STEP,
+    max_steps: int = PERTURB_MAX_STEPS,
+):
+    """Solve the perturbation hierarchy and return the saved state history.
+
+    Parameters
+    ----------
+    tau_save : array_like, optional
+        Strictly increasing conformal times at which to record the state. The
+        first entry must be ``TAU_START`` and the last ``tau0``. Defaults to just
+        the two endpoints, i.e. the final state only. The line-of-sight CMB
+        integration needs a dense grid through recombination instead.
+    as_jax : bool, optional
+        Return the history as a device-resident JAX array instead of copying it
+        back to host NumPy. The solver's output already lives on the GPU (the
+        numba kernel is invoked through a JAX FFI custom call), so this keeps the
+        whole downstream pipeline -- e.g. the CMB source construction and
+        line-of-sight projection -- on device with no host round-trip.
+
+    Returns
+    -------
+    (history, layout, tables)
+        ``history`` has shape ``(n_k, len(tau_save), nvar)`` in the caller's
+        original ``k`` order; ``tables`` is the ``build_thermo_tables`` tuple.
+    """
+
+    from .integrators import rodas5Pnumba_solve
+
+    prepared = _prepare_solve((cosmology,))
+    cosmology = prepared.cosmologies[0]
+    layout = prepared.layout
+    tau0 = float(prepared.tau0[0])
+
+    k_arr = np.ascontiguousarray(np.asarray(k_values, dtype=np.float64))
+    order = np.argsort(k_arr, kind="stable")
+    k_sorted = k_arr[order]
+
+    params = np.ascontiguousarray(make_params(cosmology, k_sorted, tau0))
+    y0 = np.ascontiguousarray(make_initial_states(cosmology, k_sorted, layout))
+    if tau_save is None:
+        t_span = np.asarray((TAU_START, tau0), dtype=np.float64)
+    else:
+        t_span = np.ascontiguousarray(np.asarray(tau_save, dtype=np.float64))
+
+    sol = rodas5Pnumba_solve(
+        prepared.rhs,
+        prepared.jac,
+        y0,
+        t_span,
+        params,
+        time_jac_fn=prepared.time_jac,
+        lu_precision="fp32",
+        custom_lu_solver=prepared.lu_solver,
+        rtol=rtol,
+        atol=atol,
+        first_step=first_step,
+        max_steps=max_steps,
+        pcoeff=0.3,
+        icoeff=0.4,
+        batches_per_block=BATCHES_PER_BLOCK,
+        tf_local_idx=IX_TAU_END,
+    )
+    # The solver returns trajectories in ascending-k order; undo the sort. The
+    # inverse permutation is a host-side constant, so the reorder is a plain
+    # gather that works equally on device (JAX) or host (NumPy).
+    inv_order = np.argsort(order)
+    if as_jax:
+        import jax.numpy as jnp
+
+        return jnp.asarray(sol)[jnp.asarray(inv_order)], layout, prepared.tables[0]
+
+    hist_sorted = np.asarray(sol)  # (n_k, n_save, nvar)
+    return hist_sorted[inv_order], layout, prepared.tables[0]
+
+
+def solve_perturbation_history_batch(
+    k_values,
+    cosmologies,
+    *,
+    tau_save,
+    rtol: float = PERTURB_RTOL,
+    atol: float = PERTURB_ATOL,
+    first_step: float = PERTURB_FIRST_STEP,
+    max_steps: int = PERTURB_MAX_STEPS,
+):
+    """Solve a batch of cosmologies on a shared ``tau_save`` grid in one launch.
+
+    All ``n_cosmologies * n_k`` trajectories are integrated by a single
+    ``rodas5Pnumba`` launch. Each trajectory still stops at its *own* ``tau0``
+    (via ``IX_TAU_END``), so save times beyond a cosmology's ``tau0`` simply hold
+    its frozen final state -- consumers must mask them (see
+    :func:`discoeb.cmb.cmb_spectrum_from_sources`).
+
+    Returns
+    -------
+    (history, k_sorted, prepared)
+        ``history`` is a device-resident JAX array of shape
+        ``(n_k, n_cosmologies, len(tau_save), nvar)``, with the wave modes in
+        **ascending** order (``k_sorted``).
+
+        The history is deliberately left in this layout: it is the solver's own
+        packing, so the reshape is a free view. Transposing to a cosmology-major
+        layout, or gathering the wave modes back into the caller's order, would
+        each need a full second copy of the array -- 6.5 GB for a 128-cosmology,
+        1000-save-point batch, enough to exhaust a 12 GB GPU on its own. Ascending
+        ``k`` is what the downstream spline and the ``dln k`` quadrature want
+        anyway.
+    """
+
+    import jax.numpy as jnp
+
+    from .integrators import rodas5Pnumba_solve
+
+    prepared = _prepare_solve(tuple(cosmologies))
+    layout = prepared.layout
+    n_cosmo = len(prepared.cosmologies)
+
+    params, y0, t_span, order, k_sorted = _pack_batch(prepared, k_values, tau_save)
+    n_k = len(k_sorted)
+
+    sol = rodas5Pnumba_solve(
+        prepared.rhs,
+        prepared.jac,
+        y0,
+        t_span,
+        params,
+        time_jac_fn=prepared.time_jac,
+        lu_precision="fp32",
+        custom_lu_solver=prepared.lu_solver,
+        rtol=rtol,
+        atol=atol,
+        first_step=first_step,
+        max_steps=max_steps,
+        pcoeff=0.3,
+        icoeff=0.4,
+        batches_per_block=BATCHES_PER_BLOCK,
+        tf_local_idx=IX_TAU_END,
+    )
+    # Rows are packed k-major (row = k_idx * n_cosmo + cosmology_idx), so this
+    # reshape is a free view -- no copy of the (potentially multi-GB) history.
+    hist = jnp.asarray(sol).reshape(n_k, n_cosmo, len(t_span), layout.nvar)
+    return hist, k_sorted, prepared
+
+
+def solve_perturbations(k_values, cosmology, **solve_kwargs):
+    """Solve the perturbation hierarchy for each ``k`` and return final states.
+
+    Returns
+    -------
+    np.ndarray
+        Final perturbation state for each wave mode, shape ``(n_k, nvar)``,
+        evaluated at ``tau0`` (today).
+    """
+
+    solve_kwargs.pop("tau_save", None)
+    hist, _, _ = solve_perturbation_history(k_values, cosmology, **solve_kwargs)
+    return hist[:, -1, :]
+
+
+def solve_matter_power_spectrum(
+    k_values,
+    cosmology,
+    **solve_kwargs,
+) -> np.ndarray:
+    """Return the linear matter power spectrum ``P(k)`` in Mpc^3 for ``cosmology``."""
+
+    cosmology = _as_cosmology(cosmology)
+    k_arr = np.ascontiguousarray(np.asarray(k_values, dtype=np.float64))
+    y_final = solve_perturbations(k_arr, cosmology, **solve_kwargs)
+    densities = density_coefficients(cosmology)
+    grhoc_val, grhob_val = densities[2], densities[3]
+
+    pk = np.empty(len(k_arr), dtype=np.float64)
+    for i, k in enumerate(k_arr):
+        delta_m = total_matter_density_contrast(
+            grhoc_val, y_final[i, IX_CLXC], grhob_val, y_final[i, IX_CLXB]
+        )
+        pk[i] = matter_power_spectrum(
+            float(k), delta_m, cosmology.A_s, cosmology.n_s, cosmology.k_pivot
+        )
+    return pk
+
+
+def solve_matter_power_spectrum_batch(
+    k_values,
+    cosmologies,
+    *,
+    rtol: float = PERTURB_RTOL,
+    atol: float = PERTURB_ATOL,
+    first_step: float = PERTURB_FIRST_STEP,
+    max_steps: int = PERTURB_MAX_STEPS,
+) -> np.ndarray:
+    """Return ``P(k)`` for a batch of cosmologies in one GPU solve.
+
+    All cosmologies must share a perturbation layout. The ``n_cosmologies * n_k``
+    trajectories are integrated by a single ``rodas5Pnumba`` launch, so the whole
+    batch amortizes one kernel compilation and one set of device buffers.
+
+    Returns
+    -------
+    np.ndarray
+        ``P(k)`` in Mpc^3, shape ``(n_cosmologies, n_k)``, in the caller's
+        original cosmology and ``k`` order.
+    """
+
+    from .integrators import rodas5Pnumba_solve
+
+    prepared = _prepare_solve(tuple(cosmologies))
+    cosmologies = prepared.cosmologies
+    layout = prepared.layout
+    n_cosmo = len(cosmologies)
+
+    params, y0, t_span, order, k_sorted = _pack_batch(prepared, k_values)
+    n_k = len(k_sorted)
+
+    sol = rodas5Pnumba_solve(
+        prepared.rhs,
+        prepared.jac,
+        y0,
+        t_span,
+        params,
+        time_jac_fn=prepared.time_jac,
+        lu_precision="fp32",
+        custom_lu_solver=prepared.lu_solver,
+        rtol=rtol,
+        atol=atol,
+        first_step=first_step,
+        max_steps=max_steps,
+        pcoeff=0.3,
+        icoeff=0.4,
+        batches_per_block=BATCHES_PER_BLOCK,
+        tf_local_idx=IX_TAU_END,
+    )
+    y_final = np.asarray(sol)[:, -1, :].reshape(n_k, n_cosmo, layout.nvar)
+
+    pk_sorted = np.empty((n_cosmo, n_k), dtype=np.float64)
+    for ci, cosmology in enumerate(cosmologies):
+        densities = density_coefficients(cosmology)
+        grhoc_val, grhob_val = densities[2], densities[3]
+        for ki in range(n_k):
+            yv = y_final[ki, ci]
+            delta_m = total_matter_density_contrast(
+                grhoc_val, yv[IX_CLXC], grhob_val, yv[IX_CLXB]
+            )
+            pk_sorted[ci, ki] = matter_power_spectrum(
+                float(k_sorted[ki]), delta_m, cosmology.A_s, cosmology.n_s, cosmology.k_pivot
+            )
+
+    pk = np.empty_like(pk_sorted)
+    pk[:, order] = pk_sorted
+    return pk
