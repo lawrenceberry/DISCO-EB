@@ -256,3 +256,56 @@ def test_matter_power_spectrum_matches_class(n_cosmologies, benchmark):
         f"max relative error {rel[worst]:.6g} for cosmology {worst[0]} "
         f"at k={MATTER_POWER_K[worst[1]]:.6g} Mpc^-1"
     )
+
+
+DENSITY_NAMES = ("grhog", "grhornomass", "grhoc", "grhob", "grhov")
+DERIV_GATE = 1.0e-3
+
+
+def test_matter_power_spectrum_derivatives(benchmark):
+    """Time and check dP(k)/d(background densities) by forward sensitivity.
+
+    The five densities enter both the hierarchy and the matter weighting of
+    ``delta_m``, so this is the total derivative. Central differences are the
+    noisy side of the comparison: the solve runs at rtol = atol = 1e-4, which
+    bounds how well any finite difference of it can agree.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    from discoeb.perturbations import (
+        PHYSICAL_DENSITY_COLUMNS,
+        _as_cosmology,
+        density_coefficients,
+        matter_power_spectrum_jax,
+    )
+
+    cosmology = _perturbed_cosmologies(1)[0]
+    densities = jnp.asarray(
+        np.asarray(density_coefficients(_as_cosmology(cosmology)), dtype=np.float64)
+    )
+    assert densities.shape == (len(PHYSICAL_DENSITY_COLUMNS),)
+
+    def total_power(d):
+        return jnp.sum(matter_power_spectrum_jax(MATTER_POWER_K, cosmology, d))
+
+    value_and_grad = jax.value_and_grad(total_power)
+
+    def run():
+        value, grad = value_and_grad(densities)
+        return float(value), np.asarray(jax.block_until_ready(grad))
+
+    value, grad = benchmark.pedantic(run, rounds=1, warmup_rounds=1, iterations=1)
+    assert np.isfinite(grad).all(), f"non-finite gradient {grad}"
+
+    for i, name in enumerate(DENSITY_NAMES):
+        step = 1.0e-5 * abs(float(densities[i]))
+        plus = float(total_power(densities.at[i].add(step)))
+        minus = float(total_power(densities.at[i].add(-step)))
+        finite = (plus - minus) / (2.0 * step)
+        rel = abs(grad[i] - finite) / max(abs(finite), 1e-300)
+        assert rel < DERIV_GATE, (
+            f"d(sum P)/d{name}: sensitivity {grad[i]:.8e} against central "
+            f"difference {finite:.8e}, relative {rel:.3g}"
+        )

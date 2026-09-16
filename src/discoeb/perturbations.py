@@ -4066,6 +4066,110 @@ def solve_matter_power_spectrum(
     return pk
 
 
+PHYSICAL_DENSITY_COLUMNS = (0, 1, 2, 3, 4)
+"""Packed-parameter columns carrying the background densities.
+
+``(grhog, grhornomass, grhoc, grhob, grhov)`` -- the entries of a parameter row
+that are physical quantities one would differentiate. The rest of the row is
+the wave number, two integration bounds, two integer selectors and the
+dark-energy and massive-neutrino settings, none of which a gradient with
+respect to "the cosmology" wants, and two of which are not differentiable at
+all.
+"""
+
+
+def matter_power_spectrum_jax(
+    k_values,
+    cosmology,
+    densities=None,
+    *,
+    rtol: float = PERTURB_RTOL,
+    atol: float = PERTURB_ATOL,
+    first_step: float = PERTURB_FIRST_STEP,
+    max_steps: int = PERTURB_MAX_STEPS,
+):
+    """``P(k)`` as a JAX array, differentiable in the background densities.
+
+    ``densities`` is the five-vector of :data:`PHYSICAL_DENSITY_COLUMNS`,
+    defaulting to the cosmology's own. Differentiating with respect to it runs
+    modax's continuous forward-sensitivity system for those five columns only,
+    which is what ``sens_param_columns`` is for: the joint system is
+    ``n_vars * (1 + n_sens)`` components and every direction costs a
+    second-order sweep per stage, so carrying the whole seventeen-column row
+    would be three times the work for the same answer.
+
+    The densities enter twice -- through the hierarchy, and through the
+    matter-weighting of ``delta_m`` -- and both paths are differentiated, so
+    this is the total derivative and not just the ODE's part of it. What is
+    held fixed is the thermodynamics: the recombination history is tabulated on
+    the host and uploaded, so this is a derivative at fixed ionisation history.
+    """
+    import jax.numpy as jnp
+
+    from solvers.rodas5P import solve as rodas5P_solve
+
+    cosmology = _as_cosmology(cosmology)
+    prepared = _prepare_solve((cosmology,))
+    cosmology = prepared.cosmologies[0]
+    layout = prepared.layout
+
+    params, y0, t_span, order, k_sorted = _pack_batch(prepared, k_values)
+    columns = jnp.asarray(PHYSICAL_DENSITY_COLUMNS)
+    if densities is None:
+        densities = jnp.asarray(params[0, list(PHYSICAL_DENSITY_COLUMNS)])
+    densities = jnp.asarray(densities)
+    params_j = jnp.asarray(params).at[:, columns].set(
+        jnp.broadcast_to(densities, (params.shape[0], densities.shape[-1]))
+    )
+
+    sol = rodas5P_solve(
+        prepared.ode_fn,
+        jnp.asarray(y0),
+        jnp.asarray(t_span),
+        params_j,
+        linear_solver=prepared.lu_solver,
+        sparsity=prepared.sparsity,
+        # fp64 here, unlike the plain solve: the Rosenbrock-W property lets an
+        # fp32 factorisation carry the *state* at full order, but the
+        # sensitivity rows are driven by that same matrix and measure ~25%
+        # error from it, against ~5e-4 in fp64.
+        lu_precision="fp64",
+        rtol=rtol,
+        atol=atol,
+        first_step=first_step,
+        max_steps=max_steps,
+        pcoeff=0.3,
+        icoeff=0.4,
+        trajectories_per_block=TRAJECTORIES_PER_BLOCK,
+        tf_index=IX_TAU_END,
+        max_registers=CUDA_MAX_REGISTERS,
+        sens_param_columns=PHYSICAL_DENSITY_COLUMNS,
+        # The sensitivities run to ~1e17 while the state is O(1), so letting
+        # them into the weighted error norm hands them the step size and costs
+        # 20x the solve for no accuracy the tolerances asked for.
+        sens_error_control=False,
+    )
+    y_final = sol[:, -1, :]
+
+    grhoc_val = densities[2]
+    grhob_val = densities[3]
+    delta_m = (
+        grhoc_val * y_final[:, IX_CLXC] + grhob_val * y_final[:, IX_CLXB]
+    ) / (grhoc_val + grhob_val)
+    ks = jnp.asarray(k_sorted)
+    pk_sorted = (
+        2.0
+        * jnp.pi**2
+        / ks**3
+        * cosmology.A_s
+        * (ks / cosmology.k_pivot) ** (cosmology.n_s - 1.0)
+        * delta_m**2
+    )
+    del layout
+    return pk_sorted[jnp.asarray(np.argsort(order))]
+
+
+
 def solve_matter_power_spectrum_batch(
     k_values,
     cosmologies,
