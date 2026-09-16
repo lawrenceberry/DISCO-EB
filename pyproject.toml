@@ -6,13 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "discoeb"
 version = "0.1.0"
 dependencies = [
-    "jax[cuda12]",
-    "numba-cuda[cu12]>=0.30.4; python_version >= '3.10'",
+    "jax[cuda13]",
+    "modax",
     "diffrax",
     "equinox",
     "jaxtyping",
     "jax_cosmo",
-    "setuptools<67",
     "lineax",
     "xprof>=2.21.6",
     "tensorflow>=2.20.0",
@@ -28,7 +27,7 @@ authors = [{ name = "Oliver Hahn", email = "oliver.hahn@univie.ac.at" }]
 description = "..."
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.9"
+requires-python = ">=3.13"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3",
@@ -36,6 +35,16 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
     "Topic :: Scientific/Engineering :: Astronomy",
 ]
+
+# The GPU stack must match modax's lock: these kernels are compiled by
+# numba-cuda-mlir and linked by nvjitlink, and 0.5.2 with CUDA 13.4 emits a
+# `.smax` that ptxas rejects when building the 50-variable Enzyme kernel.
+[tool.uv]
+constraint-dependencies = ["numba-cuda-mlir==0.5.1", "cuda-toolkit==13.2.1"]
+
+[tool.uv.sources]
+modax = { path = "../modax", editable = true }
+
 [project.optional-dependencies]
 dev = ["pytest", "pytest-benchmark", "pytest-regressions", "camb>=1.6.0", "classy>=3.3.4.0", "ipykernel>=6.31.0", "matplotlib>=3.9.4", "pandas"]
 docs = ["sphinx", "nbsphinx"]

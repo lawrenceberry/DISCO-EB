@@ -1,4 +1,6 @@
 import math
+import os
+import sys
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -7,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from scipy import integrate, interpolate
 
+from ._unroll import unroll_to_tuple
 from .util import lngamma_complex_e, root_find_bisect, root_find_bisect_nocond, savgol_filter
 
 import diffrax as drx
@@ -3169,7 +3172,11 @@ IX_AMNU = 16
 N_PARAM = 17
 
 THERMO_TABLE_DTYPE = np.float32
-BATCHES_PER_BLOCK = 32
+TRAJECTORIES_PER_BLOCK = 32
+"""Wave modes packed into one CUDA block by modax's thread-local Rodas5P kernel."""
+
+CUDA_MAX_REGISTERS = int(os.environ.get("DISCO_CUDA_MAX_REGISTERS", "168"))
+"""Per-thread register cap for that kernel: fewer registers, more resident warps."""
 
 NQMAX = 3
 """Massive-neutrino momentum bins used by both the background and the hierarchy.
@@ -3417,7 +3424,13 @@ def build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds, schur_solv
     just ``n_cosmologies == 1``.
     """
 
-    from numba import cuda, float64
+    from numba_cuda_mlir import cuda
+    from numba_cuda_mlir.types import float64
+
+    # numba-cuda-mlir rebuilds SSA with a mutually recursive walk over the
+    # control-flow graph, and the perturbation right-hand side below has enough
+    # basic blocks to overrun CPython's default 1000-frame limit while doing it.
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
 
     NVAR = layout.nvar
     ENABLE_DE = layout.enable_dark_energy
@@ -3468,7 +3481,8 @@ def build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds, schur_solv
             + (y1 - m1 * h**2 / 6.0) * right / h
         )
 
-    @cuda.jit(device=True)
+    # Left undecorated: this is the template `unroll_to_tuple` reads, and the
+    # array form below is compiled from the same object.
     def rhs(y, tau, p, out):
         k = p[IX_K]
         log_tau = math.log(tau)
@@ -3654,309 +3668,13 @@ def build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds, schur_solv
                     kv * y[b + LMAXNU - 1] - (LMAXNU + 1.0) * y[b + LMAXNU] / tau
                 )
 
-    dense_position = {
-        state_index: dense_index
-        for dense_index, state_index in enumerate(schur_solver.dense_idx)
-    }
-    D_ETAK = dense_position[IX_ETAK]
-    D_CLXC = dense_position[IX_CLXC]
-    D_CLXB = dense_position[IX_CLXB]
-    D_VB = dense_position[IX_VB]
-    D_G = dense_position[IX_G]
-    D_QG = dense_position[IX_G + 1]
-    D_PIG = dense_position[IX_G + 2]
-    D_POL = dense_position[IX_POL]
-    D_R = dense_position[IX_R]
-    D_QR = dense_position[IX_R + 1]
-    D_PIR = dense_position[IX_R + 2]
-    D_CLXQ = dense_position[IX_CLXQ] if ENABLE_DE else 0
-    D_THETAQ = dense_position[IX_THETAQ] if ENABLE_DE else 0
-    D_MNU = dense_position[layout.ix_psi(0, 0)] if ENABLE_MNU else 0
+    # Enzyme requires the tuple form, which this derives from `rhs` above by
+    # unrolling the multipole loops -- so the differentiated callback cannot
+    # drift from the right-hand side it came from.
+    ode_fn = unroll_to_tuple(rhs, NVAR, name="perturbation_rhs")
+    rhs_array = cuda.jit(device=True)(rhs)
 
-    B_G = schur_solver.k_bases.index(IX_G + 3)
-    B_POL = schur_solver.k_bases.index(IX_POL + 1)
-    B_R = schur_solver.k_bases.index(IX_R + 3)
-    B_MNU = (
-        schur_solver.k_bases.index(layout.ix_psi(3, 0)) if ENABLE_MNU else 0
-    )
-
-    D_SIZE = schur_solver.d_size
-    TL = schur_solver.tridiag_len
-    JAC_SIZE = schur_solver.jac_size
-    J_DENSE = schur_solver.jac_dense_off
-    J_DIAG = schur_solver.jac_diag_off
-    J_UPPER = schur_solver.jac_upper_off
-    J_LOWER = schur_solver.jac_lower_off
-    J_C0 = schur_solver.jac_c0_off
-
-    @cuda.jit(device=True)
-    def jac(y, tau, p, out):
-        # The system is linear in y, so only background-dependent coefficients
-        # are required. Curvature corrections are intentionally omitted here:
-        # Rodas5P is a Rosenbrock-W method and accepts this approximate Jacobian.
-        for i in range(JAC_SIZE):
-            out[i] = 0.0
-
-        k = p[IX_K]
-        log_tau = math.log(tau)
-        a = spline_eval(log_tau, p, 0)
-        opacity = spline_eval(log_tau, p, 1)
-        cs2 = spline_eval(log_tau, p, 2)
-        if opacity < 1.0e-30:
-            opacity = 1.0e-30
-        if cs2 < 0.0:
-            cs2 = 0.0
-
-        a2 = a * a
-        grhog_t = p[0] / a2
-        grhor_t = p[1] / a2
-        grhoc_t = p[2] / a
-        grhob_t = p[3] / a
-        if ENABLE_DE:
-            w0 = p[IX_W_DE_0]
-            wa = p[IX_W_DE_A]
-            cs2_Q = p[IX_CS2_DE]
-            w_Q = w0 + wa * (1.0 - a)
-            rho_Q = a ** (-3.0 * (1.0 + w0 + wa)) * math.exp(
-                3.0 * (a - 1.0) * wa
-            )
-            grhov_t = p[4] * rho_Q * a2
-        else:
-            grhov_t = p[4] * a2
-
-        if ENABLE_MNU:
-            grhor_nu = p[IX_GRHOR_NU]
-            n_mnu = p[IX_NMNU]
-            amnu = p[IX_AMNU]
-            rhonu = spline_eval(log_tau, p, 3)
-            grho_mnu_t = grhor_nu * n_mnu * rhonu / a2
-        else:
-            grho_mnu_t = 0.0
-
-        grhok = p[IX_GRHOK]
-        adotoa = math.sqrt(
-            (
-                grhog_t
-                + grhor_t
-                + grho_mnu_t
-                + grhoc_t
-                + grhob_t
-                + grhov_t
-                + grhok
-            )
-            / 3.0
-        )
-        photbar = grhog_t / grhob_t
-        pb43 = 4.0 * photbar / 3.0
-
-        zc = cuda.local.array(D_SIZE, float64)
-        sigc = cuda.local.array(D_SIZE, float64)
-        for i in range(D_SIZE):
-            zc[i] = 0.0
-            sigc[i] = 0.0
-
-        zc[D_ETAK] = 1.0 / adotoa
-        zc[D_CLXB] = 0.5 * grhob_t / (k * adotoa)
-        zc[D_CLXC] = 0.5 * grhoc_t / (k * adotoa)
-        zc[D_G] = 0.5 * grhog_t / (k * adotoa)
-        zc[D_R] = 0.5 * grhor_t / (k * adotoa)
-        if ENABLE_DE:
-            zc[D_CLXQ] = 0.5 * grhov_t / (k * adotoa)
-        if ENABLE_MNU:
-            for qi in range(NQ):
-                d0 = D_MNU + 3 * qi
-                vq = 1.0 / math.sqrt(1.0 + (a * amnu / q_dev[qi]) ** 2)
-                zc[d0] = (
-                    0.5
-                    * (grhor_nu * n_mnu * w_dev[qi] / (vq * a2))
-                    / (k * adotoa)
-                )
-
-        for i in range(D_SIZE):
-            sigc[i] = zc[i]
-        sigc[D_VB] = 1.5 * grhob_t / (k * k)
-        sigc[D_QG] = 1.5 * grhog_t / (k * k)
-        sigc[D_QR] = 1.5 * grhor_t / (k * k)
-        if ENABLE_DE:
-            sigc[D_THETAQ] = 1.5 * grhov_t * (1.0 + w_Q) / k**3
-        if ENABLE_MNU:
-            for qi in range(NQ):
-                d0 = D_MNU + 3 * qi
-                velmnu = grhor_nu * n_mnu * w_dev[qi] / a2
-                sigc[d0 + 1] = 1.5 * velmnu / (k * k)
-
-        # Metric row and the z/sigma outer-product couplings.
-        out[J_DENSE + D_ETAK * D_SIZE + D_VB] = 0.5 * grhob_t
-        out[J_DENSE + D_ETAK * D_SIZE + D_QG] = 0.5 * grhog_t
-        out[J_DENSE + D_ETAK * D_SIZE + D_QR] = 0.5 * grhor_t
-        if ENABLE_DE:
-            out[J_DENSE + D_ETAK * D_SIZE + D_THETAQ] = (
-                0.5 * grhov_t * (1.0 + w_Q) / k
-            )
-        if ENABLE_MNU:
-            for qi in range(NQ):
-                d0 = D_MNU + 3 * qi
-                velmnu = grhor_nu * n_mnu * w_dev[qi] / a2
-                out[J_DENSE + D_ETAK * D_SIZE + d0 + 1] = 0.5 * velmnu
-
-        for c in range(D_SIZE):
-            z_coeff = zc[c]
-            sigma_coeff = sigc[c]
-            out[J_DENSE + D_CLXC * D_SIZE + c] += -k * z_coeff
-            out[J_DENSE + D_CLXB * D_SIZE + c] += -k * z_coeff
-            out[J_DENSE + D_G * D_SIZE + c] += -(4.0 * k / 3.0) * z_coeff
-            out[J_DENSE + D_R * D_SIZE + c] += -(4.0 * k / 3.0) * z_coeff
-            out[J_DENSE + D_PIG * D_SIZE + c] += (
-                8.0 * k / 15.0
-            ) * sigma_coeff
-            out[J_DENSE + D_PIR * D_SIZE + c] += (
-                8.0 * k / 15.0
-            ) * sigma_coeff
-            if ENABLE_DE:
-                out[J_DENSE + D_CLXQ * D_SIZE + c] += (
-                    -(1.0 + w_Q) * k * z_coeff
-                )
-            if ENABLE_MNU:
-                for qi in range(NQ):
-                    d0 = D_MNU + 3 * qi
-                    dlf = dlf_dev[qi]
-                    out[J_DENSE + d0 * D_SIZE + c] += (
-                        k * dlf / 3.0
-                    ) * z_coeff
-                    out[J_DENSE + (d0 + 2) * D_SIZE + c] += (
-                        -(2.0 / 15.0) * k * dlf
-                    ) * sigma_coeff
-
-        out[J_DENSE + D_CLXB * D_SIZE + D_VB] += -k
-        out[J_DENSE + D_G * D_SIZE + D_QG] += -k
-        out[J_DENSE + D_R * D_SIZE + D_QR] += -k
-
-        # Baryon velocity and photon dipole.
-        vbf_vb = -adotoa - 4.0 * photbar * opacity / 3.0
-        vbf_clxb = k * cs2
-        vbf_qg = photbar * opacity
-        dipole_factor = -4.0 / (3.0 * pb43)
-
-        out[J_DENSE + D_VB * D_SIZE + D_VB] += vbf_vb
-        out[J_DENSE + D_VB * D_SIZE + D_CLXB] += vbf_clxb
-        out[J_DENSE + D_VB * D_SIZE + D_QG] += vbf_qg
-        out[J_DENSE + D_QG * D_SIZE + D_VB] += dipole_factor * vbf_vb
-        out[J_DENSE + D_QG * D_SIZE + D_CLXB] += dipole_factor * vbf_clxb
-        out[J_DENSE + D_QG * D_SIZE + D_QG] += dipole_factor * vbf_qg
-        out[J_DENSE + D_QG * D_SIZE + D_VB] += (
-            -4.0 * adotoa / (3.0 * pb43)
-        )
-        out[J_DENSE + D_QG * D_SIZE + D_CLXB] += (
-            4.0 * k * cs2 / (3.0 * pb43)
-        )
-        out[J_DENSE + D_QG * D_SIZE + D_G] += k / 3.0
-        out[J_DENSE + D_QG * D_SIZE + D_PIG] += -2.0 * k / 3.0
-
-        # Photon shear and temperature hierarchy.
-        out[J_DENSE + D_PIG * D_SIZE + D_QG] += 2.0 * k / 5.0
-        out[J_DENSE + D_PIG * D_SIZE + D_PIG] += -0.9 * opacity
-        out[J_DENSE + D_PIG * D_SIZE + D_POL] += 0.6 * opacity
-        out[J_C0 + B_G] = -3.0 * k / 5.0
-        for ell in range(3, LMAX_G):
-            i = ell - 3
-            out[J_LOWER + B_G * TL + i] = k * ell / (2 * ell + 1)
-            out[J_DIAG + B_G * TL + i] = -opacity
-            out[J_UPPER + B_G * (TL - 1) + i] = (
-                -k * (ell + 1) / (2 * ell + 1)
-            )
-        out[J_LOWER + B_G * TL + TL - 1] = k
-        out[J_DIAG + B_G * TL + TL - 1] = -(LMAX_G + 1.0) / tau - opacity
-
-        # E-mode polarization hierarchy.
-        out[J_DENSE + D_POL * D_SIZE + D_PIG] += 0.1 * opacity
-        out[J_DENSE + D_POL * D_SIZE + D_POL] += -0.4 * opacity
-        out[J_C0 + B_POL] = -k / 3.0
-        for ell in range(3, LMAX_POL):
-            i = ell - 3
-            polfac = (ell + 3.0) * (ell - 1.0) / (ell + 1.0)
-            out[J_LOWER + B_POL * TL + i] = k * ell / (2 * ell + 1)
-            out[J_DIAG + B_POL * TL + i] = -opacity
-            out[J_UPPER + B_POL * (TL - 1) + i] = (
-                -polfac * k / (2 * ell + 1)
-            )
-        out[J_LOWER + B_POL * TL + TL - 1] = (
-            k * LMAX_POL / (2 * LMAX_POL + 1)
-        )
-        out[J_DIAG + B_POL * TL + TL - 1] = (
-            -opacity - (LMAX_POL + 3.0) / tau
-        )
-
-        # Massless-neutrino hierarchy.
-        out[J_DENSE + D_QR * D_SIZE + D_R] = k / 3.0
-        out[J_DENSE + D_QR * D_SIZE + D_PIR] = -2.0 * k / 3.0
-        out[J_DENSE + D_PIR * D_SIZE + D_QR] += 2.0 * k / 5.0
-        out[J_C0 + B_R] = -3.0 * k / 5.0
-        for ell in range(3, LMAX_NR):
-            i = ell - 3
-            out[J_LOWER + B_R * TL + i] = k * ell / (2 * ell + 1)
-            out[J_UPPER + B_R * (TL - 1) + i] = (
-                -k * (ell + 1) / (2 * ell + 1)
-            )
-        out[J_LOWER + B_R * TL + TL - 1] = k
-        out[J_DIAG + B_R * TL + TL - 1] = -(LMAX_NR + 1.0) / tau
-
-        if ENABLE_DE:
-            w_Q_prime = -wa * adotoa * a
-            ca2_Q = w_Q - w_Q_prime / (3.0 * (1.0 + w_Q) * adotoa)
-            out[J_DENSE + D_CLXQ * D_SIZE + D_CLXQ] += (
-                -3.0 * (cs2_Q - w_Q) * adotoa
-            )
-            out[J_DENSE + D_CLXQ * D_SIZE + D_THETAQ] += (
-                -(1.0 + w_Q)
-                - 9.0
-                * (1.0 + w_Q)
-                * (cs2_Q - ca2_Q)
-                * adotoa**2
-                / k**2
-            )
-            out[J_DENSE + D_THETAQ * D_SIZE + D_CLXQ] = (
-                cs2_Q * k**2 / (1.0 + w_Q)
-            )
-            out[J_DENSE + D_THETAQ * D_SIZE + D_THETAQ] = (
-                -(1.0 - 3.0 * cs2_Q) * adotoa
-            )
-
-        if ENABLE_MNU:
-            for qi in range(NQ):
-                d0 = D_MNU + 3 * qi
-                block = B_MNU + qi
-                vq = 1.0 / math.sqrt(1.0 + (a * amnu / q_dev[qi]) ** 2)
-                kv = k * vq
-
-                out[J_DENSE + d0 * D_SIZE + d0 + 1] += -kv
-                out[J_DENSE + (d0 + 1) * D_SIZE + d0] = kv / 3.0
-                out[J_DENSE + (d0 + 1) * D_SIZE + d0 + 2] = -2.0 * kv / 3.0
-                out[J_DENSE + (d0 + 2) * D_SIZE + d0 + 1] += 2.0 * kv / 5.0
-                out[J_C0 + block] = -3.0 * kv / 5.0
-
-                for ell in range(3, LMAXNU):
-                    i = ell - 3
-                    out[J_LOWER + block * TL + i] = (
-                        kv * ell / (2 * ell + 1)
-                    )
-                    out[J_UPPER + block * (TL - 1) + i] = (
-                        -kv * (ell + 1) / (2 * ell + 1)
-                    )
-                out[J_LOWER + block * TL + TL - 1] = kv
-                out[J_DIAG + block * TL + TL - 1] = -(LMAXNU + 1.0) / tau
-
-    @cuda.jit(device=True)
-    def time_jac(y, tau, p, out):
-        eps = 1.0e-6 * max(abs(tau), 1.0)
-        fp = cuda.local.array(NVAR, float64)
-        fm = cuda.local.array(NVAR, float64)
-        rhs(y, tau + eps, p, fp)
-        rhs(y, tau - eps, p, fm)
-        inv = 1.0 / (2.0 * eps)
-        for i in range(NVAR):
-            out[i] = (fp[i] - fm[i]) * inv
-
-    return rhs, jac, time_jac
+    return ode_fn, rhs_array
 
 
 class _PreparedSolve(NamedTuple):
@@ -3966,10 +3684,10 @@ class _PreparedSolve(NamedTuple):
     layout: object
     tables: tuple  # per-cosmology (tau_grid, values, seconds, tau0)
     tau0: np.ndarray  # (n_cosmologies,)
-    rhs: object
-    jac: object
-    time_jac: object
+    ode_fn: object
+    rhs_array: object
     lu_solver: object
+    sparsity: object
 
 
 _PREPARED_SOLVE_CACHE: dict = {}
@@ -4019,8 +3737,6 @@ def _build_schur_solver(layout):
             k_bases.append(layout.ix_psi(3, qi))
 
     return SchurEBSolver(
-        batches_per_block=BATCHES_PER_BLOCK,
-        block_dim=(BATCHES_PER_BLOCK, 1, 1),
         dense_idx=tuple(dense_idx),
         k_bases=tuple(k_bases),
         dense_c0=tuple(dense_c0),
@@ -4038,7 +3754,7 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
     times, or the solver tolerances. They are also what triggers the *slow*
     numba-CUDA kernel compilation: the returned ``rhs`` / ``jac`` / ``time_jac``
     closures and the :class:`SchurEBSolver` instance are the identity keys of
-    :func:`discoeb.integrators.rodas5Pnumba_solve`'s compiled-kernel cache, so
+    modax's ``solvers.rodas5P`` compiled-kernel cache, so
     reusing the same objects across solves of the same batch turns a repeated
     solve from a full recompile (tens of seconds) into a bare kernel launch.
 
@@ -4057,7 +3773,7 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
     cosmologies = tuple(_as_cosmology(cosmology) for cosmology in cosmologies)
     # Include the presets that change the compiled artifacts, so a caller that
     # rebinds them (e.g. NQMAX) does not get a stale kernel.
-    key = (cosmologies, NQMAX, N_THERMO_GRID, TAU_START, BATCHES_PER_BLOCK)
+    key = (cosmologies, NQMAX, N_THERMO_GRID, TAU_START, TRAJECTORIES_PER_BLOCK)
     cached = _PREPARED_SOLVE_CACHE.get(key)
     if cached is not None:
         return cached
@@ -4078,12 +3794,18 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
     tables = tuple(build_thermo_tables(c) for c in cosmologies)
     tau_min, inv_dtau, values, seconds, tau0 = _stack_thermo_tables(tables)
     lu_solver = _build_schur_solver(layout)
-    rhs, jac, time_jac = build_numba_callbacks(
+    ode_fn, rhs_array = build_numba_callbacks(
         layout, tau_min, inv_dtau, values, seconds, lu_solver
     )
+    # One colouring serves both sides: modax caches on the pattern, so the
+    # layout it compresses into is the very object the solver is bound to.
+    from solvers._sparsity import colour_sparsity, normalize_sparsity
+
+    sparsity = lu_solver.sparsity()
+    lu_solver.bind(colour_sparsity(normalize_sparsity(sparsity, layout.nvar)))
 
     prepared = _PreparedSolve(
-        cosmologies, layout, tables, tau0, rhs, jac, time_jac, lu_solver
+        cosmologies, layout, tables, tau0, ode_fn, rhs_array, lu_solver, sparsity
     )
     _PREPARED_SOLVE_CACHE[key] = prepared
     return prepared
@@ -4118,8 +3840,8 @@ def _pack_batch(prepared, k_values, tau_save=None):
     n_k = len(k_sorted)
 
     # Pack trajectories as row = k_idx * n_cosmo + cosmology_idx, so a block of
-    # BATCHES_PER_BLOCK consecutive rows shares one wave mode when
-    # n_cosmo >= BATCHES_PER_BLOCK: neighbouring threads then take near-identical
+    # TRAJECTORIES_PER_BLOCK consecutive rows shares one wave mode when
+    # n_cosmo >= TRAJECTORIES_PER_BLOCK: neighbouring threads then take near-identical
     # adaptive steps, minimizing warp divergence.
     n_traj = n_k * n_cosmo
     params = np.empty((n_traj, N_PARAM), dtype=np.float64)
@@ -4187,7 +3909,7 @@ def solve_perturbation_history(
         original ``k`` order; ``tables`` is the ``build_thermo_tables`` tuple.
     """
 
-    from .integrators import rodas5Pnumba_solve
+    from solvers.rodas5P import solve as rodas5P_solve
 
     prepared = _prepare_solve((cosmology,))
     cosmology = prepared.cosmologies[0]
@@ -4205,23 +3927,23 @@ def solve_perturbation_history(
     else:
         t_span = np.ascontiguousarray(np.asarray(tau_save, dtype=np.float64))
 
-    sol = rodas5Pnumba_solve(
-        prepared.rhs,
-        prepared.jac,
+    sol = rodas5P_solve(
+        prepared.ode_fn,
         y0,
         t_span,
         params,
-        time_jac_fn=prepared.time_jac,
+        linear_solver=prepared.lu_solver,
+        sparsity=prepared.sparsity,
         lu_precision="fp32",
-        custom_lu_solver=prepared.lu_solver,
         rtol=rtol,
         atol=atol,
         first_step=first_step,
         max_steps=max_steps,
         pcoeff=0.3,
         icoeff=0.4,
-        batches_per_block=BATCHES_PER_BLOCK,
-        tf_local_idx=IX_TAU_END,
+        trajectories_per_block=TRAJECTORIES_PER_BLOCK,
+        tf_index=IX_TAU_END,
+        max_registers=CUDA_MAX_REGISTERS,
     )
     # The solver returns trajectories in ascending-k order; undo the sort. The
     # inverse permutation is a host-side constant, so the reorder is a plain
@@ -4249,7 +3971,7 @@ def solve_perturbation_history_batch(
     """Solve a batch of cosmologies on a shared ``tau_save`` grid in one launch.
 
     All ``n_cosmologies * n_k`` trajectories are integrated by a single
-    ``rodas5Pnumba`` launch. Each trajectory still stops at its *own* ``tau0``
+    modax Rodas5P launch. Each trajectory still stops at its *own* ``tau0``
     (via ``IX_TAU_END``), so save times beyond a cosmology's ``tau0`` simply hold
     its frozen final state -- consumers must mask them (see
     :func:`discoeb.cmb.cmb_spectrum_from_sources`).
@@ -4272,7 +3994,7 @@ def solve_perturbation_history_batch(
 
     import jax.numpy as jnp
 
-    from .integrators import rodas5Pnumba_solve
+    from solvers.rodas5P import solve as rodas5P_solve
 
     prepared = _prepare_solve(tuple(cosmologies))
     layout = prepared.layout
@@ -4281,23 +4003,23 @@ def solve_perturbation_history_batch(
     params, y0, t_span, order, k_sorted = _pack_batch(prepared, k_values, tau_save)
     n_k = len(k_sorted)
 
-    sol = rodas5Pnumba_solve(
-        prepared.rhs,
-        prepared.jac,
+    sol = rodas5P_solve(
+        prepared.ode_fn,
         y0,
         t_span,
         params,
-        time_jac_fn=prepared.time_jac,
+        linear_solver=prepared.lu_solver,
+        sparsity=prepared.sparsity,
         lu_precision="fp32",
-        custom_lu_solver=prepared.lu_solver,
         rtol=rtol,
         atol=atol,
         first_step=first_step,
         max_steps=max_steps,
         pcoeff=0.3,
         icoeff=0.4,
-        batches_per_block=BATCHES_PER_BLOCK,
-        tf_local_idx=IX_TAU_END,
+        trajectories_per_block=TRAJECTORIES_PER_BLOCK,
+        tf_index=IX_TAU_END,
+        max_registers=CUDA_MAX_REGISTERS,
     )
     # Rows are packed k-major (row = k_idx * n_cosmo + cosmology_idx), so this
     # reshape is a free view -- no copy of the (potentially multi-GB) history.
@@ -4356,7 +4078,7 @@ def solve_matter_power_spectrum_batch(
     """Return ``P(k)`` for a batch of cosmologies in one GPU solve.
 
     All cosmologies must share a perturbation layout. The ``n_cosmologies * n_k``
-    trajectories are integrated by a single ``rodas5Pnumba`` launch, so the whole
+    trajectories are integrated by a single modax Rodas5P launch, so the whole
     batch amortizes one kernel compilation and one set of device buffers.
 
     Returns
@@ -4366,7 +4088,7 @@ def solve_matter_power_spectrum_batch(
         original cosmology and ``k`` order.
     """
 
-    from .integrators import rodas5Pnumba_solve
+    from solvers.rodas5P import solve as rodas5P_solve
 
     prepared = _prepare_solve(tuple(cosmologies))
     cosmologies = prepared.cosmologies
@@ -4376,23 +4098,23 @@ def solve_matter_power_spectrum_batch(
     params, y0, t_span, order, k_sorted = _pack_batch(prepared, k_values)
     n_k = len(k_sorted)
 
-    sol = rodas5Pnumba_solve(
-        prepared.rhs,
-        prepared.jac,
+    sol = rodas5P_solve(
+        prepared.ode_fn,
         y0,
         t_span,
         params,
-        time_jac_fn=prepared.time_jac,
+        linear_solver=prepared.lu_solver,
+        sparsity=prepared.sparsity,
         lu_precision="fp32",
-        custom_lu_solver=prepared.lu_solver,
         rtol=rtol,
         atol=atol,
         first_step=first_step,
         max_steps=max_steps,
         pcoeff=0.3,
         icoeff=0.4,
-        batches_per_block=BATCHES_PER_BLOCK,
-        tf_local_idx=IX_TAU_END,
+        trajectories_per_block=TRAJECTORIES_PER_BLOCK,
+        tf_index=IX_TAU_END,
+        max_registers=CUDA_MAX_REGISTERS,
     )
     y_final = np.asarray(sol)[:, -1, :].reshape(n_k, n_cosmo, layout.nvar)
 
