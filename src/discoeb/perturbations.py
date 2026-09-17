@@ -3948,6 +3948,7 @@ def solve_perturbation_history(
         trajectories_per_block=TRAJECTORIES_PER_BLOCK,
         tf_index=IX_TAU_END,
         max_registers=CUDA_MAX_REGISTERS,
+        array_rhs=prepared.rhs_array,
     )
     # The solver returns trajectories in ascending-k order; undo the sort. The
     # inverse permutation is a host-side constant, so the reorder is a plain
@@ -4024,6 +4025,7 @@ def solve_perturbation_history_batch(
         trajectories_per_block=TRAJECTORIES_PER_BLOCK,
         tf_index=IX_TAU_END,
         max_registers=CUDA_MAX_REGISTERS,
+        array_rhs=prepared.rhs_array,
     )
     # Rows are packed k-major (row = k_idx * n_cosmo + cosmology_idx), so this
     # reshape is a free view -- no copy of the (potentially multi-GB) history.
@@ -4223,6 +4225,7 @@ def solve_matter_power_spectrum_batch(
         trajectories_per_block=TRAJECTORIES_PER_BLOCK,
         tf_index=IX_TAU_END,
         max_registers=CUDA_MAX_REGISTERS,
+        array_rhs=prepared.rhs_array,
     )
     y_final = np.asarray(sol)[:, -1, :].reshape(n_k, n_cosmo, layout.nvar)
 
