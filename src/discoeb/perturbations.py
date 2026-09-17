@@ -3797,12 +3797,16 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
     ode_fn, rhs_array = build_numba_callbacks(
         layout, tau_min, inv_dtau, values, seconds, lu_solver
     )
-    # One colouring serves both sides: modax caches on the pattern, so the
-    # layout it compresses into is the very object the solver is bound to.
-    from solvers._sparsity import colour_sparsity, normalize_sparsity
+    # One layout serves both sides: the object the solver is bound to is the
+    # one handed to the kernel, so the two cannot disagree about a slot.
+    # Packed rather than the (nvar x n_colours) colour grid, because the grid
+    # leaves most of its slots holding nothing and the matrix is per-thread
+    # local memory; a slot stays a compile-time constant either way.
+    from solvers._sparsity import colour_sparsity, normalize_sparsity, pack
 
-    sparsity = lu_solver.sparsity()
-    lu_solver.bind(colour_sparsity(normalize_sparsity(sparsity, layout.nvar)))
+    pattern = normalize_sparsity(lu_solver.sparsity(), layout.nvar)
+    sparsity = pack(colour_sparsity(pattern))
+    lu_solver.bind(sparsity)
 
     prepared = _PreparedSolve(
         cosmologies, layout, tables, tau0, ode_fn, rhs_array, lu_solver, sparsity
