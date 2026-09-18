@@ -9,10 +9,11 @@ It uses the Rodas5P W-transformed tableau (Steinebach 2023, BIT 63:27), matching
 the Julia ``Rodas5P`` / ``GPURodas5P`` coefficients.
 
 The production perturbation solve does not come through here: it runs modax's
-numba-CUDA Rodas5P kernel (``solvers.rodas5P.solve``) with the Schur/EB block-LU
-of :mod:`discoeb.schur_eb` as its ``linear_solver``. That kernel used to be
-vendored into this module; modax now carries it, so there is one implementation
-to maintain rather than a fork.
+numba-CUDA Rodas5P kernel (``solvers.rodas5P.solve``), handed the sparsity
+pattern :mod:`discoeb.eb_sparsity` declares, from which the kernel compiles its
+own sparse direct linear solve. That kernel used to be vendored into this
+module; modax now carries it, so there is one implementation to maintain rather
+than a fork.
 """
 
 from __future__ import annotations

@@ -10,6 +10,7 @@ import numpy as np
 from scipy import integrate, interpolate
 
 from ._unroll import unroll_to_tuple
+from .eb_sparsity import perturbation_sparsity
 from .util import lngamma_complex_e, root_find_bisect, root_find_bisect_nocond, savgol_filter
 
 import diffrax as drx
@@ -2178,8 +2179,9 @@ def power_multipoles( *, y : jnp.ndarray, kmodes : jnp.ndarray, b : float, param
 # Hierarchy truncations. These are module-level integers (not runtime arguments)
 # so the state-vector layout and the accelerator-compiled right-hand side treat
 # them as compile-time constants. The current flat-LambdaCDM + massless-neutrino
-# layout has NVAR == 50 (11-var dense core + 3x13 free-streaming hierarchies),
-# matching the hand-tuned Schur-EB LU solver in :mod:`discoeb.schur_eb`.
+# layout has NVAR == 50: an 11-variable densely coupled core bordered by three
+# 13-variable free-streaming hierarchies, which is the structure
+# :mod:`discoeb.eb_sparsity` declares and the sparse direct solver exploits.
 LMAX_G = 15
 """Photon temperature hierarchy truncation (``Theta_0 ... Theta_LMAX_G``)."""
 
@@ -2991,8 +2993,8 @@ class PerturbationLayout:
         The multipole ``psi_l`` of momentum bin ``q`` is stored at
         ``ix_massive_nu + q * (lmaxnu + 1) + l`` (**bin-major, multipole-minor**),
         so that each bin's free-streaming tail ``psi_3 ... psi_lmaxnu`` is
-        contiguous and can be treated as one tridiagonal block by the Schur-EB
-        block-LU solver.
+        contiguous and is one tridiagonal block of the sparsity pattern
+        (:mod:`discoeb.eb_sparsity`).
         """
         if self.nqmax == 0:
             raise AttributeError("massive neutrinos are not enabled in this layout")
@@ -3417,13 +3419,14 @@ def make_initial_states(cosmology, k_values: np.ndarray, layout) -> np.ndarray:
     return y0
 
 
-def build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds, schur_solver):
-    """Return numba-CUDA ``(rhs, jac, time_jac)`` device callbacks for a layout.
+def build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds):
+    """Return the two numba-CUDA forms of the right-hand side for a layout.
 
     The thermodynamics tables are uploaded once and read through a uniform
-    ``log(tau)`` cubic-spline device evaluator; the perturbation RHS and its
-    (linear, sparse) Jacobian are compiled as ``cuda.jit(device=True)`` functions.
-    The dynamical-dark-energy fluid equations are included when
+    ``log(tau)`` cubic-spline device evaluator. ``ode_fn`` is the tuple form
+    Enzyme differentiates to get the Jacobian and ``df/dt``; ``rhs_array`` is the
+    same function over arrays, which the kernel's eight stage evaluations call
+    directly. The dynamical-dark-energy fluid equations are included when
     ``layout.enable_dark_energy`` is set; because the flag is a compile-time
     constant, numba prunes the DE branches entirely when it is disabled (so the
     flat-LambdaCDM kernel is unchanged).
@@ -3702,7 +3705,6 @@ class _PreparedSolve(NamedTuple):
     tau0: np.ndarray  # (n_cosmologies,)
     ode_fn: object
     rhs_array: object
-    lu_solver: object
     sparsity: object
 
 
@@ -3730,47 +3732,16 @@ def _stack_thermo_tables(tables):
     return tau_min, inv_dtau, values, seconds, tau0
 
 
-def _build_schur_solver(layout):
-    """Build the Schur-EB block-LU matching a perturbation layout.
-
-    The state splits into a densely-coupled core (metric / fluid / low multipoles
-    [+ DE fluid] [+ psi0,1,2 per massive-nu bin]) bordered by free-streaming
-    tridiagonal blocks (photon, polarization, massless-nu [+ one tail per bin]),
-    each coupling into the core only through its lowest multipole.
-    """
-
-    from .schur_eb import DENSE_IDX, K_BASES, DENSE_C0, A_SIZE, SchurEBSolver
-
-    dense_idx = list(DENSE_IDX)
-    k_bases = list(K_BASES)
-    dense_c0 = list(DENSE_C0)
-    if layout.enable_dark_energy:
-        dense_idx += [layout.ix_clxq, layout.ix_thetaq]
-    if layout.has_massive_neutrinos:
-        for qi in range(layout.nqmax):
-            dense_c0.append(len(dense_idx) + 2)  # position of psi2(q) in the core
-            dense_idx += [layout.ix_psi(l, qi) for l in (0, 1, 2)]
-            k_bases.append(layout.ix_psi(3, qi))
-
-    return SchurEBSolver(
-        dense_idx=tuple(dense_idx),
-        k_bases=tuple(k_bases),
-        dense_c0=tuple(dense_c0),
-        tridiag_len=A_SIZE,
-        nvar=layout.nvar,
-    )
-
-
 def _prepare_solve(cosmologies) -> _PreparedSolve:
     """Return (and cache) the compiled solve artifacts for a batch of cosmologies.
 
-    The thermodynamics tables, the numba-CUDA right-hand side / Jacobian device
-    functions, and the Schur-EB block-LU depend only on the cosmologies (and the
+    The thermodynamics tables, the numba-CUDA right-hand side device function and
+    the Jacobian sparsity pattern depend only on the cosmologies (and the
     module-level grid and quadrature presets), not on the wave modes, the save
     times, or the solver tolerances. They are also what triggers the *slow*
-    numba-CUDA kernel compilation: the returned ``rhs`` / ``jac`` / ``time_jac``
-    closures and the :class:`SchurEBSolver` instance are the identity keys of
-    modax's ``solvers.rodas5P`` compiled-kernel cache, so
+    numba-CUDA kernel compilation: the returned ``ode_fn`` / ``rhs_array``
+    closures and the sparsity pattern are the identity keys of modax's
+    ``solvers.rodas5P`` compiled-kernel cache, so
     reusing the same objects across solves of the same batch turns a repeated
     solve from a full recompile (tens of seconds) into a bare kernel launch.
 
@@ -3783,8 +3754,6 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
     accumulates GPU allocations. Call :func:`clear_prepared_solve_cache` to
     release them.
     """
-
-    from .schur_eb import A_SIZE
 
     cosmologies = tuple(_as_cosmology(cosmology) for cosmology in cosmologies)
     # Include the presets that change the compiled artifacts, so a caller that
@@ -3801,31 +3770,21 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
                 "all cosmologies in a batch must share a perturbation layout "
                 "(same dark-energy / massive-neutrino settings)"
             )
-    if layout.has_massive_neutrinos and layout.lmaxnu - 2 != A_SIZE:
-        raise NotImplementedError(
-            "the Schur-EB solver requires all tridiagonal blocks to share a length; "
-            f"massive-nu needs lmaxnu - 2 == {A_SIZE} (got {layout.lmaxnu})"
-        )
 
     tables = tuple(build_thermo_tables(c) for c in cosmologies)
     tau_min, inv_dtau, values, seconds, tau0 = _stack_thermo_tables(tables)
-    lu_solver = _build_schur_solver(layout)
-    ode_fn, rhs_array = build_numba_callbacks(
-        layout, tau_min, inv_dtau, values, seconds, lu_solver
-    )
-    # One layout serves both sides: the object the solver is bound to is the
-    # one handed to the kernel, so the two cannot disagree about a slot.
-    # Packed rather than the (nvar x n_colours) colour grid, because the grid
-    # leaves most of its slots holding nothing and the matrix is per-thread
-    # local memory; a slot stays a compile-time constant either way.
-    from solvers._sparsity import colour_sparsity, normalize_sparsity, pack
-
-    pattern = normalize_sparsity(lu_solver.sparsity(), layout.nvar)
-    sparsity = pack(colour_sparsity(pattern))
-    lu_solver.bind(sparsity)
-
+    ode_fn, rhs_array = build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds)
+    # The pattern is all modax needs: it colours it for the Enzyme sweeps, and
+    # orders it with AMD, factorises it symbolically and compiles a sparse LU
+    # and sparse triangular solves for that exact structure.
     prepared = _PreparedSolve(
-        cosmologies, layout, tables, tau0, ode_fn, rhs_array, lu_solver, sparsity
+        cosmologies,
+        layout,
+        tables,
+        tau0,
+        ode_fn,
+        rhs_array,
+        perturbation_sparsity(layout),
     )
     _PREPARED_SOLVE_CACHE[key] = prepared
     return prepared
@@ -3952,7 +3911,6 @@ def solve_perturbation_history(
         y0,
         t_span,
         params,
-        linear_solver=prepared.lu_solver,
         sparsity=prepared.sparsity,
         lu_precision="fp32",
         rtol=rtol,
@@ -4029,7 +3987,6 @@ def solve_perturbation_history_batch(
         y0,
         t_span,
         params,
-        linear_solver=prepared.lu_solver,
         sparsity=prepared.sparsity,
         lu_precision="fp32",
         rtol=rtol,
@@ -4174,7 +4131,6 @@ def matter_power_spectrum_jax(
     densities = jnp.asarray(densities)
 
     settings = dict(
-        linear_solver=prepared.lu_solver,
         sparsity=prepared.sparsity,
         lu_precision="fp64",
         rtol=rtol,
@@ -4308,7 +4264,6 @@ def solve_matter_power_spectrum_batch(
         y0,
         t_span,
         params,
-        linear_solver=prepared.lu_solver,
         sparsity=prepared.sparsity,
         lu_precision="fp32",
         rtol=rtol,

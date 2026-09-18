@@ -7,7 +7,10 @@ name = "discoeb"
 version = "0.1.0"
 dependencies = [
     "jax[cuda13]",
-    "modax",
+    # The perturbation solve runs on modax's sparse direct linear solver, whose
+    # fill-reducing ordering is SuiteSparse's AMD through scikit-sparse -- hence
+    # the `sparse` extra, and hence libsuitesparse-dev on the machine.
+    "modax[sparse]",
     "diffrax",
     "equinox",
     "jaxtyping",
