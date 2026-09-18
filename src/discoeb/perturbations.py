@@ -3154,9 +3154,16 @@ TAU_START = 0.1
 # Packed-parameter row layout consumed by the device rhs/jac.
 #   p = (grhog, grhornomass, grhoc, grhob, grhov,
 #        tau_start, tau_end, k, cosmology_idx, save_index,
-#        w_DE_0, w_DE_a, cs2_DE, grhok)
+#        w_DE_0, w_DE_a, cs2_DE, grhok, grhor_nu, n_mnu, amnu,
+#        eps, dir_grhog, dir_grhornomass, dir_grhoc, dir_grhob, dir_grhov)
 # grhok = grhom * Omega_k is the (constant) comoving curvature density
 # coefficient 8*pi*G*rho_K a^2; it is 0 for a flat cosmology.
+# The rhs reads density ``c`` as ``p[c] + p[IX_EPS] * p[IX_DIR + c]``. ``eps``
+# is zero in every primal solve, so the trajectory is what it always was; its
+# derivative with respect to ``eps`` alone is the directional derivative along
+# the row's ``dir`` vector. That is what lets a trajectory carry a single
+# sensitivity column for a direction of its own -- see
+# :func:`matter_power_spectrum_jax`.
 IX_TAU_START = 5
 IX_TAU_END = 6
 IX_K = 7
@@ -3169,7 +3176,9 @@ IX_GRHOK = 13
 IX_GRHOR_NU = 14
 IX_NMNU = 15
 IX_AMNU = 16
-N_PARAM = 17
+IX_EPS = 17
+IX_DIR = 18
+N_PARAM = IX_DIR + 5
 
 THERMO_TABLE_DTYPE = np.float32
 TRAJECTORIES_PER_BLOCK = 32
@@ -3368,10 +3377,13 @@ def make_params(cosmology, k_values: np.ndarray, tau_end: float) -> np.ndarray:
     grhor_nu_col = np.full(n, grhor_nu, dtype=np.float64)
     n_mnu_col = np.full(n, n_mnu, dtype=np.float64)
     amnu_col = np.full(n, amnu, dtype=np.float64)
+    # No sensitivity direction: eps and dir are zero, so the densities the rhs
+    # sees are exactly the five in ``rows``.
+    direction = np.zeros((n, N_PARAM - IX_EPS), dtype=np.float64)
     return np.column_stack(
         (rows, tau_start, tau_end_col, np.asarray(k_values, dtype=np.float64),
          cosmology_idx, save_index, w_de_0, w_de_a, cs2_de, grhok_col,
-         grhor_nu_col, n_mnu_col, amnu_col)
+         grhor_nu_col, n_mnu_col, amnu_col, direction)
     )
 
 
@@ -3495,18 +3507,22 @@ def build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds, schur_solv
             cs2 = 0.0
 
         a2 = a * a
-        grhog_t = p[0] / a2
-        grhor_t = p[1] / a2
-        grhoc_t = p[2] / a
-        grhob_t = p[3] / a
+        # The densities are read through the row's sensitivity direction: eps
+        # is zero in a primal solve and d/d(eps) is the derivative along dir.
+        eps = p[IX_EPS]
+        grhog_t = (p[0] + eps * p[IX_DIR]) / a2
+        grhor_t = (p[1] + eps * p[IX_DIR + 1]) / a2
+        grhoc_t = (p[2] + eps * p[IX_DIR + 2]) / a
+        grhob_t = (p[3] + eps * p[IX_DIR + 3]) / a
+        grhov = p[4] + eps * p[IX_DIR + 4]
         if ENABLE_DE:
             w0 = p[IX_W_DE_0]
             wa = p[IX_W_DE_A]
             w_Q = w0 + wa * (1.0 - a)
             rho_Q = a ** (-3.0 * (1.0 + w0 + wa)) * math.exp(3.0 * (a - 1.0) * wa)
-            grhov_t = p[4] * rho_Q * a2
+            grhov_t = grhov * rho_Q * a2
         else:
-            grhov_t = p[4] * a2
+            grhov_t = grhov * a2
         if ENABLE_MNU:
             grhor_nu = p[IX_GRHOR_NU]
             n_mnu = p[IX_NMNU]
@@ -4093,23 +4109,54 @@ def matter_power_spectrum_jax(
     atol: float = PERTURB_ATOL,
     first_step: float = PERTURB_FIRST_STEP,
     max_steps: int = PERTURB_MAX_STEPS,
+    one_column_per_trajectory: bool = True,
 ):
     """``P(k)`` as a JAX array, differentiable in the background densities.
 
     ``densities`` is the five-vector of :data:`PHYSICAL_DENSITY_COLUMNS`,
     defaulting to the cosmology's own. Differentiating with respect to it runs
-    modax's continuous forward-sensitivity system for those five columns only,
-    which is what ``sens_param_columns`` is for: the joint system is
-    ``n_vars * (1 + n_sens)`` components and every direction costs a
-    second-order sweep per stage, so carrying the whole seventeen-column row
-    would be three times the work for the same answer.
-
-    The densities enter twice -- through the hierarchy, and through the
+    modax's continuous forward-sensitivity system alongside the state. The
+    densities enter twice -- through the hierarchy, and through the
     matter-weighting of ``delta_m`` -- and both paths are differentiated, so
     this is the total derivative and not just the ODE's part of it. What is
     held fixed is the thermodynamics: the recombination history is tabulated on
     the host and uploaded, so this is a derivative at fixed ionisation history.
+
+    The same sensitivity system can be laid out over the threads two ways.
+
+    ``one_column_per_trajectory=True`` (the default)
+        Every wave mode is replicated once per density, and replica ``j``
+        carries one sensitivity column, along the unit direction ``e_j``,
+        through the ``IX_EPS`` / ``IX_DIR`` columns of its parameter row. A
+        thread then integrates ``2 * nvar`` components instead of ``6 * nvar``,
+        and the five columns run side by side on threads the launch would
+        otherwise leave idle -- 128 modes are four blocks of 32 on a GPU with
+        dozens of SMs. The state and the Jacobian are recomputed by each
+        replica, which costs nothing while the card has SMs to spare. Measured
+        on an RTX 4070 SUPER for the 128 test modes (``jax.value_and_grad``,
+        ``test_matter_power_spectrum_derivatives``): 0.28 s for the plain
+        solve, 1.92 s for five columns in one thread, 0.59 s for one column
+        per thread. A backward adjoint solve would need at least the forward
+        solve plus a second pass of comparable cost, so this is already at the
+        adjoint's floor with no trajectory storage.
+
+    ``one_column_per_trajectory=False``
+        One trajectory per mode carrying all five columns
+        (``sens_param_columns=PHYSICAL_DENSITY_COLUMNS``). Five times less
+        thread-time in total, since the state and the Jacobian are formed once
+        per mode rather than once per column, so it is the arrangement to
+        prefer once a batch is large enough to saturate the GPU by itself.
+
+    Either way the sensitivities are kept out of step-size control
+    (``sens_error_control=False``): they run to ~1e17 while the state is O(1),
+    so letting them into the weighted error norm hands them the step size and
+    costs 20x the solve for no accuracy the tolerances asked for. The LU is
+    fp64, unlike the plain solve: the Rosenbrock-W property lets an fp32
+    factorisation carry the *state* at full order, but the sensitivity rows are
+    driven by that same matrix and measure ~25% error from it, against ~5e-4
+    in fp64.
     """
+    import jax
     import jax.numpy as jnp
 
     from solvers.rodas5P import solve as rodas5P_solve
@@ -4117,28 +4164,18 @@ def matter_power_spectrum_jax(
     cosmology = _as_cosmology(cosmology)
     prepared = _prepare_solve((cosmology,))
     cosmology = prepared.cosmologies[0]
-    layout = prepared.layout
 
     params, y0, t_span, order, k_sorted = _pack_batch(prepared, k_values)
-    columns = jnp.asarray(PHYSICAL_DENSITY_COLUMNS)
+    columns = list(PHYSICAL_DENSITY_COLUMNS)
+    n_dir = len(columns)
+    n_k = params.shape[0]
     if densities is None:
-        densities = jnp.asarray(params[0, list(PHYSICAL_DENSITY_COLUMNS)])
+        densities = params[0, columns]
     densities = jnp.asarray(densities)
-    params_j = jnp.asarray(params).at[:, columns].set(
-        jnp.broadcast_to(densities, (params.shape[0], densities.shape[-1]))
-    )
 
-    sol = rodas5P_solve(
-        prepared.ode_fn,
-        jnp.asarray(y0),
-        jnp.asarray(t_span),
-        params_j,
+    settings = dict(
         linear_solver=prepared.lu_solver,
         sparsity=prepared.sparsity,
-        # fp64 here, unlike the plain solve: the Rosenbrock-W property lets an
-        # fp32 factorisation carry the *state* at full order, but the
-        # sensitivity rows are driven by that same matrix and measure ~25%
-        # error from it, against ~5e-4 in fp64.
         lu_precision="fp64",
         rtol=rtol,
         atol=atol,
@@ -4149,13 +4186,72 @@ def matter_power_spectrum_jax(
         trajectories_per_block=TRAJECTORIES_PER_BLOCK,
         tf_index=IX_TAU_END,
         max_registers=CUDA_MAX_REGISTERS,
-        sens_param_columns=PHYSICAL_DENSITY_COLUMNS,
-        # The sensitivities run to ~1e17 while the state is O(1), so letting
-        # them into the weighted error norm hands them the step size and costs
-        # 20x the solve for no accuracy the tolerances asked for.
+        array_rhs=prepared.rhs_array,
         sens_error_control=False,
     )
-    y_final = sol[:, -1, :]
+    t_span_j = jnp.asarray(t_span)
+
+    def with_densities(base, d):
+        return jnp.asarray(base).at[:, jnp.asarray(columns)].set(
+            jnp.broadcast_to(d, (base.shape[0], n_dir))
+        )
+
+    if not one_column_per_trajectory:
+        sol = rodas5P_solve(
+            prepared.ode_fn,
+            jnp.asarray(y0),
+            t_span_j,
+            with_densities(params, densities),
+            sens_param_columns=PHYSICAL_DENSITY_COLUMNS,
+            **settings,
+        )
+        y_final = sol[:, -1, :]
+    else:
+        # Replica j of mode i is row i * n_dir + j, so a block of consecutive
+        # rows still spans neighbouring wave modes and their similar step
+        # sequences; each replica's direction is the unit vector e_j.
+        params_rep = np.repeat(params, n_dir, axis=0)
+        params_rep[:, IX_DIR : IX_DIR + n_dir] = np.tile(np.eye(n_dir), (n_k, 1))
+        y0_rep = jnp.asarray(np.repeat(y0, n_dir, axis=0))
+        y0_j = jnp.asarray(y0)
+
+        @jax.custom_jvp
+        def final_state(d):
+            sol = rodas5P_solve(
+                prepared.ode_fn, y0_j, t_span_j, with_densities(params, d), **settings
+            )
+            return sol[:, -1, :]
+
+        @final_state.defjvp
+        def final_state_jvp(primals, tangents):
+            (d,), (dd,) = primals, tangents
+            p_rep = with_densities(params_rep, d)
+
+            def along_directions(eps):
+                return rodas5P_solve(
+                    prepared.ode_fn,
+                    y0_rep,
+                    t_span_j,
+                    p_rep.at[:, IX_EPS].set(eps),
+                    sens_param_columns=(IX_EPS,),
+                    **settings,
+                )
+
+            # d/d(eps) at eps = 0 along every replica at once: one joint launch
+            # of n_k * n_dir trajectories, each carrying its own single column.
+            n_rep = p_rep.shape[0]
+            sol, dsol = jax.jvp(
+                along_directions, (jnp.zeros(n_rep),), (jnp.ones(n_rep),)
+            )
+            # Every replica of a mode integrates the same state; keep the first.
+            y_final = sol[::n_dir, -1, :]
+            # sens[i, j] = d y_i(tau0) / d density_j. The contraction with the
+            # input tangent is linear, so JAX transposes it and jax.grad falls
+            # out of the same rule with no adjoint solve.
+            sens = dsol[:, -1, :].reshape(n_k, n_dir, -1)
+            return y_final, jnp.einsum("ijv,j->iv", sens, dd)
+
+        y_final = final_state(densities)
 
     grhoc_val = densities[2]
     grhob_val = densities[3]
@@ -4171,7 +4267,6 @@ def matter_power_spectrum_jax(
         * (ks / cosmology.k_pivot) ** (cosmology.n_s - 1.0)
         * delta_m**2
     )
-    del layout
     return pk_sorted[jnp.asarray(np.argsort(order))]
 
 

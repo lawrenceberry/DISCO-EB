@@ -262,13 +262,24 @@ DENSITY_NAMES = ("grhog", "grhornomass", "grhoc", "grhob", "grhov")
 DERIV_GATE = 1.0e-3
 
 
-def test_matter_power_spectrum_derivatives(benchmark):
+@pytest.mark.parametrize(
+    "one_column_per_trajectory",
+    [
+        pytest.param(True, id="one-column-per-thread"),
+        pytest.param(False, id="five-columns-per-thread"),
+    ],
+)
+def test_matter_power_spectrum_derivatives(one_column_per_trajectory, benchmark):
     """Time and check dP(k)/d(background densities) by forward sensitivity.
 
     The five densities enter both the hierarchy and the matter weighting of
     ``delta_m``, so this is the total derivative. Central differences are the
     noisy side of the comparison: the solve runs at rtol = atol = 1e-4, which
     bounds how well any finite difference of it can agree.
+
+    Both layouts of the sensitivity system are timed: the five columns stacked
+    in each mode's thread, and one column per thread over five replicas of
+    each mode (see :func:`matter_power_spectrum_jax`).
     """
 
     import jax
@@ -288,7 +299,14 @@ def test_matter_power_spectrum_derivatives(benchmark):
     assert densities.shape == (len(PHYSICAL_DENSITY_COLUMNS),)
 
     def total_power(d):
-        return jnp.sum(matter_power_spectrum_jax(MATTER_POWER_K, cosmology, d))
+        return jnp.sum(
+            matter_power_spectrum_jax(
+                MATTER_POWER_K,
+                cosmology,
+                d,
+                one_column_per_trajectory=one_column_per_trajectory,
+            )
+        )
 
     value_and_grad = jax.value_and_grad(total_power)
 
