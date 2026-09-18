@@ -247,7 +247,7 @@ def model_synchronous(*, tau, y, param, kmode, lmaxg, lmaxgp, lmaxr, lmaxnu, nqm
     # ) / a**2 + w_Q * param['grhom'] * param['OmegaDE'] * rho_Q * a**2
 
     # ... compute expansion rate
-    aprimeoa = take_idx(get_aprimeoa( param=param, aexp=a ))
+    aprimeoa = take_idx(get_aprimeoa( species=param['species'], a=a ))
     xeprime = take_idx(param['xe_of_loga_spline'].derivative( loga ) * aprimeoa)
     gpres = take_idx((
         (param['grhog'] + param['grhor'] * param['Neff']) / 3.0 + param['grhor'] * param['Nmnu'] * pnu
@@ -1371,13 +1371,15 @@ def determine_starting_time( *, param, k ):
 
         # Note: For starting time calculation, we use the full aprimeoa from background
         # This is slightly different from the old radiation-only approximation but more accurate
-        aprimeoa = get_aprimeoa( param=param, aexp=a )
+        #aprimeoa = get_aprimeoa( param=param, aexp=a )
+        aprimeoa = get_aprimeoa( species=param['species'], a=a )
         return 1.0/opac, 1.0/aprimeoa
 
 
     def get_tauH( tau, param ):
         a = param['a_of_tau_spline'].evaluate(tau)
-        aprimeoa = get_aprimeoa( param=param, aexp=a )
+        #aprimeoa = get_aprimeoa( param=param, aexp=a )
+        aprimeoa = get_aprimeoa( species=param['species'], a=a )
         return 1.0/aprimeoa
 
     # condition for small k: tau_c(a) / tau_H(a) < start_small_k_at_tau_c_over_tau_h

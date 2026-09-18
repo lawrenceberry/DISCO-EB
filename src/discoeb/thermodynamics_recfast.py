@@ -160,7 +160,7 @@ def ionization(loga, y, params, compute_xH_fn, compute_xHe_fn):
   # Hubble parameter calculation
   # Hprime = a'/a, dtau = dt/a -> da/dtau/a = da/dt = Ha
   from .background import get_aprimeoa
-  Hz = (1e-5*get_aprimeoa(param=param, aexp=a)[0]) / a * const_c * bigH
+  Hz = (1e-5*get_aprimeoa(species=param['species'], a=jnp.array([a]))[0]) / a * const_c * bigH
   
   # Temperature and rate calculations
   Tmat_1e4 = Tmat / 1e4
@@ -430,73 +430,6 @@ def compute_thermal_history( *, a0 : float, a1 : float, N : int, rtol : float = 
   Nnow = 3.0 * HO * HO * param['Omegab'] / (8.0 * jnp.pi * const_G * mu_H * const_mH)
   fHe = param['YHe']/(const_mHe_mH*(1.0-param['YHe']))
   Tcmb = param['Tcmb']
-  Tcmb2 = Tcmb**2
-  Tcmb3 = Tcmb2*Tcmb
-
-  def loop_body(i, y_arr):
-    astart = a[i]
-    zstart = 1.0/astart - 1.0
-    aend   = a[i+1]
-    zend   = 1.0/aend - 1.0
-    dzda   = -1.0/aend**2
-    tcmb = param['Tcmb'].squeeze()
-    yinit = jnp.array([1.0, 1.0, tcmb*(1.0 + zstart), 0.0, 0.0, -tcmb*(1.0 + zstart)])
-
-    y_prev = jnp.where(i > 0, y_arr[:, i-1], yinit[:, None])
-
-    cond1 = (zend > 3500.0)
-    cond2 = jnp.logical_and(i > 0, y_prev[1] > 0.99)
-    cond3 = jnp.logical_and(i > 0, y_prev[0] > 0.99)
-
-    def f_case1(): # if zend > 3500.0:
-      return jnp.array([1.0, 1.0, tcmb*(1.0 + zend), 0.0, 0.0, -tcmb*(1.0 + zend)])
-    
-    def f_case2(): # elif i>0 and x_He0 > 0.99:
-      x_H0 = 1.0
-      rhs  = (jnp.exp(1.5 * jnp.log(CR * tcmb/(1.0+zend))
-          - CB1_He1/(tcmb*(1.0+zend))) / Nnow) * 4.0
-      x_He0 = 0.5*(jnp.sqrt((rhs-1.0)**2 + 4.0*(1.0+fHe)*rhs) - (rhs-1.0))
-      dxHeIdz =((-3*(-(CB1_He1/Tcmb) + CR*Tcmb)**1.5*(Nnow + 2*fHe*Nnow + 
-              4*(-((CB1_He1 - CR*Tcmb**2)/(Tcmb*(1+zend))))**1.5 - 
-              jnp.sqrt(Nnow**2 + (16*(-CB1_He1 + CR*Tcmb**2)**3)/(Tcmb3*(1 + zend)**3) + 
-                8*(1 + 2*fHe)*Nnow*(-((CB1_He1 - CR*Tcmb**2)/(Tcmb*(1+zend))))**1.5)))
-           /(Nnow*(1 + zend)**2.5*jnp.sqrt(Nnow**2 + (16*(-CB1_He1 + CR*Tcmb**2)**3)/
-               (Tcmb**3*(1 + zend)**3) + 8*(1 + 2*fHe)*Nnow*(-((CB1_He1 - CR*Tcmb**2)/(Tcmb + Tcmb*zend)))**1.5)))
-      return jnp.array([x_H0, (x_He0 - 1.0)/fHe, tcmb*(1.0+zend), 0.0, dxHeIdz*dzda, -tcmb*(1.0+zend)])
-    
-    def f_case3(): # elif i>0 and x_H > 0.99:
-      rhs   = jnp.exp(1.5*jnp.log(CR*tcmb/(1.0+zend))
-          - CB1/(tcmb*(1.0+zend))) / Nnow
-      x_H0  = 0.5*(jnp.sqrt(rhs**2 + 4.0*rhs) - rhs)
-      dxHdz = ((3*((2*(-((CB1 - CR*Tcmb**2)/(Tcmb*(1+zend))))**1.5)/(1 + zend) + 
-                   ((CB1 - CR*Tcmb**2)*(2*CB1**2 - 4*CB1*CR*Tcmb**2 + Tcmb**2*
-                 (2*CR**2*Tcmb**2 + Nnow*(1 + zend)**2*jnp.sqrt(-((CB1 - CR*Tcmb**2)/(Tcmb*(1+zend)))))))/
-            (Tcmb**1.5*(1 + zend)**2.5*jnp.sqrt((-CB1 + CR*Tcmb**2)*
-                (CB1**2 - 2*CB1*CR*Tcmb**2 + Tcmb**2*(CR**2*Tcmb**2 + Nnow*(1 + zend)**2*
-                                                      jnp.sqrt(-((CB1 - CR*Tcmb**2)/(Tcmb*(1+zend))))))))))/(2.*Nnow))
-
-
-      y_sol = solve_ionization(astart=astart, aend=aend, ystart=y_prev, rtol=rtol, atol=atol, max_steps=128, param=param)
-      y_sol = y_sol.at[0].set(x_H0)
-      y_sol = y_sol.at[3].set(dxHdz*dzda)
-      return y_sol
-    
-    def f_case4(): # else:
-      return solve_ionization(astart=astart, aend=aend, ystart=y_prev, rtol=rtol, atol=atol, max_steps=128, param=param)
-
-    new_val = jax.lax.cond(
-      cond1,
-      f_case1,
-      lambda: jax.lax.cond(
-        cond2,
-        f_case2,
-        lambda: jax.lax.cond(cond3, f_case3, f_case4)
-      )
-    )
-
-    return y_arr.at[:, i].set(new_val)
-
-  #y_final = jax.lax.fori_loop(0, N, loop_body, y_init)
 
 
   # FIRST POINT OF ORDER : DETERMINE SAHA INPUTS
