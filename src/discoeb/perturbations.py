@@ -31,7 +31,15 @@ from .approximations import (
 )
 
 # Import background functions
-from .background import dtauda, evolve_background, get_aprimeoa, get_neutrino_momentum_bins
+from .background import (
+    batch_dimensions,
+    dtauda,
+    evolve_background,
+    get_aprimeoa,
+    get_neutrino_momentum_bins,
+    setup_background_evolution,
+)
+from .thermodynamics_recfast import evaluate_thermo
 
 
 
@@ -3393,6 +3401,45 @@ def _solve_backgrounds(stacked, n_grid: int):
             param=params, thermo_module="RECFAST", num_thermo=n_grid
         )
     )(stacked)
+
+
+@partial(jax.jit, static_argnames=("n_grid",))
+def _solve_thermal_histories(stacked, n_grid: int):
+    """The RECFAST solve of ``evolve_background`` alone, one vmap lane per cosmology."""
+
+    def one(params):
+        param = setup_background_evolution(
+            amin=1e-9, amax=1.01, param=batch_dimensions(dict(params))
+        )
+        return evaluate_thermo(param=param, num_thermo=n_grid, rtol=1e-5, atol=1e-7)
+
+    return jax.vmap(one)(stacked)
+
+
+def thermal_history_batch(cosmologies, n_grid: int = N_THERMO_GRID) -> dict:
+    """Solve the recombination history of a batch of cosmologies in one launch.
+
+    Returns host arrays: ``a`` of shape ``(n_grid + 1,)`` (the adaptive RECFAST
+    grid), and ``xe``, ``Tm`` and ``cs2`` of shape ``(n_cosmologies, n_grid + 1)``:
+    the free-electron fraction ``n_e / n_H``, the matter temperature in K and the
+    baryon sound speed squared. It is the thermodynamics half of
+    :func:`build_thermo_tables_batch`, exposed so the recombination solve can be
+    checked and timed on its own.
+    """
+
+    cosmologies = tuple(_as_cosmology(cosmology) for cosmology in cosmologies)
+    _check_background_param_fields(cosmologies[0])
+    stacked = {
+        key: jnp.asarray([getattr(c, attr) for c in cosmologies], dtype=jnp.float64)
+        for key, attr in _BACKGROUND_PARAM_FIELDS.items()
+    }
+    a, cs2, Tm, mu, xe, dxeda = _solve_thermal_histories(stacked, n_grid)
+    return {
+        "a": np.asarray(a)[0],
+        "xe": np.asarray(xe)[:, :, 0],
+        "Tm": np.asarray(Tm)[:, :, 0],
+        "cs2": np.asarray(cs2)[:, :, 0],
+    }
 
 
 def _build_thermo_tables_batch(cosmologies, n_grid: int = N_THERMO_GRID):

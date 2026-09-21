@@ -265,6 +265,8 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
             num_thermo=num_thermo,
             rtol=rtol,
             atol=atol,
+            amin=amin,
+            amax=amax,
         )
 
         param['aexp'] = aexp
