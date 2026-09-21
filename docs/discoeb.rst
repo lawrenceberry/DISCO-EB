@@ -28,14 +28,6 @@ discoeb.perturbations module
    :undoc-members:
    :show-inheritance:
 
-discoeb.thermodynamics\_mb95 module
------------------------------------
-
-.. automodule:: discoeb.thermodynamics_mb95
-   :members:
-   :undoc-members:
-   :show-inheritance:
-
 discoeb.thermodynamics\_recfast module
 --------------------------------------
 

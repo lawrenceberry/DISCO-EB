@@ -1,11 +1,8 @@
 from functools import partial
 import jax
 import jax.numpy as jnp
-import diffrax as drx
-from jax_cosmo.scipy.integrate import romb
 
 from .thermodynamics_recfast import evaluate_thermo as evaluate_thermo_recfast
-from .thermodynamics_mb95 import compute_thermo as compute_thermo_mb95
 
 from .spline_interpolation import spline_interpolation
 from .util import generalized_gauss_laguerre_weights, integrate_trapz
@@ -220,8 +217,8 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
     param : dict
         Dictionary of cosmological parameters
     thermo_module : str, optional
-        Thermal history module to use: 'RECFAST' (default, high accuracy),
-        'MB95' (faster, approximate), or 'CLASS' (use external CLASS data)
+        Thermal history module to use: 'RECFAST' (default), or 'CLASS' (use
+        external CLASS data)
     num_thermo : int, optional
         Number of sampling points for thermal history arrays. Default is 256.
         Uses adaptive sampling that concentrates 50% of points around recombination
@@ -289,37 +286,6 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
         # Pre-composed splines for direct a-to-quantity lookups (performance optimization)
         param['xe_of_loga_spline']    = spline_interpolation( jnp.log(aexp), xe , uniform = False)
         param['cs2a_of_loga_spline']  = spline_interpolation( jnp.log(aexp), aexp[:,None]*cs2 , uniform = False)
-
-    elif thermo_module == 'MB95':
-
-        # Compute the thermal history
-        th, param = compute_thermo_mb95( param=param, nthermo=num_thermo )
-
-        xe = th['xe']
-        xeHI = th['xHII']
-        xeHeI = th['xHeII']
-        xeHeII = th['xHeIII']
-        aexp = th['a']
-        tau = th['tau']
-        cs2 = th['cs2']
-        Tm = th['tb']
-
-        param['xe'] = xe
-        param['xeHI'] = xeHI
-        param['xeHeI'] = xeHeI
-        param['xeHeII'] = xeHeII
-        param['aexp'] = aexp
-        param['tau'] = tau
-
-        param['xe_of_tau_spline']     = spline_interpolation( tau, xe )
-        param['cs2a_of_tau_spline']   = spline_interpolation( tau, aexp*cs2 )
-        param['tempba_of_tau_spline'] = spline_interpolation( tau, aexp*Tm )
-        param['tau_of_a_spline'] = spline_interpolation( aexp, tau )
-        param['a_of_tau_spline'] = spline_interpolation( tau, aexp )
-
-        # Pre-composed splines for direct a-to-quantity lookups (performance optimization)
-        param['xe_of_loga_spline']    = spline_interpolation( jnp.log(aexp), xe , uniform = True)
-        param['cs2a_of_loga_spline']  = spline_interpolation( jnp.log(aexp), aexp*cs2 , uniform = True)
 
     elif thermo_module == 'CLASS':
         # use input CLASS thermodynamics

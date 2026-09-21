@@ -11,11 +11,6 @@ dependencies = [
     # fill-reducing ordering is SuiteSparse's AMD through scikit-sparse -- hence
     # the `sparse` extra, and hence libsuitesparse-dev on the machine.
     "modax[sparse]",
-    "diffrax",
-    "equinox",
-    "jaxtyping",
-    "jax_cosmo",
-    "lineax",
     "xprof>=2.21.6",
     "tensorflow>=2.20.0",
     "pytest>=8.4.2",
