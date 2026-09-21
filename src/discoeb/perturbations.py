@@ -2094,8 +2094,8 @@ def solve_perturbation_history_batch(
     All ``n_cosmologies * n_k`` trajectories are integrated by a single
     modax Rodas5P launch. Each trajectory still stops at its *own* ``tau0``
     (via ``IX_TAU_END``), so save times beyond a cosmology's ``tau0`` simply hold
-    its frozen final state -- consumers must mask them (see
-    :func:`discoeb.cmb.cmb_spectrum_from_sources`).
+    its frozen final state -- consumers must mask them (as
+    :mod:`discoeb.cmb` does through the opacity and the source channels).
 
     Returns
     -------
