@@ -1,6 +1,5 @@
 import math
 import os
-import sys
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -9,7 +8,6 @@ import jax.numpy as jnp
 import numpy as np
 from scipy import integrate, interpolate
 
-from ._unroll import unroll_to_tuple
 from .eb_sparsity import perturbation_sparsity
 from .util import lngamma_complex_e, root_find_bisect, root_find_bisect_nocond, savgol_filter
 
@@ -2178,18 +2176,25 @@ def power_multipoles( *, y : jnp.ndarray, kmodes : jnp.ndarray, b : float, param
     return P0, P2, P4
 # Hierarchy truncations. These are module-level integers (not runtime arguments)
 # so the state-vector layout and the accelerator-compiled right-hand side treat
-# them as compile-time constants. The current flat-LambdaCDM + massless-neutrino
-# layout has NVAR == 50: an 11-variable densely coupled core bordered by three
-# 13-variable free-streaming hierarchies, which is the structure
-# :mod:`discoeb.eb_sparsity` declares and the sparse direct solver exploits.
-LMAX_G = 15
+# them as compile-time constants. They are launch settings: each reads its
+# ``DISCO_LMAX_*`` environment variable at import, and a caller may also rebind
+# it before the first solve, since the GPU pipeline builds its layout from them
+# at solve time (:func:`_layout_for`). At the defaults the flat-LambdaCDM +
+# massless-neutrino layout has NVAR == 50: an 11-variable densely coupled core
+# bordered by three 13-variable free-streaming hierarchies, which is the
+# structure :mod:`discoeb.eb_sparsity` declares and the sparse direct solver
+# exploits.
+LMAX_G = int(os.environ.get("DISCO_LMAX_G", "15"))
 """Photon temperature hierarchy truncation (``Theta_0 ... Theta_LMAX_G``)."""
 
-LMAX_POL = 15
+LMAX_POL = int(os.environ.get("DISCO_LMAX_POL", "15"))
 """Photon E-mode polarization hierarchy truncation (``E_2 ... E_LMAX_POL``)."""
 
-LMAX_NR = 15
+LMAX_NR = int(os.environ.get("DISCO_LMAX_NR", "15"))
 """Massless-neutrino hierarchy truncation (``N_0 ... N_LMAX_NR``)."""
+
+LMAX_NU = int(os.environ.get("DISCO_LMAX_NU", "15"))
+"""Massive-neutrino hierarchy truncation (``psi_0 ... psi_LMAX_NU`` per momentum bin)."""
 
 IX_ETAK = 0
 """State-vector index of the metric perturbation ``etak = k eta``."""
@@ -3536,7 +3541,11 @@ def make_initial_states(cosmology, k_values: np.ndarray, layout) -> np.ndarray:
         _, _, dlfdlq = neutrino_momentum_bins(layout.nqmax)
     for i, k in enumerate(k_values):
         core = adiabatic_initial_conditions(float(k), TAU_START, *densities[:4])
-        y0[i, : len(core)] = core
+        # ``core`` is laid out by the module's index constants; place its
+        # non-zero blocks at the layout's indices.
+        y0[i, layout.ix_etak : layout.ix_vb + 1] = core[IX_ETAK : IX_VB + 1]
+        y0[i, layout.ix_g : layout.ix_g + 2] = core[IX_G : IX_G + 2]
+        y0[i, layout.ix_r : layout.ix_r + 4] = core[IX_R : IX_R + 4]
         if layout.enable_dark_energy:
             y0[i, layout.ix_clxq] = (1.0 + cosmology.w_DE_0) * core[IX_CLXC]
             y0[i, layout.ix_thetaq] = 0.0
@@ -3551,17 +3560,30 @@ def make_initial_states(cosmology, k_values: np.ndarray, layout) -> np.ndarray:
     return y0
 
 
-def build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds):
-    """Return the two numba-CUDA forms of the right-hand side for a layout.
+def build_numba_rhs(layout, tau_min, inv_dtau, values, seconds):
+    """Return the numba-CUDA right-hand side ``f(y, tau, p) -> tuple`` for a layout.
 
     The thermodynamics tables are uploaded once and read through a uniform
-    ``log(tau)`` cubic-spline device evaluator. ``ode_fn`` is the tuple form
-    Enzyme differentiates to get the Jacobian and ``df/dt``; ``rhs_array`` is the
-    same function over arrays, which the kernel's eight stage evaluations call
-    directly. The dynamical-dark-energy fluid equations are included when
-    ``layout.enable_dark_energy`` is set; because the flag is a compile-time
-    constant, numba prunes the DE branches entirely when it is disabled (so the
-    flat-LambdaCDM kernel is unchanged).
+    ``log(tau)`` cubic-spline device evaluator. The right-hand side is written
+    directly in the form Enzyme can differentiate for the Jacobian and
+    ``df/dt``: it takes and returns fixed-size tuples of scalars and indexes
+    ``y`` and ``p`` only at build-time constants, because a run-time index into
+    a tuple makes numba emit a bounds check Enzyme refuses. The same function
+    evaluated over array rows serves the kernel's primal stage evaluations.
+
+    The multipole hierarchies are therefore not looped over. Each multipole
+    above the quadrupole is its own one-line device function with its state
+    index and ``l`` baked in, and the multipoles of a hierarchy are folded into
+    one function at build time by tuple concatenation
+    (:func:`hierarchy_tail`), so the truncations are read from ``layout`` and
+    the state-vector layout, the initial conditions and the sparsity pattern
+    change together. The dynamical-dark-energy fluid equations and the
+    massive-neutrino hierarchies are included when the layout enables them;
+    both flags are compile-time constants, so numba prunes the disabled
+    branches entirely (the flat-LambdaCDM kernel is unchanged). Each
+    massive-neutrino momentum bin is likewise its own device function with the
+    bin's index base and quadrature node baked in, folded over the bins the
+    same way.
 
     The tables are stacked over cosmologies: ``values`` and ``seconds`` have
     shape ``(n_cosmologies, n_channels, n_grid)`` and ``tau_min`` / ``inv_dtau``
@@ -3572,35 +3594,33 @@ def build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds):
     """
 
     from numba_cuda_mlir import cuda
-    from numba_cuda_mlir.types import float64
 
-    # numba-cuda-mlir rebuilds SSA with a mutually recursive walk over the
-    # control-flow graph, and the perturbation right-hand side below has enough
-    # basic blocks to overrun CPython's default 1000-frame limit while doing it.
-    sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
+    ix_g, lmaxg = layout.ix_g, layout.lmaxg
+    ix_pol, lmaxpol = layout.ix_pol, layout.lmaxpol
+    ix_r, lmaxr = layout.ix_r, layout.lmaxr
 
-    NVAR = layout.nvar
     ENABLE_DE = layout.enable_dark_energy
     IX_CLXQ = layout.ix_clxq if ENABLE_DE else 0
     IX_THETAQ = layout.ix_thetaq if ENABLE_DE else 0
 
     ENABLE_MNU = layout.has_massive_neutrinos
     NQ = layout.nqmax if ENABLE_MNU else 0
-    LMAXNU = layout.lmaxnu
+    lmaxnu = layout.lmaxnu
     IX_MNU = layout.ix_massive_nu if ENABLE_MNU else 0
-    NPSI = LMAXNU + 1
+
+    # The quadrupole equations below couple to l = 3, so every hierarchy needs
+    # at least an octupole to truncate at.
+    truncations = {"lmaxg": lmaxg, "lmaxpol": lmaxpol, "lmaxr": lmaxr}
+    if ENABLE_MNU:
+        truncations["lmaxnu"] = lmaxnu
+    if any(lmax < 3 for lmax in truncations.values()):
+        raise ValueError(f"every hierarchy truncation must be >= 3; got {truncations}")
 
     n_grid = values.shape[-1]
     tau_min_dev = cuda.to_device(np.ascontiguousarray(tau_min, dtype=np.float64))
     inv_dtau_dev = cuda.to_device(np.ascontiguousarray(inv_dtau, dtype=np.float64))
     values_dev = cuda.to_device(np.ascontiguousarray(values, dtype=THERMO_TABLE_DTYPE))
     seconds_dev = cuda.to_device(np.ascontiguousarray(seconds, dtype=THERMO_TABLE_DTYPE))
-
-    # Massive-neutrino momentum quadrature (device constants).
-    q_np, w_np, dlf_np = neutrino_momentum_bins(NQ if ENABLE_MNU else 1)
-    q_dev = cuda.to_device(np.ascontiguousarray(q_np))
-    w_dev = cuda.to_device(np.ascontiguousarray(w_np))
-    dlf_dev = cuda.to_device(np.ascontiguousarray(dlf_np))
 
     @cuda.jit(device=True)
     def spline_eval(x, p, channel):
@@ -3628,9 +3648,160 @@ def build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds):
             + (y1 - m1 * h**2 / 6.0) * right / h
         )
 
-    # Left undecorated: this is the template `unroll_to_tuple` reads, and the
-    # array form below is compiled from the same object.
-    def rhs(y, tau, p, out):
+    # --- Free-streaming hierarchies -------------------------------------------
+    # Interior multipoles and the truncated top multipole of a Boltzmann
+    # hierarchy, for temperature-like (photons, massless and massive neutrinos)
+    # and E-mode couplings. ``damping`` is the Thomson opacity for photons and
+    # zero for neutrinos; ``k`` is ``k v`` for a massive-neutrino momentum bin.
+
+    @cuda.jit(device=True)
+    def stream(ell, lower, this, upper, k, damping):
+        """``psi_l' = k (l psi_{l-1} - (l+1) psi_{l+1}) / (2l+1) - damping psi_l``."""
+        return k * (ell * lower - (ell + 1.0) * upper) / (2.0 * ell + 1.0) - damping * this
+
+    @cuda.jit(device=True)
+    def truncate(ell, lower, this, k, damping, tau):
+        """``psi_L' = k psi_{L-1} - (L+1) psi_L / tau - damping psi_L``."""
+        return k * lower - (ell + 1.0) * this / tau - damping * this
+
+    @cuda.jit(device=True)
+    def stream_pol(ell, lower, this, upper, k, opacity):
+        """``E_l'``, whose coupling upwards carries ``(l+3)(l-1)/(l+1)``."""
+        polfac = (ell + 3.0) * (ell - 1.0) / (ell + 1.0)
+        return k * (ell * lower - polfac * upper) / (2.0 * ell + 1.0) - opacity * this
+
+    @cuda.jit(device=True)
+    def truncate_pol(ell, lower, this, k, opacity, tau):
+        """``E_L' = k L E_{L-1} / (2L+1) - (L+3) E_L / tau - opacity E_L``."""
+        return k * ell * lower / (2.0 * ell + 1.0) - (ell + 3.0) * this / tau - opacity * this
+
+    def hierarchy_tail(slot, lmax, interior, top):
+        """The derivatives of multipoles ``3 .. lmax`` of one hierarchy, as a tuple.
+
+        ``slot(l)`` is the state index of multipole ``l``. Each multipole is a
+        device function with its index and ``l`` baked in that appends its own
+        derivative to those of the multipoles below it, so nothing indexes
+        ``y`` at run time and the chain returns the tail in ascending ``l``.
+        """
+
+        def extend(below, ell):
+            lower, this, upper = slot(ell - 1), slot(ell), slot(ell + 1)
+            ell = float(ell)
+            if ell < lmax and below is None:
+
+                @cuda.jit(device=True)
+                def tail(y, k, damping, tau):
+                    return (interior(ell, y[lower], y[this], y[upper], k, damping),)
+
+            elif ell < lmax:
+
+                @cuda.jit(device=True)
+                def tail(y, k, damping, tau):
+                    return below(y, k, damping, tau) + (
+                        interior(ell, y[lower], y[this], y[upper], k, damping),
+                    )
+
+            elif below is None:  # a hierarchy truncated right at the octupole
+
+                @cuda.jit(device=True)
+                def tail(y, k, damping, tau):
+                    return (top(ell, y[lower], y[this], k, damping, tau),)
+
+            else:
+
+                @cuda.jit(device=True)
+                def tail(y, k, damping, tau):
+                    return below(y, k, damping, tau) + (
+                        top(ell, y[lower], y[this], k, damping, tau),
+                    )
+
+            return tail
+
+        tail = None
+        for ell in range(3, lmax + 1):
+            tail = extend(tail, ell)
+        return tail
+
+    # Theta_l at ix_g + l, E_l at ix_pol + (l - 2), N_l at ix_r + l.
+    photon_tail = hierarchy_tail(lambda l: ix_g + l, lmaxg, stream, truncate)
+    polarization_tail = hierarchy_tail(lambda l: ix_pol + l - 2, lmaxpol, stream_pol, truncate_pol)
+    neutrino_tail = hierarchy_tail(lambda l: ix_r + l, lmaxr, stream, truncate)
+
+    # --- Massive neutrinos -----------------------------------------------------
+    if ENABLE_MNU:
+        q_np, w_np, dlf_np = neutrino_momentum_bins(NQ)
+
+        def make_bin(qi):
+            """The two device functions of momentum bin ``qi``, constants baked in."""
+            b = IX_MNU + qi * (lmaxnu + 1)  # psi_l of this bin at b + l
+            q = float(q_np[qi])
+            w = float(w_np[qi])
+            dl = float(dlf_np[qi])
+            tail = hierarchy_tail(lambda l: b + l, lmaxnu, stream, truncate)
+
+            @cuda.jit(device=True)
+            def moments(y, a, amnu):
+                # The bin's share of the momentum integrals
+                #   drho_nu = sum_i w_i psi0_i / v_i ,   f_nu = sum_i w_i psi1_i
+                vq = 1.0 / math.sqrt(1.0 + (a * amnu / q) ** 2)
+                return (w * y[b] / vq, w * y[b + 1])
+
+            @cuda.jit(device=True)
+            def derivatives(y, a, amnu, k, z, sigma, tau):
+                # Massive-neutrino phase-space hierarchy (Ma & Bertschinger; CLASS
+                # perturbations.c, synchronous gauge with metric_continuity = h'/2,
+                # metric_euler = 0, metric_shear = k*sigma, and h' = 2 k z):
+                #   psi0' = -k v psi1 + (k z / 3) dlnf0
+                #   psi1' = (k v / 3) (psi0 - 2 psi2)
+                #   psi2' = (k v / 5) (2 psi1 - 3 psi3) - (2/15) k sigma dlnf0
+                #   psi_l' = (k v / (2l+1)) (l psi_{l-1} - (l+1) psi_{l+1})
+                #   psi_L' = k v psi_{L-1} - (L+1) psi_L / tau
+                vq = 1.0 / math.sqrt(1.0 + (a * amnu / q) ** 2)
+                kv = k * vq
+                psi0, psi1, psi2, psi3 = y[b], y[b + 1], y[b + 2], y[b + 3]
+                return (
+                    -kv * psi1 + (k * z / 3.0) * dl,
+                    kv / 3.0 * (psi0 - 2.0 * psi2),
+                    kv / 5.0 * (2.0 * psi1 - 3.0 * psi3) - (2.0 / 15.0) * k * sigma * dl,
+                ) + tail(y, kv, 0.0, tau)
+
+            return moments, derivatives
+
+        def summed(fns):
+            """Fold the bins' ``moments`` into one device function of their sums."""
+            if len(fns) == 1:
+                return fns[0]
+            rest, last = summed(fns[:-1]), fns[-1]
+
+            @cuda.jit(device=True)
+            def total(y, a, amnu):
+                so_far = rest(y, a, amnu)
+                this_bin = last(y, a, amnu)
+                return (so_far[0] + this_bin[0], so_far[1] + this_bin[1])
+
+            return total
+
+        def joined_bins(fns):
+            """Fold the bins' ``derivatives`` into one device function, in bin order."""
+            if len(fns) == 1:
+                return fns[0]
+            rest, last = joined_bins(fns[:-1]), fns[-1]
+
+            @cuda.jit(device=True)
+            def joined(y, a, amnu, k, z, sigma, tau):
+                return rest(y, a, amnu, k, z, sigma, tau) + last(
+                    y, a, amnu, k, z, sigma, tau
+                )
+
+            return joined
+
+        bins = [make_bin(qi) for qi in range(NQ)]
+        mnu_moments = summed([moments for moments, _ in bins])
+        mnu_derivatives = joined_bins([derivatives for _, derivatives in bins])
+    else:
+        mnu_moments = mnu_derivatives = None
+
+    def perturbation_rhs(y, tau, p):
         k = p[IX_K]
         log_tau = math.log(tau)
         a = spline_eval(log_tau, p, 0)
@@ -3675,13 +3846,10 @@ def build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds):
         clxc = y[IX_CLXC]
         clxb = y[IX_CLXB]
         vb = y[IX_VB]
-        clxg = y[IX_G]
-        qg = y[IX_G + 1]
-        pig = y[IX_G + 2]
-        e2 = y[IX_POL]
-        clxr = y[IX_R]
-        qr = y[IX_R + 1]
-        pir = y[IX_R + 2]
+        clxg, qg, pig, theta3 = y[ix_g], y[ix_g + 1], y[ix_g + 2], y[ix_g + 3]
+        e2, e3 = y[ix_pol], y[ix_pol + 1]
+        clxr, qr, pir, n3 = y[ix_r], y[ix_r + 1], y[ix_r + 2], y[ix_r + 3]
+
         dgrho = grhob_t * clxb + grhoc_t * clxc + grhog_t * clxg + grhor_t * clxr
         dgq = grhob_t * vb + grhog_t * qg + grhor_t * qr
         if ENABLE_DE:
@@ -3690,15 +3858,7 @@ def build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds):
             dgrho = dgrho + grhov_t * clxq
             dgq = dgq + grhov_t * (1.0 + w_Q) * thetaq / k
         if ENABLE_MNU:
-            # Momentum integrals of the phase-space perturbation:
-            #   drho_nu = sum_i w_i psi0_i / v_i ,   f_nu = sum_i w_i psi1_i
-            drhonu = 0.0
-            fnu = 0.0
-            for qi in range(NQ):
-                b = IX_MNU + qi * NPSI
-                vq = 1.0 / math.sqrt(1.0 + (a * amnu / q_dev[qi]) ** 2)
-                drhonu += w_dev[qi] * y[b] / vq
-                fnu += w_dev[qi] * y[b + 1]
+            drhonu, fnu = mnu_moments(y, a, amnu)
             dgrho = dgrho + grhor_nu * n_mnu * drhonu / a2
             dgq = dgq + grhor_nu * n_mnu * fnu / a2
         # Curved-geometry metric relations (CLASS perturbations.c, synchronous):
@@ -3716,116 +3876,60 @@ def build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds):
         polter = pig / 10.0 + 9.0 * e2 / 15.0
         vbdot = -adotoa * vb + k * delta_p_b - photbar * opacity * (4.0 * vb / 3.0 - qg)
 
-        for i in range(NVAR):
-            out[i] = 0.0
-        out[IX_ETAK] = (0.5 * dgq + Kcurv * z) / s2
-        out[IX_CLXC] = -k * z
-        out[IX_CLXB] = -k * (z + vb)
-        out[IX_VB] = vbdot
-        out[IX_G] = -k * (4.0 * z / 3.0 + qg)
-        out[IX_G + 1] = (
+        metric_and_matter = (
+            (0.5 * dgq + Kcurv * z) / s2,  # etak
+            -k * z,  # clxc
+            -k * (z + vb),  # clxb
+            vbdot,  # vb
+        )
+        photons = (
+            -k * (4.0 * z / 3.0 + qg),
             4.0 * (-vbdot - adotoa * vb + k * delta_p_b) / (3.0 * pb43)
             + k * clxg / 3.0
-            - 2.0 * k * pig / 3.0
-        )
-        out[IX_G + 2] = (
+            - 2.0 * k * pig / 3.0,
             2.0 * k * qg / 5.0
-            - 3.0 * k * y[IX_G + 3] / 5.0
+            - 3.0 * k * theta3 / 5.0
             - opacity * (pig - polter)
-            + 8.0 * k * sigma / 15.0
+            + 8.0 * k * sigma / 15.0,
+        ) + photon_tail(y, k, opacity, tau)
+        polarization = (-opacity * (e2 - polter) - k * e3 / 3.0,) + polarization_tail(
+            y, k, opacity, tau
         )
-        for ell in range(3, LMAX_G):
-            out[IX_G + ell] = (
-                k * ell * y[IX_G + ell - 1] / (2 * ell + 1)
-                - k * (ell + 1) * y[IX_G + ell + 1] / (2 * ell + 1)
-                - opacity * y[IX_G + ell]
-            )
-        out[IX_G + LMAX_G] = (
-            k * y[IX_G + LMAX_G - 1]
-            - (LMAX_G + 1) * y[IX_G + LMAX_G] / tau
-            - opacity * y[IX_G + LMAX_G]
-        )
-
-        out[IX_POL] = -opacity * (e2 - polter) - k * y[IX_POL + 1] / 3.0
-        for ell in range(3, LMAX_POL):
-            idx = IX_POL + ell - 2
-            polfac = (ell + 3) * (ell - 1) / (ell + 1)
-            out[idx] = (
-                -opacity * y[idx]
-                + k * ell * y[idx - 1] / (2 * ell + 1)
-                - polfac * k * y[idx + 1] / (2 * ell + 1)
-            )
-        idx_last = IX_POL + LMAX_POL - 2
-        out[idx_last] = (
-            -opacity * y[idx_last]
-            + k * LMAX_POL * y[idx_last - 1] / (2 * LMAX_POL + 1)
-            - (LMAX_POL + 3) * y[idx_last] / tau
-        )
-
-        out[IX_R] = -k * (4.0 * z / 3.0 + qr)
-        out[IX_R + 1] = k * (clxr - 2.0 * pir) / 3.0
-        out[IX_R + 2] = (
-            2.0 * k * qr / 5.0 - 3.0 * k * y[IX_R + 3] / 5.0 + 8.0 * k * sigma / 15.0
-        )
-        for ell in range(3, LMAX_NR):
-            out[IX_R + ell] = k * ell * y[IX_R + ell - 1] / (2 * ell + 1) - k * (
-                ell + 1
-            ) * y[IX_R + ell + 1] / (2 * ell + 1)
-        out[IX_R + LMAX_NR] = (
-            k * y[IX_R + LMAX_NR - 1] - (LMAX_NR + 1) * y[IX_R + LMAX_NR] / tau
-        )
+        massless_neutrinos = (
+            -k * (4.0 * z / 3.0 + qr),
+            k * (clxr - 2.0 * pir) / 3.0,
+            2.0 * k * qr / 5.0 - 3.0 * k * n3 / 5.0 + 8.0 * k * sigma / 15.0,
+        ) + neutrino_tail(y, k, 0.0, tau)
 
         if ENABLE_DE:
             cs2_Q = p[IX_CS2_DE]
             w_Q_prime = -wa * adotoa * a
             ca2_Q = w_Q - w_Q_prime / (3.0 * (1.0 + w_Q) * adotoa)
-            out[IX_CLXQ] = (
+            dark_energy = (
                 -(1.0 + w_Q) * (thetaq + k * z)
                 - 3.0 * (cs2_Q - w_Q) * adotoa * clxq
-                - 9.0 * (1.0 + w_Q) * (cs2_Q - ca2_Q) * adotoa**2 / k**2 * thetaq
-            )
-            out[IX_THETAQ] = (
+                - 9.0 * (1.0 + w_Q) * (cs2_Q - ca2_Q) * adotoa**2 / k**2 * thetaq,
                 -(1.0 - 3.0 * cs2_Q) * adotoa * thetaq
-                + cs2_Q / (1.0 + w_Q) * k**2 * clxq
+                + cs2_Q / (1.0 + w_Q) * k**2 * clxq,
             )
+        else:
+            dark_energy = ()
 
         if ENABLE_MNU:
-            # Massive-neutrino phase-space hierarchy (Ma & Bertschinger; CLASS
-            # perturbations.c, synchronous gauge with metric_continuity = h'/2,
-            # metric_euler = 0, metric_shear = k*sigma, and h' = 2 k z):
-            #   psi0' = -k v psi1 + (k z / 3) dlnf0
-            #   psi1' = (k v / 3) (psi0 - 2 psi2)
-            #   psi2' = (k v / 5) (2 psi1 - 3 psi3) - (2/15) k sigma dlnf0
-            #   psi_l' = (k v / (2l+1)) (l psi_{l-1} - (l+1) psi_{l+1})
-            #   psi_L' = k v psi_{L-1} - (L+1) psi_L / tau
-            for qi in range(NQ):
-                b = IX_MNU + qi * NPSI
-                vq = 1.0 / math.sqrt(1.0 + (a * amnu / q_dev[qi]) ** 2)
-                kv = k * vq
-                dl = dlf_dev[qi]
-                out[b] = -kv * y[b + 1] + (k * z / 3.0) * dl
-                out[b + 1] = kv / 3.0 * (y[b] - 2.0 * y[b + 2])
-                out[b + 2] = (
-                    kv / 5.0 * (2.0 * y[b + 1] - 3.0 * y[b + 3])
-                    - (2.0 / 15.0) * k * sigma * dl
-                )
-                for ell in range(3, LMAXNU):
-                    out[b + ell] = (
-                        kv
-                        / (2.0 * ell + 1.0)
-                        * (ell * y[b + ell - 1] - (ell + 1.0) * y[b + ell + 1])
-                    )
-                out[b + LMAXNU] = (
-                    kv * y[b + LMAXNU - 1] - (LMAXNU + 1.0) * y[b + LMAXNU] / tau
-                )
+            massive_neutrinos = mnu_derivatives(y, a, amnu, k, z, sigma, tau)
+        else:
+            massive_neutrinos = ()
 
-    # Enzyme requires the tuple form, which this derives from `rhs` above by
-    # unrolling the multipole loops -- so the differentiated callback cannot
-    # drift from the right-hand side it came from.
-    ode_fn = unroll_to_tuple(rhs, NVAR, name="perturbation_rhs")
-    rhs_array = cuda.jit(device=True)(rhs)
+        return (
+            metric_and_matter
+            + photons
+            + polarization
+            + massless_neutrinos
+            + dark_energy
+            + massive_neutrinos
+        )
 
-    return ode_fn, rhs_array
+    return perturbation_rhs
 
 
 class _PreparedSolve(NamedTuple):
@@ -3836,7 +3940,6 @@ class _PreparedSolve(NamedTuple):
     tables: tuple  # per-cosmology (tau_grid, values, seconds, tau0)
     tau0: np.ndarray  # (n_cosmologies,)
     ode_fn: object
-    rhs_array: object
     sparsity: object
 
 
@@ -3864,6 +3967,19 @@ def _stack_thermo_tables(tables):
     return tau_min, inv_dtau, values, seconds, tau0
 
 
+def _layout_for(cosmology) -> PerturbationLayout:
+    """The perturbation layout the module presets imply for a cosmology."""
+
+    return PerturbationLayout.from_cosmology(
+        cosmology,
+        lmaxg=LMAX_G,
+        lmaxpol=LMAX_POL,
+        lmaxr=LMAX_NR,
+        lmaxnu=LMAX_NU,
+        nqmax=NQMAX,
+    )
+
+
 def _prepare_solve(cosmologies) -> _PreparedSolve:
     """Return (and cache) the compiled solve artifacts for a batch of cosmologies.
 
@@ -3871,8 +3987,8 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
     the Jacobian sparsity pattern depend only on the cosmologies (and the
     module-level grid and quadrature presets), not on the wave modes, the save
     times, or the solver tolerances. They are also what triggers the *slow*
-    numba-CUDA kernel compilation: the returned ``ode_fn`` / ``rhs_array``
-    closures and the sparsity pattern are the identity keys of modax's
+    numba-CUDA kernel compilation: the returned ``ode_fn`` closure and the
+    sparsity pattern are the identity keys of modax's
     ``solvers.rodas5P`` compiled-kernel cache, so
     reusing the same objects across solves of the same batch turns a repeated
     solve from a full recompile (tens of seconds) into a bare kernel launch.
@@ -3890,14 +4006,24 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
     cosmologies = tuple(_as_cosmology(cosmology) for cosmology in cosmologies)
     # Include the presets that change the compiled artifacts, so a caller that
     # rebinds them (e.g. NQMAX) does not get a stale kernel.
-    key = (cosmologies, NQMAX, N_THERMO_GRID, TAU_START, TRAJECTORIES_PER_BLOCK)
+    key = (
+        cosmologies,
+        NQMAX,
+        LMAX_G,
+        LMAX_POL,
+        LMAX_NR,
+        LMAX_NU,
+        N_THERMO_GRID,
+        TAU_START,
+        TRAJECTORIES_PER_BLOCK,
+    )
     cached = _PREPARED_SOLVE_CACHE.get(key)
     if cached is not None:
         return cached
 
-    layout = PerturbationLayout.from_cosmology(cosmologies[0], nqmax=NQMAX)
+    layout = _layout_for(cosmologies[0])
     for cosmology in cosmologies[1:]:
-        if PerturbationLayout.from_cosmology(cosmology, nqmax=NQMAX) != layout:
+        if _layout_for(cosmology) != layout:
             raise ValueError(
                 "all cosmologies in a batch must share a perturbation layout "
                 "(same dark-energy / massive-neutrino settings)"
@@ -3905,7 +4031,7 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
 
     tables = build_thermo_tables_batch(cosmologies)
     tau_min, inv_dtau, values, seconds, tau0 = _stack_thermo_tables(tables)
-    ode_fn, rhs_array = build_numba_callbacks(layout, tau_min, inv_dtau, values, seconds)
+    ode_fn = build_numba_rhs(layout, tau_min, inv_dtau, values, seconds)
     # The pattern is all modax needs: it colours it for the Enzyme sweeps, and
     # orders it with AMD, factorises it symbolically and compiles a sparse LU
     # and sparse triangular solves for that exact structure.
@@ -3915,7 +4041,6 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
         tables,
         tau0,
         ode_fn,
-        rhs_array,
         perturbation_sparsity(layout),
     )
     _PREPARED_SOLVE_CACHE[key] = prepared
@@ -4054,7 +4179,6 @@ def solve_perturbation_history(
         trajectories_per_block=TRAJECTORIES_PER_BLOCK,
         tf_index=IX_TAU_END,
         max_registers=CUDA_MAX_REGISTERS,
-        array_rhs=prepared.rhs_array,
     )
     # The solver returns trajectories in ascending-k order; undo the sort. The
     # inverse permutation is a host-side constant, so the reorder is a plain
@@ -4130,7 +4254,6 @@ def solve_perturbation_history_batch(
         trajectories_per_block=TRAJECTORIES_PER_BLOCK,
         tf_index=IX_TAU_END,
         max_registers=CUDA_MAX_REGISTERS,
-        array_rhs=prepared.rhs_array,
     )
     # Rows are packed k-major (row = k_idx * n_cosmo + cosmology_idx), so this
     # reshape is a free view -- no copy of the (potentially multi-GB) history.
@@ -4274,7 +4397,6 @@ def matter_power_spectrum_jax(
         trajectories_per_block=TRAJECTORIES_PER_BLOCK,
         tf_index=IX_TAU_END,
         max_registers=CUDA_MAX_REGISTERS,
-        array_rhs=prepared.rhs_array,
         sens_error_control=False,
     )
     t_span_j = jnp.asarray(t_span)
@@ -4407,7 +4529,6 @@ def solve_matter_power_spectrum_batch(
         trajectories_per_block=TRAJECTORIES_PER_BLOCK,
         tf_index=IX_TAU_END,
         max_registers=CUDA_MAX_REGISTERS,
-        array_rhs=prepared.rhs_array,
     )
     y_final = np.asarray(sol)[:, -1, :].reshape(n_k, n_cosmo, layout.nvar)
 
