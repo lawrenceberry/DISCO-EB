@@ -1875,7 +1875,7 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
     times, or the solver tolerances. They are also what triggers the *slow*
     numba-CUDA kernel compilation: the returned ``ode_fn`` closure and the
     sparsity pattern are the identity keys of modax's
-    ``solvers.rodas5P`` compiled-kernel cache, so
+    ``modax.rodas5P`` compiled-kernel cache, so
     reusing the same objects across solves of the same batch turns a repeated
     solve from a full recompile (tens of seconds) into a bare kernel launch.
 
@@ -2031,7 +2031,7 @@ def solve_perturbation_history(
         original ``k`` order; ``tables`` is the ``build_thermo_tables`` tuple.
     """
 
-    from solvers.rodas5P import solve as rodas5P_solve
+    from modax.rodas5P import solve as rodas5P_solve
 
     prepared = _prepare_solve((cosmology,))
     cosmology = prepared.cosmologies[0]
@@ -2115,7 +2115,7 @@ def solve_perturbation_history_batch(
 
     import jax.numpy as jnp
 
-    from solvers.rodas5P import solve as rodas5P_solve
+    from modax.rodas5P import solve as rodas5P_solve
 
     prepared = _prepare_solve(tuple(cosmologies))
     layout = prepared.layout
@@ -2254,16 +2254,74 @@ def matter_power_spectrum_jax(
     driven by that same matrix and measure ~25% error from it, against ~5e-4
     in fp64.
     """
-    import jax
     import jax.numpy as jnp
-
-    from solvers.rodas5P import solve as rodas5P_solve
 
     cosmology = _as_cosmology(cosmology)
     prepared = _prepare_solve((cosmology,))
     cosmology = prepared.cosmologies[0]
 
-    params, y0, t_span, order, k_sorted = _pack_batch(prepared, k_values)
+    history, densities, k_sorted, order = _history_jax(
+        prepared,
+        k_values,
+        densities,
+        rtol=rtol,
+        atol=atol,
+        first_step=first_step,
+        max_steps=max_steps,
+        one_column_per_trajectory=one_column_per_trajectory,
+    )
+    y_final = history[:, -1, :]
+
+    grhoc_val = densities[2]
+    grhob_val = densities[3]
+    delta_m = (
+        grhoc_val * y_final[:, IX_CLXC] + grhob_val * y_final[:, IX_CLXB]
+    ) / (grhoc_val + grhob_val)
+    ks = jnp.asarray(k_sorted)
+    pk_sorted = (
+        2.0
+        * jnp.pi**2
+        / ks**3
+        * cosmology.A_s
+        * (ks / cosmology.k_pivot) ** (cosmology.n_s - 1.0)
+        * delta_m**2
+    )
+    return pk_sorted[jnp.asarray(np.argsort(order))]
+
+
+def _history_jax(
+    prepared,
+    k_values,
+    densities=None,
+    tau_save=None,
+    *,
+    rtol: float = PERTURB_RTOL,
+    atol: float = PERTURB_ATOL,
+    first_step: float = PERTURB_FIRST_STEP,
+    max_steps: int = PERTURB_MAX_STEPS,
+    one_column_per_trajectory: bool = True,
+    sens_error_control: bool = False,
+):
+    """The saved history of one cosmology's modes, differentiable in the densities.
+
+    The solve behind :func:`matter_power_spectrum_jax` and
+    :func:`discoeb.cmb.cl_power_spectrum_jax`, which documents the two thread
+    layouts (``one_column_per_trajectory``) and the solver settings. ``prepared``
+    is the :func:`_prepare_solve` of the single cosmology; ``tau_save`` is the
+    save grid (default: the two endpoints, i.e. the final state only).
+
+    Returns ``(history, densities, k_sorted, order)``: ``history`` is
+    ``(n_k, n_save, nvar)`` in ascending ``k`` as a JAX array whose derivative
+    with respect to ``densities`` is modax's forward sensitivity; ``densities``
+    is the resolved five-vector; ``k_sorted`` and ``order`` are the sorted wave
+    numbers and the sort of the caller's ``k_values``.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from modax.rodas5P import solve as rodas5P_solve
+
+    params, y0, t_span, order, k_sorted = _pack_batch(prepared, k_values, tau_save)
     columns = list(PHYSICAL_DENSITY_COLUMNS)
     n_dir = len(columns)
     n_k = params.shape[0]
@@ -2283,7 +2341,7 @@ def matter_power_spectrum_jax(
         trajectories_per_block=TRAJECTORIES_PER_BLOCK,
         tf_index=IX_TAU_END,
         max_registers=CUDA_MAX_REGISTERS,
-        sens_error_control=False,
+        sens_error_control=sens_error_control,
     )
     t_span_j = jnp.asarray(t_span)
 
@@ -2293,7 +2351,7 @@ def matter_power_spectrum_jax(
         )
 
     if not one_column_per_trajectory:
-        sol = rodas5P_solve(
+        history = rodas5P_solve(
             prepared.ode_fn,
             jnp.asarray(y0),
             t_span_j,
@@ -2301,7 +2359,6 @@ def matter_power_spectrum_jax(
             sens_param_columns=PHYSICAL_DENSITY_COLUMNS,
             **settings,
         )
-        y_final = sol[:, -1, :]
     else:
         # Replica j of mode i is row i * n_dir + j, so a block of consecutive
         # rows still spans neighbouring wave modes and their similar step
@@ -2312,14 +2369,13 @@ def matter_power_spectrum_jax(
         y0_j = jnp.asarray(y0)
 
         @jax.custom_jvp
-        def final_state(d):
-            sol = rodas5P_solve(
+        def saved_history(d):
+            return rodas5P_solve(
                 prepared.ode_fn, y0_j, t_span_j, with_densities(params, d), **settings
             )
-            return sol[:, -1, :]
 
-        @final_state.defjvp
-        def final_state_jvp(primals, tangents):
+        @saved_history.defjvp
+        def saved_history_jvp(primals, tangents):
             (d,), (dd,) = primals, tangents
             p_rep = with_densities(params_rep, d)
 
@@ -2340,30 +2396,16 @@ def matter_power_spectrum_jax(
                 along_directions, (jnp.zeros(n_rep),), (jnp.ones(n_rep),)
             )
             # Every replica of a mode integrates the same state; keep the first.
-            y_final = sol[::n_dir, -1, :]
-            # sens[i, j] = d y_i(tau0) / d density_j. The contraction with the
-            # input tangent is linear, so JAX transposes it and jax.grad falls
-            # out of the same rule with no adjoint solve.
-            sens = dsol[:, -1, :].reshape(n_k, n_dir, -1)
-            return y_final, jnp.einsum("ijv,j->iv", sens, dd)
+            history = sol[::n_dir]
+            # sens[i, j] = d y_i(tau) / d density_j at every save. The
+            # contraction with the input tangent is linear, so JAX transposes
+            # it and jax.grad falls out of the same rule with no adjoint solve.
+            sens = dsol.reshape(n_k, n_dir, *dsol.shape[1:])
+            return history, jnp.einsum("ijtv,j->itv", sens, dd)
 
-        y_final = final_state(densities)
+        history = saved_history(densities)
 
-    grhoc_val = densities[2]
-    grhob_val = densities[3]
-    delta_m = (
-        grhoc_val * y_final[:, IX_CLXC] + grhob_val * y_final[:, IX_CLXB]
-    ) / (grhoc_val + grhob_val)
-    ks = jnp.asarray(k_sorted)
-    pk_sorted = (
-        2.0
-        * jnp.pi**2
-        / ks**3
-        * cosmology.A_s
-        * (ks / cosmology.k_pivot) ** (cosmology.n_s - 1.0)
-        * delta_m**2
-    )
-    return pk_sorted[jnp.asarray(np.argsort(order))]
+    return history, densities, k_sorted, order
 
 
 
@@ -2389,7 +2431,7 @@ def solve_matter_power_spectrum_batch(
         original cosmology and ``k`` order.
     """
 
-    from solvers.rodas5P import solve as rodas5P_solve
+    from modax.rodas5P import solve as rodas5P_solve
 
     prepared = _prepare_solve(tuple(cosmologies))
     cosmologies = prepared.cosmologies

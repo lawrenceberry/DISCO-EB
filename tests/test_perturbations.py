@@ -101,7 +101,9 @@ def test_matter_power_spectrum_matches_class(n_cosmologies, benchmark):
         warmup_rounds=1,
         iterations=1,
     )
-    pk_class = np.stack([_class_linear_pk(param, MATTER_POWER_K) for param in cosmologies])
+    pk_class = np.stack(
+        [_class_linear_pk(param, MATTER_POWER_K) for param in cosmologies]
+    )
     rel = np.abs(pk_ours / pk_class - 1.0)
     worst = np.unravel_index(np.argmax(rel), rel.shape)
     assert float(rel[worst]) < PK_GATE, (

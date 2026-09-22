@@ -197,6 +197,57 @@ def assemble_sources(channels, tau):
     return jnp.stack([s_j0, s_j1, s_j2], axis=-3)
 
 
+def source_channels_jax(history, k_sorted, a_tab, g_tab, emk_tab, densities):
+    """The five source channels of a saved history, as JAX arithmetic.
+
+    The same algebra as the device function of
+    :func:`build_source_device_function`, evaluated on the host over a history
+    ``(n_k, n_tau, nvar)`` in ascending ``k`` so that it can be differentiated:
+    the densities enter the sources through the metric combinations and the
+    background expansion rate, and that path is part of the total derivative of
+    ``C_l`` with respect to them. ``a_tab``, ``g_tab`` and ``emk_tab`` are one
+    cosmology's rows of :func:`_source_tables`. Returns ``(5, n_k, n_tau)``.
+    """
+
+    y = jnp.asarray(history)
+    k = jnp.asarray(k_sorted)[:, None]
+    a = jnp.asarray(a_tab)[None, :]
+    g = jnp.asarray(g_tab)[None, :]
+    emk = jnp.asarray(emk_tab)[None, :]
+    grhog, grhor, grhoc, grhob, grhov = (densities[i] for i in range(5))
+
+    etak = y[..., IX_ETAK]
+    clxc, clxb, vb = y[..., IX_CLXC], y[..., IX_CLXB], y[..., IX_VB]
+    clxg, qg, pig = y[..., IX_G], y[..., IX_G + 1], y[..., IX_G + 2]
+    e2 = y[..., IX_POL]
+    clxr, qr, pir = y[..., IX_R], y[..., IX_R + 1], y[..., IX_R + 2]
+
+    a2 = a * a
+    grhog_t = grhog / a2
+    grhor_t = grhor / a2
+    grhoc_t = grhoc / a
+    grhob_t = grhob / a
+    grhov_t = grhov * a2
+    adotoa = jnp.sqrt((grhog_t + grhor_t + grhoc_t + grhob_t + grhov_t) / 3.0)
+
+    dgrho = grhob_t * clxb + grhoc_t * clxc + grhog_t * clxg + grhor_t * clxr
+    dgq = grhob_t * vb + grhog_t * qg + grhor_t * qr
+    dgpi = grhog_t * pig + grhor_t * pir
+    k2 = k * k
+    phi = -(dgrho + 3.0 * dgq * adotoa / k + dgpi) / (2.0 * k2)
+    z = (0.5 * dgrho / k + etak) / adotoa
+    sigma = z + 1.5 * dgq / k2
+    polter = pig / 10.0 + 9.0 / 15.0 * e2
+    monopole = -etak / k + 2.0 * phi + 0.25 * clxg
+
+    s_noisw = g * (monopole + 0.625 * polter)
+    s_j1 = g * (sigma + vb)
+    s_j2 = 1.875 * g * polter
+    return jnp.stack(
+        [s_noisw, s_j1, s_j2, phi, jnp.broadcast_to(emk, phi.shape)], axis=0
+    )
+
+
 # =============================================================================
 # 3. The projection operator: grids, Bessel tables and matrix products
 # =============================================================================
@@ -749,7 +800,7 @@ def _solve_with_hook(prepared, k_values, tau_save, hook, hook_size, solve_kwargs
     ``hook_out`` is ``(n_k, n_cosmo, hook_size)``; no history is kept.
     """
 
-    from solvers.rodas5P import solve as rodas5P_solve
+    from modax.rodas5P import solve as rodas5P_solve
 
     from .perturbations import _pack_batch
 
@@ -907,3 +958,113 @@ def compute_cl_power_spectrum(cosmology, **kwargs):
 
     ells_out, cl, dl = compute_cl_power_spectrum_batch([cosmology], **kwargs)
     return ells_out, cl[0], dl[0]
+
+
+def cl_power_spectrum_jax(
+    cosmology,
+    densities=None,
+    *,
+    k_values: np.ndarray | None = None,
+    ells: np.ndarray | None = None,
+    n_save: int = 1000,
+    n_k_fine: int = 1500,
+    k_fine_values: np.ndarray | None = None,
+    projection_dtype=jnp.float64,
+    one_column_per_trajectory: bool = True,
+    **solve_kwargs,
+):
+    """``(ells, C_l, D_l)`` of one cosmology as JAX arrays, differentiable in the densities.
+
+    The counterpart of :func:`discoeb.perturbations.matter_power_spectrum_jax`
+    for the unlensed TT spectrum. ``densities`` is the five-vector of
+    :data:`~discoeb.perturbations.PHYSICAL_DENSITY_COLUMNS`, defaulting to the
+    cosmology's own; differentiating with respect to it runs modax's forward
+    sensitivity system alongside the state, in either of the two thread layouts
+    of :func:`~discoeb.perturbations.matter_power_spectrum_jax`
+    (``one_column_per_trajectory``). The densities enter through the hierarchy
+    and again through the source algebra (:func:`source_channels_jax`), and
+    both paths are differentiated. As for ``P(k)``, the thermodynamics -- here
+    the visibility and ``a(tau)`` on the save grid -- and the grids are held
+    fixed, so this is the derivative at fixed ionisation history.
+
+    A hooked modax launch cannot be differentiated (the hook's accumulator is
+    outside the sensitivity rule), so unlike :func:`compute_cl_power_spectrum`
+    this path saves the state history on the ``tau`` grid and forms the sources
+    on the host; for one cosmology that history is a few hundred megabytes. The
+    projection defaults to ``float64``: the ``float32`` matrix products cost
+    2.6e-4 in ``D_l``, which a derivative of the spectrum cannot afford.
+    """
+
+    from .perturbations import _history_jax, _prepare_solve
+
+    cosmology = _as_cosmology(cosmology)
+    prepared = _prepare_solve((cosmology,))
+    cosmology = prepared.cosmologies[0]
+    if k_values is None:
+        k_values = cmb_k_grid(cosmology, n=128, mode="ode")
+    if ells is None:
+        ells = DEFAULT_CMB_ELLS
+    k_values = np.asarray(k_values, dtype=np.float64)
+    ells = np.asarray(ells, dtype=np.int64)
+
+    tau0 = float(prepared.tau0[0])
+    tau_save = cmb_tau_grid(cosmology, k_values, n_save, tau_end=tau0)
+    if k_fine_values is None:
+        k_fine = cmb_k_grid(
+            cosmology,
+            n=n_k_fine,
+            mode="cl",
+            k_min=float(k_values[0]),
+            k_max=float(k_values[-1]),
+            ell_max=int(np.max(ells)),
+        )
+    else:
+        k_fine = np.asarray(k_fine_values, dtype=np.float64)
+
+    history, densities, k_sorted, _ = _history_jax(
+        prepared,
+        k_values,
+        densities,
+        tau_save,
+        rtol=solve_kwargs.get("rtol", PERTURB_RTOL),
+        atol=solve_kwargs.get("atol", PERTURB_ATOL),
+        first_step=solve_kwargs.get("first_step", PERTURB_FIRST_STEP),
+        max_steps=solve_kwargs.get("max_steps", PERTURB_MAX_STEPS),
+        one_column_per_trajectory=one_column_per_trajectory,
+        sens_error_control=solve_kwargs.get("sens_error_control", False),
+    )
+    a_tab, g_tab, emk_tab = _source_tables(prepared, tau_save)
+    channels = source_channels_jax(
+        history, k_sorted, a_tab[0], g_tab[0], emk_tab[0], densities
+    )
+
+    interp, bessel, lnk_weights = projection_operator(
+        ells, k_sorted, k_fine, tau_save, tau0, projection_dtype
+    )
+    ells_d = jnp.asarray(ells, dtype=jnp.float64)
+    k_fine_d = jnp.asarray(k_fine)
+    idx, w = _lagrange_shift_stencil(tau_save, 0.0)
+    band = _k_band(
+        ells_d,
+        k_fine_d,
+        float(tau0 - tau_save[0]),
+        float(tau0 - _cmb_grid_summary(cosmology)["tau_star"]),
+    )
+    theta = theta_ell_batch(
+        channels[None],
+        jnp.asarray(tau_save),
+        jnp.asarray(idx)[None],
+        jnp.asarray(w)[None],
+        band[None],
+        interp,
+        bessel,
+    )
+    cl = cl_from_theta(
+        theta,
+        lnk_weights,
+        jnp.asarray([float(cosmology.n_s)]),
+        jnp.asarray([float(cosmology.A_s)]),
+        float(cosmology.k_pivot),
+        k_fine_d,
+    )[0]
+    return ells, cl, dl_power_spectrum(cl, ells_d, float(cosmology.T_cmb))

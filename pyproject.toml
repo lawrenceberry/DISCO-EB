@@ -8,9 +8,9 @@ version = "0.1.0"
 dependencies = [
     "jax[cuda13]",
     # The perturbation solve runs on modax's sparse direct linear solver, whose
-    # fill-reducing ordering is SuiteSparse's AMD through scikit-sparse -- hence
-    # the `sparse` extra, and hence libsuitesparse-dev on the machine.
-    "modax[sparse]",
+    # fill-reducing ordering is SuiteSparse's AMD (through cvxopt's wheel since
+    # modax-solvers 0.0.3; the `sparse` extra is kept for older checkouts).
+    "modax-solvers[sparse]",
     "xprof>=2.21.6",
     "tensorflow>=2.20.0",
     "pytest>=8.4.2",
@@ -41,7 +41,7 @@ classifiers = [
 constraint-dependencies = ["numba-cuda-mlir==0.5.1", "cuda-toolkit==13.2.1"]
 
 [tool.uv.sources]
-modax = { path = "../modax", editable = true }
+modax-solvers = { path = "../modax", editable = true }
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-benchmark", "pytest-regressions", "camb>=1.6.0", "classy>=3.3.4.0", "ipykernel>=6.31.0", "matplotlib>=3.9.4", "pandas"]
