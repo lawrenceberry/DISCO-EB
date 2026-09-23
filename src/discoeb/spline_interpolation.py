@@ -301,7 +301,7 @@ class spline_interpolation(object):
         yidxp1 = jnp.take_along_axis(self._y_, idx+1, axis=0)
         Sidx = jnp.take_along_axis(self._S_full_, idx, axis=0)
         Sidxp1 = jnp.take_along_axis(self._S_full_, idx+1, axis=0)
-        Icumidx = jnp.take_along_axis(self._I_cum_, idx+1, axis=0)
+        Icumidx = jnp.take_along_axis(self._I_cum_, idx, axis=0) # Correction: was idx+1 before, but that seems illogical
         h_local = xidxp1 - xidx
         d_val = x_new - xidx
         # Local coefficients (as defined in the cubic polynomial):
@@ -314,4 +314,210 @@ class spline_interpolation(object):
         d2ydx2 = 2 * c_local + 6 * d_local * d_val
         return jnp.where(x_new.shape[0] == 1, dydx[0], dydx), jnp.where(x_new.shape[0] == 1, d2ydx2[0], d2ydx2)
 
+
+class FastUniformCubicSpline1D(object):
+
+    def __init__(self, xin: jnp.ndarray, yin: jnp.ndarray, integrate_from_start: bool = True):
+
+        h = xin[1] - xin[0]
+        dx_inv = 1./h
+
+        n = yin.shape[0]
+        if n < 2:
+            raise ValueError("There must be at least two data points.")
+
+        # 1. Forward-fill trailing NaNs in y using lax.scan
+        _, y = jax.lax.scan(
+            lambda c, v: (jnp.where(jnp.isnan(v), c, v),)*2, yin[0], yin
+        )
+
+        m = n - 2  # number of interior points
+        if m <= 0:
+            return jnp.zeros((n,), dtype=yin.dtype)
+
+        dx_inv_sq = dx_inv * dx_inv
+        d = (6.0 * dx_inv_sq) * (y[:-2] - 2.0 * y[1:-1] + y[2:])
+
+        # 3. Forward elimination step for Thomas algorithm
+        def _forward_step(carry, d_i):
+            cp_prev, dp_prev = carry
+            cp_curr = 1.0 / (4.0 - cp_prev)
+            dp_curr = cp_curr * (d_i - dp_prev)
+            return (cp_curr, dp_curr), (cp_curr, dp_curr)
+
+        cp0 = 0.25
+        dp0 = 0.25 * d[0]
+
+        _, (cp_rest, dp_rest) = jax.lax.scan(_forward_step, (cp0, dp0), d[1:])
+
+        cp = jnp.concatenate([jnp.array([cp0]), cp_rest])
+        dp = jnp.concatenate([jnp.array([dp0]), dp_rest])
+
+        # 4. Backward substitution step
+        def _backward_step(S_next, cp_dp):
+            cp_i, dp_i = cp_dp
+            S_i = dp_i - cp_i * S_next
+            return S_i, S_i
+
+        _, S_rev = jax.lax.scan(
+            _backward_step, dp[-1], (cp[:-1], dp[:-1]), reverse=True
+        )
+        S_interior = jnp.concatenate([S_rev, dp[-1:]])
+        S_full = jnp.pad(S_interior, (1, 1))
+
+
+        y_i, y_ip1 = y[:-1], y[1:]
+        S_i, S_ip1 = S_full[:-1], S_full[1:]
+        c0 = y_i
+        c1 = y_ip1 - y_i - 2.0 * S_i - S_ip1
+        c2 = 3.0 * S_i
+        c3 = S_ip1 - S_i
+
+        # The exact integral over the full interval [x[i], x[i+1]] is:
+        I_full = h * (c0 + 0.5 * c1 + (1.0 / 3.0) * c2 + 0.25 * c3)
+        zeros = jnp.zeros((1,))
+        # Cumulative integral from x[0] up to each knot.
+        I_cum = jnp.pad(jnp.cumsum(I_full), (1, 0))
+        I_total = I_cum[-1]
+
+        # Store the spline data.
+        self._h_ = h
+        self._integrate_from_start_ = integrate_from_start
+        self._coeffs_ = jnp.stack([c0, c1, c2, c3], axis=-1)
+        self._I_total_ = I_total
+        self._I_cum_ = I_cum
+        self._x0_ = xin[0]
+        self._dx_inv_ = 1.0 / h
+        self._max_idx_ = n - 2
+
+    # Operations for flattening/unflattening representation
+    def tree_flatten(self):
+        children = (self._coeffs_, self._I_cum_, self._x0_, self._h_)
+        aux_data = {'max_idx': self._max_idx_, 'ifs':self._integrate_from_start_}
+        return children, aux_data
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        obj = cls.__new__(cls)  # Create instance without calling __init__
+        obj._coeffs_, obj._I_cum_, obj._x0_, obj._h_ = children
+        obj._max_idx_ = aux_data['max_idx']
+        obj._integrate_from_start_ = aux_data['ifs']
+        obj._dx_inv_ = 1.0 / obj._h_
+        obj._I_total_ = obj._I_cum_[-1]
+        return obj
+
+    def _find_index_t(self, x_new):
+        i = (x_new - self._x0_) * self._dx_inv_
+        idx = jax.lax.clamp(0, jnp.floor(i).astype(jnp.int32), self._max_idx_)
+        return idx, i - idx.astype(x_new.dtype)
+
+    def evaluate(self, x_new: jnp.ndarray):
+        # Find the interval index i such that x[i] <= x_new < x[i+1]
+        idx, t = self._find_index_t(x_new)
+        c = jax.lax.dynamic_slice(self._coeffs_, (idx,0), (1,4)).reshape(4)
+        # Estrin's scheme for degree-3 polynomial (higher ILP)
+        t2 = t * t
+        p01 = c[..., 0] + t * c[..., 1]
+        p23 = c[..., 2] + t * c[..., 3]
+        y_new = p01 + t2 * p23
+        return y_new
+    
+    def integral(self, x_new: jnp.ndarray):
+        """
+        Evaluates the definite integral of the spline.
+        
+        Args:
+            x_new: scalar or 1D array of new x values.
+            from_start: if True, returns the integral from x[0] to x_new;
+                        if False, returns the integral from x_new to x[-1].
+                        
+        Returns:
+            The definite integral values.
+        """
+        # Locate the interval index for each x_new.
+        idx, t = self._find_index_t(x_new)
+        c = jax.lax.dynamic_slice(self._coeffs_, (idx,0), (1,4)).reshape(4)
+        I_cum = jax.lax.dynamic_slice(self._I_cum_, (idx,), (1,)).reshape(())
+
+        # Compute the local coefficients for the interval.
+        d0 = c[0]
+        d1 = 0.5 * c[1]
+        d2 = (1.0 / 3.0) * c[2]
+        d3 = 0.25 * c[3]
+
+        # 4. Estrin's scheme for degree-3 integrated polynomial (high ILP)
+        t2 = t * t
+        p01 = d0 + t * d1
+        p23 = d2 + t * d3
+        Q = p01 + t2 * p23
+
+        # 5. Local cell integral: dx * t * Q(t)
+        I_partial = self._h_ * t * Q
+
+        I_forward = I_cum + I_partial
+
+        if self._integrate_from_start_:
+          return I_forward
+        else:
+          return self._I_total_ - I_forward
+    
+    def derivative(self, x_new: jnp.ndarray):
+        """
+        Computes the derivative of the spline at new x positions.
+        
+        Args:
+            x_new: scalar or 1D array of new x values.
+            
+        Returns:
+            The derivative (dy/dx) evaluated at x_new.
+        """
+        # Find the interval index i such that x[i] <= x_new < x[i+1]
+        idx, t = self._find_index_t(x_new)
+        c = jax.lax.dynamic_slice(self._coeffs_, (idx,0), (1,4)).reshape(4)
+        # Estrin's scheme for degree-3 polynomial (higher ILP)
+        d1 = c[1]
+        d2 = 2.0 * c[2]
+        d3 = 3.0 * c[3]
+        dydx = self._dx_inv_ * (d1 + t * (d2 + t * d3))
+        return dydx
+
+    def derivative2(self, x_new: jnp.ndarray):
+        """
+        Computes the second derivative of the spline at new x positions.
+
+        Args:
+            x_new: scalar or 1D array of new x values.
+
+        Returns:
+            The derivative (d^2y/dx^2) evaluated at x_new.
+        """
+        # Find the interval index i such that x[i] <= x_new < x[i+1]
+        idx, t = self._find_index_t(x_new)
+        c = jax.lax.dynamic_slice(self._coeffs_, (idx,0), (1,4)).reshape(4)
+        # Estrin's scheme for degree-3 polynomial (higher ILP)
+        d2 = 2.0 * c[2]
+        d3 = 6.0 * c[3]
+        d2ydx2 = self._dx_inv_ * self._dx_inv_ * (d2 + t * d3)
+        return d2ydx2
+
+    
+    def derivative12(self, x_new: jnp.ndarray):
+        """
+        Computes both the first and the second derivative of the spline at new x positions.
+
+        Args:
+            x_new: scalar or 1D array of new x values.
+            
+        Returns:
+            The derivatives (dy/dx),(d^2y/dx^2) evaluated at x_new.
+        """
+        idx, t = self._find_index_t(x_new)
+        c = jax.lax.dynamic_slice(self._coeffs_, (idx,0), (1,4)).reshape(4)
+        # Estrin's scheme for degree-3 polynomial (higher ILP)
+        d1 = c[1]
+        d2 = 2.0 * c[2]
+        d3 = 3.0 * c[3]
+        dydx = self._dx_inv_ * (d1 + t * (d2 + t * d3))
+        d2ydx2 = self._dx_inv_ * self._dx_inv_ * (d2 + 2.0 * t * d3)
+        return dydx, d2ydx2
 
