@@ -57,6 +57,30 @@ CONST_G = 6.67428e-11
 CONST_neutrino_inst_dec_ratio = (4.0/11.0) ** (1.0/3.0)
 CONST_Mpc_to_m = 3.085677581282e22 #CAMB uses 3.085678e22
 
+
+def _init_static_splines(n_y_grid=1000, nq=100):
+    y_grid = jnp.logspace(-6, 4, n_y_grid)
+    log_y_grid = jnp.log(y_grid)
+
+    q, w = get_neutrino_momentum_bins(nq)
+    y_2d = y_grid[:, None]
+    q_2d = q[None, :]
+    w_2d = w[None, :]
+    v_2d = 1.0 / jnp.sqrt(1.0 + (y_2d / q_2d) ** 2)
+
+    I_rho = jnp.sum(w_2d / v_2d, axis=1)
+    I_P = jnp.sum(w_2d * v_2d / 3.0, axis=1)
+    I_PP = jnp.sum(w_2d * (v_2d ** 3) / 3.0, axis=1)
+
+    return (
+        FastUniformCubicSpline1D(log_y_grid, jnp.log(I_rho)),
+        FastUniformCubicSpline1D(log_y_grid, jnp.log(I_P)),
+        FastUniformCubicSpline1D(log_y_grid, jnp.log(I_PP)),
+    )
+
+SPLINE_LN_RHO, SPLINE_LN_P, SPLINE_LN_PP = _init_static_splines()
+
+
 class Species(eqx.Module):
   @abstractmethod
   def rho(self, a: jnp.ndarray) -> jnp.ndarray:
@@ -83,13 +107,6 @@ class MassiveNeutrinos(Species):
     amnu: jnp.ndarray
     prefactor: jnp.ndarray
 
-    # Pre-computed static 1D reference tables over dimensionless variable y = amnu * a
-    # Important: These are computed ONCE over all cosmologies, since we smartly factorize the integral
-    # y = a_mnu * a
-    spline_ln_rho: jnp.ndarray = eqx.field(static=True)
-    spline_ln_P: jnp.ndarray = eqx.field(static=True)
-    spline_ln_PP: jnp.ndarray = eqx.field(static=True)
-
     def __init__(self, mnu: jnp.ndarray, Tcmb: jnp.ndarray, Nmnu : jnp.ndarray, nq: int = 8, n_y_grid: int = 1000):
         # conversion factor for neutrinos masses to scale factor, a_mnu = (m_nu*c**2/(k_B*T_nu0)
         self.amnu = mnu * CONST_eV / (Tcmb * CONST_neutrino_inst_dec_ratio * CONST_k_B)
@@ -97,40 +114,17 @@ class MassiveNeutrinos(Species):
         rho_gamma0 = jnp.pi**2/15. * (CONST_k_B/CONST_eV * Tcmb)**4
         self.prefactor = rho_gamma0 * CONST_neutrino_inst_dec_ratio**4 * Nmnu
 
-        # 1. Build log-spaced grid in y = a * amnu 
-        # covering ultra-relativistic to non-relativistic regimes (-6 to 4)
-        y_grid = jnp.logspace(-6, 4, n_y_grid)
-        log_y_grid = jnp.log(y_grid)
-
-        q, w = get_neutrino_momentum_bins(nq)
-        y_2d = y_grid[:, None]
-        q_2d = q[None, :]
-        w_2d = w[None, :]
-        v_2d = 1.0 / jnp.sqrt(1.0 + (y_2d / q_2d) ** 2)
-
-        I_rho = jnp.sum(w_2d / v_2d, axis=1)
-        I_P = jnp.sum(w_2d * v_2d / 3.0, axis=1)
-        I_PP = jnp.sum(w_2d * (v_2d ** 3) / 3.0, axis=1)
-
-        # 4. Store as static spline field
-        self.spline_ln_rho = FastUniformCubicSpline1D(log_y_grid, jnp.log(I_rho))
-        self.spline_ln_P = FastUniformCubicSpline1D(log_y_grid, jnp.log(I_P))
-        self.spline_ln_PP = FastUniformCubicSpline1D(log_y_grid, jnp.log(I_PP))
-
     def rho(self, a: jnp.ndarray) -> jnp.ndarray:
-        """Returns normalized energy density rho_nu / rho_nu0 of shape (N_cosmo, N_a)."""
         ln_y_eval = jnp.log(self.amnu * a)
-        return jnp.exp(self.spline_ln_rho.evaluate(ln_y_eval)) * self.prefactor
+        return jnp.exp(SPLINE_LN_RHO.evaluate(ln_y_eval)) * self.prefactor
 
     def P(self, a: jnp.ndarray) -> jnp.ndarray:
-        """Returns normalized energy density rho_nu / rho_nu0 of shape (N_cosmo, N_a)."""
         ln_y_eval = jnp.log(self.amnu * a)
-        return jnp.exp(self.spline_ln_P.evaluate(ln_y_eval)) * self.prefactor
+        return jnp.exp(SPLINE_LN_P.evaluate(ln_y_eval)) * self.prefactor
         
     def PP(self, a: jnp.ndarray) -> jnp.ndarray:
-        """Returns normalized energy density rho_nu / rho_nu0 of shape (N_cosmo, N_a)."""
         ln_y_eval = jnp.log(self.amnu * a)
-        return jnp.exp(self.spline_ln_PP.evaluate(ln_y_eval)) * self.prefactor
+        return jnp.exp(SPLINE_LN_PP.evaluate(ln_y_eval)) * self.prefactor
 class Baryons(Species):
     rho_b: jnp.ndarray
     def __init__(self, Omega_b: jnp.ndarray, H0 : jnp.ndarray):
@@ -246,7 +240,7 @@ def dtauda(a, param ):
 
 def dtauda(a, species):
     Hubble = jnp.sqrt(species.total_rho(a)/3.)
-    return 1./Hubble
+    return 1./(a*a*Hubble)
 
 
 def get_aprimeoa( *, param, aexp ):
@@ -273,7 +267,7 @@ def get_aprimeoa( *, param, aexp ):
     aprimeoa = jnp.sqrt(grho / 3.0)
     return aprimeoa
 def get_aprimeoa(*, species, a):
-    return jnp.sqrt(species.total_rho(a)/3.)
+    return a*jnp.sqrt(species.total_rho(a)/3.)
 
 def compute_angular_diameter_distance( *, aexp, param ):
     """Compute the angular diameter distance
@@ -340,8 +334,8 @@ def setup_background_evolution( *, amin, amax, species, param ):
     # Compute the conformal time interval
     param['taumin'] = amin / param['adotrad']
     #integrator = spline_interpolation(loga, dtauda(a,param) * a[:, None], uniform=True)
-    integrator = spline_interpolation(loga, (dtauda(a,species) * a).T, uniform=True)
-    param['tau'] =  param['taumin'] + integrator.integral(loga)
+    integrator = FastUniformCubicSpline1D(loga, jax.vmap(dtauda, in_axes=(0,None))(a,species) * a)
+    param['tau'] =  param['taumin'] + jax.vmap(integrator.integral)(loga)
     param['taumax'] = param['tau'][-1]
     #param['taumax'] = param['taumin'] + integrator.integral(amax)[0] - integrator.integral(amin)[0]
 
@@ -394,7 +388,8 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
         amin = jnp.min( class_thermo['scale factor a'] )
         amax = jnp.max( class_thermo['scale factor a'] )
     
-    param = batch_dimensions(param)
+    
+    #param = batch_dimensions(param)
     
     photons = Photons(Tcmb=param['Tcmb'])
     massless_neutrinos = MasslessNeutrinos(Neff=param['Neff'],Tcmb=param['Tcmb']) # TODO :: rename, Neff is typically the total, not just the massless contribution
@@ -433,6 +428,7 @@ def evolve_background( *, param, thermo_module = 'RECFAST', num_thermo: int = 25
         param['cs2'] = cs2
         param['Tm'] = Tm
 
+        # TODO ::  Can be possibly optimized
         tau = spline_interpolation(jnp.log(param['a']), param['tau']).evaluate(jnp.log(aexp))
         param['tau_th'] = tau
         param['tau_of_a_spline']      = spline_interpolation( aexp, tau )

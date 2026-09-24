@@ -315,6 +315,7 @@ class spline_interpolation(object):
         return jnp.where(x_new.shape[0] == 1, dydx[0], dydx), jnp.where(x_new.shape[0] == 1, d2ydx2[0], d2ydx2)
 
 
+@register_pytree_node_class
 class FastUniformCubicSpline1D(object):
 
     def __init__(self, xin: jnp.ndarray, yin: jnp.ndarray, integrate_from_start: bool = True):
@@ -363,8 +364,7 @@ class FastUniformCubicSpline1D(object):
             _backward_step, dp[-1], (cp[:-1], dp[:-1]), reverse=True
         )
         S_interior = jnp.concatenate([S_rev, dp[-1:]])
-        S_full = jnp.pad(S_interior, (1, 1))
-
+        S_full = jnp.pad(S_interior, (1, 1)) * h * h/6.0
 
         y_i, y_ip1 = y[:-1], y[1:]
         S_i, S_ip1 = S_full[:-1], S_full[1:]

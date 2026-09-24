@@ -144,12 +144,12 @@ def ionization(loga, y, params, compute_xH_fn, compute_xHe_fn):
   fHe = param['YHe']/(const_mHe_mH*(1.0-param['YHe']))
   Nnow = const_dens_fac * H * H * param['Omegab'] / mu_H
 
-  x_H = y[:, 0]
+  x_H = y[0]
   x_H = jnp.where(x_H<0, 0, x_H)
-  x_He = y[:, 1]
+  x_He = y[1]
   x_He = jnp.where(x_He<0, 0, x_He)
   x = x_H + fHe * x_He
-  Tmat = jnp.abs(y[:, 2])
+  Tmat = jnp.abs(y[2])
 
   # Calculate common terms once
   n = Nnow * (1 + z)**3
@@ -160,7 +160,7 @@ def ionization(loga, y, params, compute_xH_fn, compute_xHe_fn):
   # Hubble parameter calculation
   # Hprime = a'/a, dtau = dt/a -> da/dtau/a = da/dt = Ha
   from .background import get_aprimeoa
-  Hz = (1e-5*get_aprimeoa(species=param['species'], a=jnp.array([a]))[0]) / a * const_c * bigH
+  Hz = (1e-5*get_aprimeoa(species=param['species'], a=a)) / a * const_c * bigH
   
   # Temperature and rate calculations
   Tmat_1e4 = Tmat / 1e4
@@ -300,7 +300,8 @@ def ionization(loga, y, params, compute_xH_fn, compute_xHe_fn):
   #jax.lax.cond(a > 1e-9,lambda: jax.debug.print("f0={f0}, f1 = {f1}, f2={f2}, dzda = {dzda}",f0=f0, f1=f1,f2=f2 , dzda=dzda),lambda: None)
   
   #print(f0.shape, f1.shape, f2.shape)
-  dy = jnp.stack(jnp.broadcast_arrays(f0, f1, f2), axis=1)
+  #dy = jnp.stack(jnp.broadcast_arrays(f0, f1, f2), axis=1)
+  dy = jnp.stack([f0, f1, f2])
   #print("returning ",f0.shape, f1.shape, f2.shape, dy.shape)
   return dy * dzdlna#dzda
 
@@ -421,8 +422,8 @@ def compute_thermal_history( *, a0 : float, a1 : float, N : int, rtol : float = 
 
   # Use adaptive sampling that concentrates points around recombination
   a = _get_adaptive_sampling(a0, a1, N+1)
-  B = max(param[k].shape[0] for k in ['H0','YHe','Omegab']) # Never batch in T_cmb
-  y_init = jnp.zeros((6, N, B))
+  loga = jnp.log(a)
+  y_init = jnp.zeros((6, N))
 
   H = param['H0']/100.0
   HO = H*bigH
@@ -433,9 +434,7 @@ def compute_thermal_history( *, a0 : float, a1 : float, N : int, rtol : float = 
 
 
   # FIRST POINT OF ORDER : DETERMINE SAHA INPUTS
-  Nnow_2d = jnp.atleast_1d(Nnow)[:, jnp.newaxis]
-  fHe_2d = jnp.atleast_1d(fHe)[:, jnp.newaxis]
-  z_2d = (1/a-1)[jnp.newaxis, :]
+  z = (1/a-1)
   #Saha_inputs = {'HeII':[const_EionHe12s, 1.0 + fHe_2d, 1.0, fHe_2d], 'HeI':[CB1_He1, 1.0, 4.0, fHe_2d], 'HI':[CB1, 0.0, 1.0, 1.0]}
   Saha_inputs = {'HeII':[const_EionHe12s, 1.0 + fHe, 1.0, fHe], 'HeI':[CB1_He1, 1.0, 4.0, fHe], 'HI':[CB1, 0.0, 1.0, 1.0]}
 
@@ -471,7 +470,7 @@ def compute_thermal_history( *, a0 : float, a1 : float, N : int, rtol : float = 
   #threshold = 1e-9
   #dxHe_dz = jnp.where(dxHe_dz < threshold, 0.0, dxHe_dz)
   #dxH_dz = jnp.where(dxH_dz < threshold, 0.0, dxH_dz)
-  jnp.set_printoptions(threshold=jnp.inf)
+  #jnp.set_printoptions(threshold=jnp.inf)
   #import numpy as np
   #print("z = {}".format(np.array(1/a-1)))
   #print("x_H = {}".format(np.array(x_H)))
@@ -532,7 +531,7 @@ def compute_thermal_history( *, a0 : float, a1 : float, N : int, rtol : float = 
   #xHe_ini = x_He[:, 0]
   T_ini = Tcmb*(1.0 + zstart)
   #print(xH_ini, xHe_ini)
-  y0 = jnp.stack(jnp.broadcast_arrays(xH_ini, xHe_ini, T_ini), axis=1)
+  y0 = jnp.stack([xH_ini, xHe_ini, T_ini])#jnp.stack(jnp.broadcast_arrays(xH_ini, xHe_ini, T_ini), axis=1)
   #print(y0.shape, xH_ini.shape, xHe_ini.shape, T_ini.shape)
   
   #rint(param, saha_inputs)
@@ -544,8 +543,8 @@ def compute_thermal_history( *, a0 : float, a1 : float, N : int, rtol : float = 
   sol =drx.diffeqsolve(
       terms=drx.ODETerm(ionization_partial),
       solver=drx.Dopri5(),#GRKT4(),
-      t0=jnp.log(astart),
-      t1=jnp.log(aend),
+      t0=loga[0] - 1e-5,
+      t1=loga[-1] + 1e-5,
       dt0=jnp.log(aend/astart)*1e-3,#jnp.abs(astart*1e-3),
       y0=y0,
       #stepsize_controller = drx.PIDController(rtol=rtol,atol=atol, dtmax=0.01), 
@@ -562,7 +561,7 @@ def compute_thermal_history( *, a0 : float, a1 : float, N : int, rtol : float = 
 
 
   #jax.debug.print("ys = {v} \n , dys = {dv}",v=jax.vmap(sol.evaluate)(jnp.log(a)), dv=jax.vmap(sol.derivative)(jnp.log(a)))
-  return jax.vmap(sol.evaluate)(jnp.log(a)), jax.vmap(sol.derivative)(jnp.log(a)), a
+  return jax.vmap(sol.evaluate)(loga), jax.vmap(sol.derivative)(loga), a
 
 
 @partial(jax.jit, static_argnames=("num_thermo", "rtol", "atol"))
@@ -584,28 +583,28 @@ def evaluate_thermo(
     print(y.shape, dy.shape)
 
     # extract the relevant quantities from the solution
-    xeHI      = y[:, :, 0]
-    xHe       = y[:, :, 1]
+    xeHI      = y[:, 0]
+    xHe       = y[:, 1]
     #xeHeI     = y[:, :, 1]
     #xeHeII    = Saha_HeII(a, param)
     # val_HeII = Saha(T_z, z, Nnow, *Saha_inputs['HeII'])
     #xe        = xeHI + param['fHe'] * xeHeI + xeHeII
     xe        = xeHI + param['fHe'] * xHe
     mu        = 1/(1 + (1/const_mHe_mH-1) * param['YHe'] + (1-param['YHe']) * xe)
-    Tm        = y[:, :, 2]
+    Tm        = y[:, 2]
 
     # extract the derivatives that were also computed, which allows to compute cs2 and dxedtau
-    dxeHIda  = dy[:, :, 0]
+    dxeHIda  = dy[:, 0]
     #dxeHeIda = y[:, :, 1]
-    dxeHeda = dy[:, :, 1]
+    dxeHeda = dy[:, 1]
 
     #a_broadcasted = jnp.broadcast_to(a[:, None], (1025, 5))
     #val, vjp_fun = jax.vjp(lambda x: Saha_HeII(x, param), a_broadcasted)
     #dxHeIIda = vjp_fun(jnp.ones_like(val))[0]
 
-    dTmda    = dy[:, :, 2]
+    dTmda    = dy[:, 2]
 
-    daTmda   = Tm + a[:, None] * dTmda
+    daTmda   = Tm + a * dTmda
     cs2      = const_kB/ const_mH / const_c**2 / mu * Tm * (4 - daTmda / (Tm)) /3
     #dxeda = (dxeHIda + param['fHe'] * dxeHeIda + dxHeIIda)
     dxeda = (dxeHIda + param['fHe'] * dxeHeda)
