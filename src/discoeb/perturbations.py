@@ -1446,7 +1446,7 @@ def make_initial_states(cosmology, k_values: np.ndarray, layout) -> np.ndarray:
     return y0
 
 
-def build_numba_rhs(layout, tau_min, inv_dtau, values, seconds):
+def build_numba_rhs(layout, tau_min, inv_dtau, values, rescaled_seconds):
     """Return the numba-CUDA right-hand side ``f(y, tau, p) -> tuple`` for a layout.
 
     The thermodynamics tables are uploaded once and read through a uniform
@@ -1506,33 +1506,35 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, seconds):
     tau_min_dev = cuda.to_device(np.ascontiguousarray(tau_min, dtype=np.float64))
     inv_dtau_dev = cuda.to_device(np.ascontiguousarray(inv_dtau, dtype=np.float64))
     values_dev = cuda.to_device(np.ascontiguousarray(values, dtype=THERMO_TABLE_DTYPE))
-    seconds_dev = cuda.to_device(np.ascontiguousarray(seconds, dtype=THERMO_TABLE_DTYPE))
+    rescaled_seconds_dev = cuda.to_device(np.ascontiguousarray(rescaled_seconds, dtype=THERMO_TABLE_DTYPE))
+    coeffs_dev = cuda.to_device(np.ascontiguousarray(coeffs, dtype=THERMO_TABLE_DTYPE))
 
     @cuda.jit(device=True)
-    def spline_eval(x, p, channel):
-        cosmology_idx = int(p[IX_COSMOLOGY])
+    def uniform_spline_eval(x, cosmology_idx, channel):
         x_min = tau_min_dev[cosmology_idx]
         inv_dx = inv_dtau_dev[cosmology_idx]
-        idx = int((x - x_min) * inv_dx)
-        if idx < 0:
-            idx = 0
-        if idx > n_grid - 2:
-            idx = n_grid - 2
-        h = 1.0 / inv_dx
-        x0 = x_min + idx * h
-        x1 = x0 + h
-        left = x1 - x
-        right = x - x0
-        y0 = values_dev[cosmology_idx, channel, idx]
-        y1 = values_dev[cosmology_idx, channel, idx + 1]
-        m0 = seconds_dev[cosmology_idx, channel, idx]
-        m1 = seconds_dev[cosmology_idx, channel, idx + 1]
-        return (
-            m0 * left**3 / (6.0 * h)
-            + m1 * right**3 / (6.0 * h)
-            + (y0 - m0 * h**2 / 6.0) * left / h
-            + (y1 - m1 * h**2 / 6.0) * right / h
-        )
+
+        # 1. Non-branching index calculation
+        i = (x - x_min) * inv_dx
+        idx = max(0, min(int(i), n_grid - 2))
+
+        # 2. Normalized local coordinate t in [0, 1]
+        t = i - idx
+
+        # 3. Load coefficients
+        y0 = values_dev[cosmology_idx, channel, idx];
+        y1 = values_dev[cosmology_idx, channel, idx + 1];
+        k0 = rescaled_seconds_dev[cosmology_idx, channel, idx];
+        k1 = rescaled_seconds_dev[cosmology_idx, channel, idx + 1];
+
+        # 4. Transform to Horner evaluation scheme
+        c0 = y0
+        c1 = (y1 - y0) - (2.0 * k0 + k1)
+        c2 = 3.0 * k0
+        c3 = k1 - k0
+
+        y_new = c0 + t * (c1 + t * (c2 + t * c3));
+        return y_new
 
     # --- Free-streaming hierarchies -------------------------------------------
     # Interior multipoles and the truncated top multipole of a Boltzmann
@@ -1690,9 +1692,10 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, seconds):
     def perturbation_rhs(y, tau, p):
         k = p[IX_K]
         log_tau = math.log(tau)
-        a = spline_eval(log_tau, p, 0)
-        opacity = spline_eval(log_tau, p, 1)
-        cs2 = spline_eval(log_tau, p, 2)
+        cosmology_idx = int(p[IX_COSMOLOGY])
+        a = uniform_spline_eval(log_tau, cosmology_idx, 0)
+        opacity = uniform_spline_eval(log_tau, cosmology_idx, 1)
+        cs2 = uniform_spline_eval(log_tau, cosmology_idx, 2)
         if opacity < 1.0e-30:
             opacity = 1.0e-30
         if cs2 < 0.0:
@@ -1719,7 +1722,7 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, seconds):
             grhor_nu = p[IX_GRHOR_NU]
             n_mnu = p[IX_NMNU]
             amnu = p[IX_AMNU]
-            rhonu = spline_eval(log_tau, p, 3)
+            rhonu = uniform_spline_eval(log_tau, cosmology_idx, 3)
             grho_mnu_t = grhor_nu * n_mnu * rhonu / a2
         else:
             grho_mnu_t = 0.0
@@ -1848,9 +1851,9 @@ def _stack_thermo_tables(tables):
         dtype=np.float64,
     )
     values = np.stack([t[1] for t in tables])
-    seconds = np.stack([t[2] for t in tables])
+    rescaled_seconds = np.stack([t[2]*(np.log(t[0][1]) - np.log(t[0][0]))**2/6.0 for t in tables])
     tau0 = np.array([t[3] for t in tables], dtype=np.float64)
-    return tau_min, inv_dtau, values, seconds, tau0
+    return tau_min, inv_dtau, values, rescaled_seconds, tau0
 
 
 def _layout_for(cosmology) -> PerturbationLayout:
@@ -1916,8 +1919,8 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
             )
 
     tables = build_thermo_tables_batch(cosmologies)
-    tau_min, inv_dtau, values, seconds, tau0 = _stack_thermo_tables(tables)
-    ode_fn = build_numba_rhs(layout, tau_min, inv_dtau, values, seconds)
+    tau_min, inv_dtau, values, rescaled_seconds, tau0 = _stack_thermo_tables(tables)
+    ode_fn = build_numba_rhs(layout, tau_min, inv_dtau, values, rescaled_seconds)
     # The pattern is all modax needs: it colours it for the Enzyme sweeps, and
     # orders it with AMD, factorises it symbolically and compiles a sparse LU
     # and sparse triangular solves for that exact structure.
