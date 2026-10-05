@@ -1603,7 +1603,6 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, rescaled_seconds):
     inv_dtau_dev = on_device(inv_dtau, np.float64)
     values_dev = on_device(values, THERMO_TABLE_DTYPE)
     rescaled_seconds_dev = on_device(rescaled_seconds, THERMO_TABLE_DTYPE)
-    coeffs_dev = cuda.to_device(np.ascontiguousarray(coeffs, dtype=THERMO_TABLE_DTYPE))
 
     @cuda.jit(device=True)
     def uniform_spline_eval(x, cosmology_idx, channel):
