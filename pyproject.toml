@@ -6,7 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "discoeb"
 version = "0.1.0"
 dependencies = [
-    "jax[cuda13]",
+    # JAX's CUDA 13 build starts after it dropped Python 3.10, so 3.10 takes the
+    # CUDA 12 one (jax 0.6.2, the last release for 3.10, which modax supports).
+    "jax[cuda13]; python_version >= '3.11'",
+    "jax[cuda12]; python_version < '3.11'",
     # The perturbation solve runs on modax's sparse direct linear solver, whose
     # fill-reducing ordering is SuiteSparse's AMD (through cvxopt's wheel since
     # modax-solvers 0.0.3; the `sparse` extra is kept for older checkouts).
@@ -25,7 +28,7 @@ authors = [{ name = "Oliver Hahn", email = "oliver.hahn@univie.ac.at" }]
 description = "..."
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3",
@@ -36,9 +39,14 @@ classifiers = [
 
 # The GPU stack must match modax's lock: these kernels are compiled by
 # numba-cuda-mlir and linked by nvjitlink, and 0.5.2 with CUDA 13.4 emits a
-# `.smax` that ptxas rejects when building the 50-variable Enzyme kernel.
+# `.smax` that ptxas rejects when building the 50-variable Enzyme kernel. On
+# Python 3.10 modax runs the whole stack on CUDA 12 instead, so the 13.x toolkit
+# pin applies only above it.
 [tool.uv]
-constraint-dependencies = ["numba-cuda-mlir==0.5.1", "cuda-toolkit==13.2.1"]
+constraint-dependencies = [
+    "numba-cuda-mlir==0.5.1",
+    "cuda-toolkit==13.2.1; python_version >= '3.11'",
+]
 
 [tool.uv.sources]
 modax-solvers = { path = "../modax", editable = true }
