@@ -1542,25 +1542,25 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, rescaled_seconds):
     # zero for neutrinos; ``k`` is ``k v`` for a massive-neutrino momentum bin.
 
     @cuda.jit(device=True)
-    def stream(ell, lower, this, upper, k, damping):
+    def stream(ell, inv_twoell_plusone, lower, this, upper, k, damping):
         """``psi_l' = k (l psi_{l-1} - (l+1) psi_{l+1}) / (2l+1) - damping psi_l``."""
-        return k * (ell * lower - (ell + 1.0) * upper) / (2.0 * ell + 1.0) - damping * this
+        return k * (ell * lower - (ell + 1.0) * upper) * inv_twoell_plusone - damping * this
 
     @cuda.jit(device=True)
-    def truncate(ell, lower, this, k, damping, tau):
+    def truncate(ell, inv_twoell_plusone, lower, this, k, damping, inv_tau):
         """``psi_L' = k psi_{L-1} - (L+1) psi_L / tau - damping psi_L``."""
-        return k * lower - (ell + 1.0) * this / tau - damping * this
+        return k * lower - (ell + 1.0) * this * inv_tau - damping * this
 
     @cuda.jit(device=True)
-    def stream_pol(ell, lower, this, upper, k, opacity):
+    def stream_pol(ell, inv_twoell_plusone, lower, this, upper, k, opacity):
         """``E_l'``, whose coupling upwards carries ``(l+3)(l-1)/(l+1)``."""
         polfac = (ell + 3.0) * (ell - 1.0) / (ell + 1.0)
-        return k * (ell * lower - polfac * upper) / (2.0 * ell + 1.0) - opacity * this
+        return k * (ell * lower - polfac * upper) * inv_twoell_plusone - opacity * this
 
     @cuda.jit(device=True)
-    def truncate_pol(ell, lower, this, k, opacity, tau):
+    def truncate_pol(ell, inv_twoell_plusone, lower, this, k, opacity, inv_tau):
         """``E_L' = k L E_{L-1} / (2L+1) - (L+3) E_L / tau - opacity E_L``."""
-        return k * ell * lower / (2.0 * ell + 1.0) - (ell + 3.0) * this / tau - opacity * this
+        return k * ell * lower * inv_twoell_plusone - (ell + 3.0) * this * inv_tau - opacity * this
 
     def hierarchy_tail(slot, lmax, interior, top):
         """The derivatives of multipoles ``3 .. lmax`` of one hierarchy, as a tuple.
@@ -1574,32 +1574,33 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, rescaled_seconds):
         def extend(below, ell):
             lower, this, upper = slot(ell - 1), slot(ell), slot(ell + 1)
             ell = float(ell)
+            inv_twoell_plusone = 1.0 / (2.0 * ell + 1.0)
             if ell < lmax and below is None:
 
                 @cuda.jit(device=True)
-                def tail(y, k, damping, tau):
-                    return (interior(ell, y[lower], y[this], y[upper], k, damping),)
+                def tail(y, k, damping, inv_tau):
+                    return (interior(ell, inv_twoell_plusone, y[lower], y[this], y[upper], k, damping),)
 
             elif ell < lmax:
 
                 @cuda.jit(device=True)
-                def tail(y, k, damping, tau):
-                    return below(y, k, damping, tau) + (
-                        interior(ell, y[lower], y[this], y[upper], k, damping),
+                def tail(y, k, damping, inv_tau):
+                    return below(y, k, damping, inv_tau) + (
+                        interior(ell, inv_twoell_plusone, y[lower], y[this], y[upper], k, damping),
                     )
 
             elif below is None:  # a hierarchy truncated right at the octupole
 
                 @cuda.jit(device=True)
-                def tail(y, k, damping, tau):
-                    return (top(ell, y[lower], y[this], k, damping, tau),)
+                def tail(y, k, damping, inv_tau):
+                    return (top(ell, inv_twoell_plusone, y[lower], y[this], k, damping, inv_tau),)
 
             else:
 
                 @cuda.jit(device=True)
-                def tail(y, k, damping, tau):
-                    return below(y, k, damping, tau) + (
-                        top(ell, y[lower], y[this], k, damping, tau),
+                def tail(y, k, damping, inv_tau):
+                    return below(y, k, damping, inv_tau) + (
+                        top(ell, inv_twoell_plusone,  y[lower], y[this], k, damping, inv_tau),
                     )
 
             return tail
@@ -1647,9 +1648,9 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, rescaled_seconds):
                 kv = k * vq
                 psi0, psi1, psi2, psi3 = y[b], y[b + 1], y[b + 2], y[b + 3]
                 return (
-                    -kv * psi1 + (k * z / 3.0) * dl,
-                    kv / 3.0 * (psi0 - 2.0 * psi2),
-                    kv / 5.0 * (2.0 * psi1 - 3.0 * psi3) - (2.0 / 15.0) * k * sigma * dl,
+                    -kv * psi1 + (k * z * (1.0 / 3.0)) * dl,
+                    kv * (1.0 / 3.0) * (psi0 - 2.0 * psi2),
+                    kv * (1.0 / 5.0) * (2.0 * psi1 - 3.0 * psi3) - (2.0 / 15.0) * k * sigma * dl,
                 ) + tail(y, kv, 0.0, tau)
 
             return moments, derivatives
@@ -1688,26 +1689,99 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, rescaled_seconds):
     else:
         mnu_moments = mnu_derivatives = None
 
+    @cuda.jit(device=True, inline=True)
+    def bitcast_f64_to_u64(x):
+        buf = cuda.local.array(1, dtype=np.float64)
+        buf[0] = x
+        buf_u64 = buf.view(np.uint64)
+        return buf_u64[0]
+
+    @cuda.jit(device=True, inline=True)
+    def bitcast_u64_to_f64(u):
+        buf = cuda.local.array(1, dtype=np.uint64)
+        buf[0] = u
+        buf_f64 = buf.view(np.float64)
+        return buf_f64[0]
+
+    @cuda.jit(device=True, inline=True)
+    def fast_branchless_log_f64(x):
+        # Constants
+        SQRT2 = 1.4142135623730950488016887242097
+        LN2_HI = 0.69314718036912381649          # Exact in float64 top bits
+        LN2_LO = 1.90821492927058770002e-10      # Remainder tail bits
+
+        # 1. Extract Exponent and Mantissa via bit manipulation
+        LN2_HI = 0.69314718036912381649
+        LN2_LO = 1.90821492927058770002e-10
+
+        # 1. Zero-cost register bitcast
+        I = bitcast_f64_to_u64(x)
+
+        # 2. Extract biased exponent and convert to float without conditionals
+        # Emits: shr.u64, and.b64, cvt.rn.f64.s64, fsub.f64
+        E_biased = (I >> np.uint64(52)) & np.uint64(0x7FF)
+        e = (np.int64(E_biased) - 1023) * 1.0
+
+        # 3. Extract mantissa directly into range [1.0, 2.0)
+        # Emits: and.b64, or.b64
+        I_m = (I & np.uint64(0x000FFFFFFFFFFFFF)) | np.uint64(0x3FF0000000000000)
+        m = bitcast_u64_to_f64(I_m)
+
+        u = (m - 1.0) / (m + 1.0)
+        z = u * u
+
+        # 3. 16-term Horner Polynomial for R(z) = ln(m) / (2*u) over z in [0, 1/9]
+        # Yields full f64 accuracy (< 1e-16 error) without range reduction predicates
+        poly = 0.03030303030303030303          # 1/33
+        poly = poly * z + 0.03225806451612903226  # 1/31
+        poly = poly * z + 0.03448275862068965517  # 1/29
+        poly = poly * z + 0.03703703703703703704  # 1/27
+        poly = poly * z + 0.04000000000000000000  # 1/25
+        poly = poly * z + 0.04347826086956521739  # 1/23
+        poly = poly * z + 0.04761904761904761905  # 1/21
+        poly = poly * z + 0.05263157894736842105  # 1/19
+        poly = poly * z + 0.05882352941176470588  # 1/17
+        poly = poly * z + 0.06666666666666666667  # 1/15
+        poly = poly * z + 0.07692307692307692308  # 1/13
+        poly = poly * z + 0.09090909090909090909  # 1/11
+        poly = poly * z + 0.11111111111111111111  # 1/9
+        poly = poly * z + 0.14285714285714285714  # 1/7
+        poly = poly * z + 0.20000000000000000000  # 1/5
+        poly = poly * z + 0.33333333333333333333  # 1/3
+        poly = poly * z + 1.0
+
+        # 4. Reconstruction: ln(x) = e*ln(2) + 2*u*R(z)
+        log_m = 2.0 * u * poly
+        return e * LN2_HI + (e * LN2_LO + log_m)
+
     def perturbation_rhs(y, tau, p):
         k = p[IX_K]
-        log_tau = math.log(tau)
-        cosmology_idx = int(p[IX_COSMOLOGY])
+        log_tau = fast_branchless_log_f64(tau)#math.log(tau)
+        #cosmology_idx = int(p[IX_COSMOLOGY])
+        #cosmology_idx = fast_float_to_int(p[IX_COSMOLOGY])
+        cosmology_idx = (p.view(np.int64))[IX_COSMOLOGY]
         a = uniform_spline_eval(log_tau, cosmology_idx, 0)
         opacity = uniform_spline_eval(log_tau, cosmology_idx, 1)
         cs2 = uniform_spline_eval(log_tau, cosmology_idx, 2)
-        if opacity < 1.0e-30:
-            opacity = 1.0e-30
-        if cs2 < 0.0:
-            cs2 = 0.0
+        opacity = max(opacity, 1e-30)
+        cs2 = max(cs2, 0.0)
+        #if opacity < 1.0e-30:
+        #    opacity = 1.0e-30
+        #if cs2 < 0.0:
+        #    cs2 = 0.0
 
         a2 = a * a
+        inv_a = 1.0/a
+        inv_a2 = inv_a * inv_a
+        inv_k2 = 1.0 / (k*k)
+        inv_tau = 1.0 / tau
         # The densities are read through the row's sensitivity direction: eps
         # is zero in a primal solve and d/d(eps) is the derivative along dir.
         eps = p[IX_EPS]
-        grhog_t = (p[0] + eps * p[IX_DIR]) / a2
-        grhor_t = (p[1] + eps * p[IX_DIR + 1]) / a2
-        grhoc_t = (p[2] + eps * p[IX_DIR + 2]) / a
-        grhob_t = (p[3] + eps * p[IX_DIR + 3]) / a
+        grhog_t = (p[0] + eps * p[IX_DIR]) * inv_a2 # Done as division
+        grhor_t = (p[1] + eps * p[IX_DIR + 1]) * inv_a2 # Done as division
+        grhoc_t = (p[2] + eps * p[IX_DIR + 2]) * inv_a # Done as division
+        grhob_t = (p[3] + eps * p[IX_DIR + 3]) * inv_a # Done as division
         grhov = p[4] + eps * p[IX_DIR + 4]
         if ENABLE_DE:
             w0 = p[IX_W_DE_0]
@@ -1722,7 +1796,7 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, rescaled_seconds):
             n_mnu = p[IX_NMNU]
             amnu = p[IX_AMNU]
             rhonu = uniform_spline_eval(log_tau, cosmology_idx, 3)
-            grho_mnu_t = grhor_nu * n_mnu * rhonu / a2
+            grho_mnu_t = grhor_nu * n_mnu * rhonu * inv_a2
         else:
             grho_mnu_t = 0.0
         grhok = p[IX_GRHOK]
@@ -1747,47 +1821,48 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, rescaled_seconds):
             dgq = dgq + grhov_t * (1.0 + w_Q) * thetaq / k
         if ENABLE_MNU:
             drhonu, fnu = mnu_moments(y, a, amnu)
-            dgrho = dgrho + grhor_nu * n_mnu * drhonu / a2
-            dgq = dgq + grhor_nu * n_mnu * fnu / a2
+            dgrho = dgrho + grhor_nu * n_mnu * drhonu * inv_a2
+            dgq = dgq + grhor_nu * n_mnu * fnu * inv_a2
         # Curved-geometry metric relations (CLASS perturbations.c, synchronous):
         #   h'    = (k^2 s2^2 eta + 1.5 a^2 delta_rho)/(0.5 aH),   z = h'/(2k)
         #   eta'  = (1.5 a^2 (rho+p)theta + 0.5 K h')/(k^2 s2^2)
         #   sigma = k alpha = (z + 1.5 dgq/k^2)/s2^2
         # with K = -grhok/3 and s2^2 = 1 - 3K/k^2 = 1 + grhok/k^2 (= 1 when flat).
-        s2 = 1.0 + grhok / (k * k)
-        Kcurv = -grhok / 3.0
-        z = (0.5 * dgrho / k + s2 * etak) / adotoa
-        sigma = (z + 1.5 * dgq / (k * k)) / s2
+        s2 = 1.0 + grhok * inv_k2 # Done as division
+        inv_s2 = 1.0 / s2
+        Kcurv = -grhok * (1.0 / 3.0) # Done as division (?!!)
+        z = (0.5 * dgrho / k + s2 * etak) / adotoa # Done as division
+        sigma = (z + 1.5 * dgq * inv_k2) * inv_s2 # Done as division
         photbar = grhog_t / grhob_t
         pb43 = 4.0 / 3.0 * photbar
         delta_p_b = cs2 * clxb
-        polter = pig / 10.0 + 9.0 * e2 / 15.0
-        vbdot = -adotoa * vb + k * delta_p_b - photbar * opacity * (4.0 * vb / 3.0 - qg)
+        polter = pig * (1.0 / 10.0) + 9.0 * e2 * (1.0 / 15.0)
+        vbdot = -adotoa * vb + k * delta_p_b - photbar * opacity * ((4.0 / 3.0) * vb - qg)
 
         metric_and_matter = (
-            (0.5 * dgq + Kcurv * z) / s2,  # etak
+            (0.5 * dgq + Kcurv * z) * inv_s2,  # etak
             -k * z,  # clxc
             -k * (z + vb),  # clxb
             vbdot,  # vb
         )
         photons = (
-            -k * (4.0 * z / 3.0 + qg),
+            -k * ((4.0/ 3.0) * z  + qg),
             4.0 * (-vbdot - adotoa * vb + k * delta_p_b) / (3.0 * pb43)
-            + k * clxg / 3.0
-            - 2.0 * k * pig / 3.0,
-            2.0 * k * qg / 5.0
-            - 3.0 * k * theta3 / 5.0
+            + k * clxg * (1.0/ 3.0)
+            - (2.0/ 3.0) * k * pig ,
+            (2.0/ 5.0) * k * qg 
+            - (3.0/ 5.0) * k * theta3 
             - opacity * (pig - polter)
-            + 8.0 * k * sigma / 15.0,
-        ) + photon_tail(y, k, opacity, tau)
-        polarization = (-opacity * (e2 - polter) - k * e3 / 3.0,) + polarization_tail(
-            y, k, opacity, tau
+            + (8.0/ 15.0) * k * sigma ,
+        ) + photon_tail(y, k, opacity, inv_tau)
+        polarization = (-opacity * (e2 - polter) - k * e3 * (1.0 / 3.0),) + polarization_tail(
+            y, k, opacity, inv_tau
         )
         massless_neutrinos = (
-            -k * (4.0 * z / 3.0 + qr),
+            -k * ((4.0 / 3.0) * z+ qr),
             k * (clxr - 2.0 * pir) / 3.0,
-            2.0 * k * qr / 5.0 - 3.0 * k * n3 / 5.0 + 8.0 * k * sigma / 15.0,
-        ) + neutrino_tail(y, k, 0.0, tau)
+            (2.0 / 5.0) * k * qr - (3.0 / 5.0) * k * n3  + (8.0 / 15.0) * k * sigma,
+        ) + neutrino_tail(y, k, 0.0, inv_tau)
 
         if ENABLE_DE:
             cs2_Q = p[IX_CS2_DE]
@@ -1796,7 +1871,7 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, rescaled_seconds):
             dark_energy = (
                 -(1.0 + w_Q) * (thetaq + k * z)
                 - 3.0 * (cs2_Q - w_Q) * adotoa * clxq
-                - 9.0 * (1.0 + w_Q) * (cs2_Q - ca2_Q) * adotoa**2 / k**2 * thetaq,
+                - 9.0 * (1.0 + w_Q) * (cs2_Q - ca2_Q) * adotoa**2 * inv_k2 * thetaq,
                 -(1.0 - 3.0 * cs2_Q) * adotoa * thetaq
                 + cs2_Q / (1.0 + w_Q) * k**2 * clxq,
             )
@@ -1972,7 +2047,7 @@ def _pack_batch(prepared, k_values, tau_save=None):
     y0 = np.empty((n_traj, layout.nvar), dtype=np.float64)
     for ci, cosmology in enumerate(prepared.cosmologies):
         base = make_params(cosmology, k_sorted, float(prepared.tau0[ci]))
-        base[:, IX_COSMOLOGY] = float(ci)
+        base[:, IX_COSMOLOGY] = ci.view(np.float64)#float(ci)
         params[ci::n_cosmo] = base
         y0[ci::n_cosmo] = make_initial_states(cosmology, k_sorted, layout)
     params = np.ascontiguousarray(params)
