@@ -58,6 +58,7 @@ contraction, whose flop count is a few percent of the FFT's.
 from __future__ import annotations
 
 import math
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -65,6 +66,10 @@ import numpy as np
 from scipy import integrate, special
 
 from .perturbations import (
+    BATCH_CACHE_SIZE,
+    THERMO_TABLE_CACHE_SIZE,
+    BoundedCache,
+    DeviceTableSlot,
     IX_CLXB,
     IX_CLXC,
     IX_ETAK,
@@ -107,10 +112,20 @@ PROJECTION_BUDGET_BYTES = 1.0e9
 """Device memory for one projection call's fine-``k`` source arrays, which sets how
 many cosmologies are contracted together at once."""
 
-_BESSEL_CACHE: dict[tuple, tuple] = {}
-_CMB_GRID_CACHE: dict[tuple, dict[str, float]] = {}
-_OPERATOR_CACHE: dict[tuple, tuple] = {}
-_HOOK_CACHE: dict[tuple, tuple] = {}
+TAU_END_MARGIN = 0.01
+"""How far past the fiducial cosmology's ``tau0`` the save grid of :func:`cmb_grids`
+extends, as a fraction, so that the grids built once from a fiducial serve every
+batch whose conformal ages fall within it. Measured against per-batch grids on
+the 128 nearby cosmologies of the tests, the shift onto the fiducial's grid
+moves ``D_l`` by at most 2.7e-4 at 1 percent, 1.0e-3 at 2 percent and 4.4e-3
+at 5 percent (the low multipoles' late-time sources sit on the coarse end of
+the grid)."""
+
+_BESSEL_CACHE: BoundedCache = BoundedCache(BATCH_CACHE_SIZE)
+_CMB_GRID_CACHE: BoundedCache = BoundedCache(THERMO_TABLE_CACHE_SIZE)
+_VISIBILITY_PEAK_CACHE: BoundedCache = BoundedCache(THERMO_TABLE_CACHE_SIZE)
+_OPERATOR_CACHE: BoundedCache = BoundedCache(BATCH_CACHE_SIZE)
+_HOOK_SLOTS: dict[tuple, DeviceTableSlot] = {}
 
 
 # =============================================================================
@@ -307,6 +322,7 @@ def _interp_uniform_table(x, x0, inv_dx, n_x, vals):
     return (1.0 - frac) * vals[idx] + frac * vals[idx + 1]
 
 
+@jax.jit
 def _k_band(ells, k, chi_max, chi_star):
     """Return the ``(n_ell, n_k)`` mask of wave modes that project onto each multipole.
 
@@ -316,9 +332,14 @@ def _k_band(ells, k, chi_max, chi_star):
     the finite ``tau`` and ``k`` grids cannot resolve, so integrating them
     injects aliasing noise rather than signal. Without the upper cut the damping
     tail is inflated by several percent (``+6%`` at ``l = 500``).
+
+    ``chi_star`` may carry leading batch axes, ``(n_c,)`` for a batch of
+    cosmologies, and the mask then has them too: ``(n_c, n_ell, n_k)``, from
+    one jitted call rather than one eager call per cosmology.
     """
 
     ells = ells[:, None]
+    chi_star = jnp.asarray(chi_star)[..., None, None]
     k_lo = jnp.maximum(0.0, ells - 4.0 * ells ** (1.0 / 3.0)) / chi_max
     k_hi = (ells + 2500.0) / chi_star
     return (k[None, :] >= k_lo) & (k[None, :] <= k_hi)
@@ -329,18 +350,20 @@ def _lagrange_shift_stencil(tau, delta, order=SHIFT_STENCIL):
 
     Returns ``(i0, w)`` with ``i0`` of shape ``(n_tau,)`` and ``w`` of shape
     ``(n_tau, order)`` such that ``f(tau_j + delta) ~ sum_a w[j, a] f(tau[i0_j + a])``.
-    Targets outside the grid are clamped to its ends.
+    Targets outside the grid are clamped to its ends. ``delta`` may carry
+    leading axes, ``(n_c,)`` for one shift per cosmology of a batch, which
+    then lead the shapes of ``i0`` and ``w``.
     """
 
     tau = np.asarray(tau, dtype=np.float64)
     n = len(tau)
-    target = np.clip(tau + delta, tau[0], tau[-1])
+    target = np.clip(np.asarray(delta, dtype=np.float64)[..., None] + tau, tau[0], tau[-1])
     i0 = np.clip(np.searchsorted(tau, target) - order // 2, 0, n - order)
-    w = np.ones((n, order))
+    w = np.ones(target.shape + (order,))
     for a in range(order):
         for b in range(order):
             if a != b:
-                w[:, a] *= (target - tau[i0 + b]) / (tau[i0 + a] - tau[i0 + b])
+                w[..., a] *= (target - tau[i0 + b]) / (tau[i0 + a] - tau[i0 + b])
     return i0, w
 
 
@@ -549,6 +572,24 @@ def _cmb_grid_summary(cosmology) -> dict[str, float]:
     return out
 
 
+def _visibility_peak(cosmology) -> float:
+    """The conformal time of the visibility maximum, ``tau_star``.
+
+    The one number of :func:`_cmb_grid_summary` the batched spectrum needs per
+    cosmology (for the ``k`` band of :func:`_k_band`), without the sound-horizon
+    and Silk-damping quadratures the grids need only from their fiducial.
+    """
+
+    cosmology = _as_cosmology(cosmology)
+    cached = _VISIBILITY_PEAK_CACHE.get(cosmology)
+    if cached is None:
+        tau_grid, values, _, tau0 = build_thermo_tables(cosmology)
+        _, vis, _ = visibility_on_grid(tau_grid, values[1], tau_grid, float(tau0))
+        cached = float(tau_grid[int(np.argmax(vis))])
+        _VISIBILITY_PEAK_CACHE[cosmology] = cached
+    return cached
+
+
 def _resample_from_density(x, density, n):
     """Return ``n`` points drawn from ``x`` in proportion to ``density``."""
 
@@ -650,6 +691,83 @@ def cmb_tau_grid(
     return tau_save
 
 
+class CMBGrids(NamedTuple):
+    """The grids of one CMB spectrum computation, shaped by a fiducial cosmology.
+
+    ``k_values`` are the wave modes the hierarchy is solved on, ``k_fine`` the
+    quadrature grid in ``k`` the sources are refined onto, ``tau_save`` the
+    conformal times the sources are recorded at, ``ells`` the multipoles.
+    Built by :func:`cmb_grids`; passed to :func:`compute_cl_power_spectrum_batch`
+    they fix the line-of-sight projection operator across batches.
+    """
+
+    k_values: np.ndarray
+    ells: np.ndarray
+    k_fine: np.ndarray
+    tau_save: np.ndarray
+
+    @property
+    def tau_end(self) -> float:
+        return float(self.tau_save[-1])
+
+
+def cmb_grids(
+    cosmology,
+    *,
+    k_values: np.ndarray | None = None,
+    ells: np.ndarray | None = None,
+    n_save: int = 1000,
+    n_k_fine: int = 1500,
+    k_fine_values: np.ndarray | None = None,
+    tau_end: float | None = None,
+    tau_end_margin: float = TAU_END_MARGIN,
+) -> CMBGrids:
+    """Return the :class:`CMBGrids` shaped by ``cosmology``, built once for many batches.
+
+    The grids adapt to where the sources have structure -- the recombination
+    epoch and the sound horizon in ``tau`` (:func:`cmb_tau_grid`), the acoustic
+    scale and Silk damping in ``k`` (:func:`cmb_k_grid`) -- and nearby
+    cosmologies share that structure, so one fiducial's grids serve them all;
+    a batch has always been solved on its first cosmology's grids. Fixing them
+    across batches is what lets the projection operator
+    (:func:`projection_operator`: the Bessel table and the ``ln k`` refinement
+    matrix) be built once rather than per batch, 0.3 s each time.
+
+    The save grid ends at ``tau_end``, by default ``tau_end_margin`` past the
+    fiducial's ``tau0``, and every cosmology projected on these grids must
+    have ``tau0 <= tau_end`` (its sources are shifted onto the shared
+    comoving-distance grid, which must reach ``tau0``). A cosmology's own
+    trajectory still stops at its own ``tau0``; the saves past it carry zero
+    sources. The shift grows with the margin and costs accuracy through the
+    source interpolation (see :data:`TAU_END_MARGIN` for the measured cost),
+    so keep the margin to what the batches need. A cosmology past ``tau_end``
+    raises ``ValueError`` rather than projecting short.
+    """
+
+    cosmology = _as_cosmology(cosmology)
+    if k_values is None:
+        k_values = cmb_k_grid(cosmology, n=128, mode="ode")
+    if ells is None:
+        ells = DEFAULT_CMB_ELLS
+    k_values = np.asarray(k_values, dtype=np.float64)
+    ells = np.asarray(ells, dtype=np.int64)
+    if tau_end is None:
+        tau_end = _cmb_grid_summary(cosmology)["tau0"] * (1.0 + float(tau_end_margin))
+    tau_save = cmb_tau_grid(cosmology, k_values, n_save, tau_end=float(tau_end))
+    if k_fine_values is None:
+        k_fine = cmb_k_grid(
+            cosmology,
+            n=n_k_fine,
+            mode="cl",
+            k_min=float(k_values[0]),
+            k_max=float(k_values[-1]),
+            ell_max=int(np.max(ells)),
+        )
+    else:
+        k_fine = np.asarray(k_fine_values, dtype=np.float64)
+    return CMBGrids(k_values, ells, k_fine, tau_save)
+
+
 # =============================================================================
 # 5. In-kernel sources: modax's save hook
 # =============================================================================
@@ -724,17 +842,24 @@ def build_source_device_function(a_tab, g_tab, emk_tab):
     10 percent); a difference of saved potentials cancels that error, so the
     hooks difference ``phi`` across saves exactly as the host does. ``a``, ``g``
     and ``exp(-kappa)`` come from the tables of :func:`_source_tables`, indexed
-    by the trajectory's cosmology tag and the save index. Flat LambdaCDM with
-    massless neutrinos, as the host sources.
+    by the trajectory's cosmology tag and the save index; host arrays are
+    uploaded, device arrays (a :class:`DeviceTableSlot`'s buffers, refilled per
+    batch) are read in place. Flat LambdaCDM with massless neutrinos, as the
+    host sources.
     """
 
     from numba_cuda_mlir import cuda
 
     from .perturbations import IX_COSMOLOGY, IX_K
 
-    a_dev = cuda.to_device(a_tab)
-    g_dev = cuda.to_device(g_tab)
-    emk_dev = cuda.to_device(emk_tab)
+    def on_device(table):
+        if cuda.is_cuda_array(table):
+            return table
+        return cuda.to_device(np.ascontiguousarray(table, dtype=np.float64))
+
+    a_dev = on_device(a_tab)
+    g_dev = on_device(g_tab)
+    emk_dev = on_device(emk_tab)
 
     @cuda.jit(device=True)
     def sources(save_idx, y, tau, p):
@@ -805,6 +930,7 @@ def _solve_with_hook(prepared, k_values, tau_save, hook, hook_size, solve_kwargs
     from .perturbations import _pack_batch
 
     params, y0, t_span, _, k_sorted = _pack_batch(prepared, k_values, tau_save)
+    prepared.bind()
     _, out = rodas5P_solve(
         prepared.ode_fn,
         y0,
@@ -828,6 +954,7 @@ def _solve_with_hook(prepared, k_values, tau_save, hook, hook_size, solve_kwargs
 def compute_cl_power_spectrum_batch(
     cosmologies,
     *,
+    grids: CMBGrids | None = None,
     k_values: np.ndarray | None = None,
     ells: np.ndarray | None = None,
     n_save: int = 1000,
@@ -841,12 +968,17 @@ def compute_cl_power_spectrum_batch(
     One modax launch integrates the perturbation hierarchy of every wave mode of
     every cosmology, with the sources evaluated at the save times by the save
     hook; the launch returns ``5 n_save`` numbers per trajectory and no history,
-    so nothing bounds the batch but the kernel's own memory. The save grid is
-    shaped by the first cosmology and extended to the largest ``tau0`` of the
-    batch (each cosmology's own ``tau0`` is respected through zeroed sources
-    past it). The sources are then refined in ``ln k`` onto ``k_fine``
-    (default: the ``C_l`` grid of :func:`cmb_k_grid`) and projected by
+    so nothing bounds the batch but the kernel's own memory. The sources are
+    then refined in ``ln k`` onto the fine grid and projected by
     :func:`theta_ell_batch` and :func:`cl_from_theta`.
+
+    ``grids`` fixes the wave modes, multipoles, fine ``k`` grid and save grid
+    (:func:`cmb_grids`); built once from a fiducial cosmology, it makes the
+    projection operator shared by every batch of an inference loop. Without
+    it, the grids are shaped by the batch's first cosmology from the remaining
+    keyword arguments, with the save grid ending at the largest ``tau0`` of the
+    batch (each cosmology's own ``tau0`` is respected through zeroed sources
+    past it), and the operator is rebuilt for each batch whose grids differ.
 
     ``projection_dtype`` is the arithmetic of the projection's matrix products:
     ``float32`` (default, 2.6e-4 in ``D_l``) or ``float64`` (ten times slower
@@ -857,43 +989,46 @@ def compute_cl_power_spectrum_batch(
     from .perturbations import _prepare_solve
 
     cosmologies = tuple(_as_cosmology(c) for c in cosmologies)
-    base = cosmologies[0]
-    if k_values is None:
-        k_values = cmb_k_grid(base, n=128, mode="ode")
-    if ells is None:
-        ells = DEFAULT_CMB_ELLS
-    k_values = np.asarray(k_values, dtype=np.float64)
-    ells = np.asarray(ells, dtype=np.int64)
-
     prepared = _prepare_solve(cosmologies)
     tau0_all = np.asarray(prepared.tau0, dtype=np.float64)
-    tau0_ref = float(np.max(tau0_all))
-    tau_save = cmb_tau_grid(base, k_values, n_save, tau_end=tau0_ref)
-    if k_fine_values is None:
-        k_fine = cmb_k_grid(
-            base,
-            n=n_k_fine,
-            mode="cl",
-            k_min=float(k_values[0]),
-            k_max=float(k_values[-1]),
-            ell_max=int(np.max(ells)),
+    if grids is None:
+        grids = cmb_grids(
+            cosmologies[0],
+            k_values=k_values,
+            ells=ells,
+            n_save=n_save,
+            n_k_fine=n_k_fine,
+            k_fine_values=k_fine_values,
+            tau_end=float(np.max(tau0_all)),
         )
-    else:
-        k_fine = np.asarray(k_fine_values, dtype=np.float64)
+    k_values, ells, k_fine, tau_save = grids
+    tau0_ref = grids.tau_end
+    if np.max(tau0_all) > tau0_ref * (1.0 + 1.0e-12):
+        raise ValueError(
+            f"a cosmology's tau0 = {np.max(tau0_all):.1f} Mpc lies past the save grid's "
+            f"end {tau0_ref:.1f} Mpc: build the grids with a larger tau_end_margin"
+        )
 
-    # The hook closes over device tables built for these cosmologies and this
-    # save grid; it is the kernel-cache key, so keep it for repeat solves.
-    key = (prepared.cosmologies, tau_save.tobytes())
-    if key not in _HOOK_CACHE:
-        _HOOK_CACHE[key] = build_source_hook(
-            build_source_device_function(*_source_tables(prepared, tau_save))
+    # The hook is part of modax's kernel-cache key, so like the right-hand
+    # side it is compiled once per batch shape, against a slot of device
+    # tables that each batch's visibility is copied into before its launch.
+    n_cosmo, n_save_grid = len(cosmologies), len(tau_save)
+    hook_slot = _HOOK_SLOTS.get((n_cosmo, n_save_grid))
+    if hook_slot is None:
+        hook_slot = DeviceTableSlot(
+            (((n_cosmo, n_save_grid), np.float64),) * 3,
+            lambda *buffers: build_source_hook(build_source_device_function(*buffers)),
         )
+        _HOOK_SLOTS[(n_cosmo, n_save_grid)] = hook_slot
+    hook_key = (prepared.cosmologies, tau_save.tobytes())
+    if hook_slot.loaded != hook_key:
+        hook_slot.load(hook_key, *_source_tables(prepared, tau_save))
     out, k_sorted = _solve_with_hook(
         prepared,
         k_values,
         tau_save,
-        _HOOK_CACHE[key],
-        SOURCE_CHANNELS * len(tau_save),
+        hook_slot.device_function,
+        SOURCE_CHANNELS * n_save_grid,
         solve_kwargs,
     )
     # (n_k, n_cosmo, 5 n_tau) -> (n_cosmo, 5, n_k, n_tau)
@@ -909,25 +1044,31 @@ def compute_cl_power_spectrum_batch(
     ells_d = jnp.asarray(ells, dtype=jnp.float64)
     k_fine_d = jnp.asarray(k_fine)
     tau_d = jnp.asarray(tau_save)
+    # Everything per cosmology below is one host array and one device transfer
+    # for the whole batch: the shifts onto the shared chi grid, the k bands, the
+    # primordial amplitudes. A per-cosmology loop of eager ``jnp`` arithmetic
+    # here cost 80 ms of host time a batch (and, while the kernel was in
+    # flight, waited for it).
     chi_max = float(tau0_ref - tau_save[0])
-    stencils = [
-        _lagrange_shift_stencil(tau_save, float(t0 - tau0_ref)) for t0 in tau0_all
-    ]
-    bands = jnp.stack(
-        [
-            _k_band(
-                ells_d, k_fine_d, chi_max, float(t0 - _cmb_grid_summary(c)["tau_star"])
-            )
-            for t0, c in zip(tau0_all, cosmologies)
-        ]
+    shift_idx, shift_w = _lagrange_shift_stencil(tau_save, tau0_all - tau0_ref)
+    shift_idx, shift_w = jnp.asarray(shift_idx), jnp.asarray(shift_w)
+    chi_star = np.asarray(
+        [t0 - _visibility_peak(c) for t0, c in zip(tau0_all, cosmologies)]
     )
+    bands = _k_band(ells_d, k_fine_d, chi_max, chi_star)
     n_s = jnp.asarray([float(c.n_s) for c in cosmologies])
     A_s = jnp.asarray([float(c.A_s) for c in cosmologies])
     T_cmb = jnp.asarray([float(c.T_cmb) for c in cosmologies])
-    k_pivot = float(base.k_pivot)
+    k_pivot = float(cosmologies[0].k_pivot)
 
     # The projection of a group of cosmologies is one set of GEMMs; the group
     # is sized so its fine-k source arrays fit the memory budget.
+    # The projection of a group of cosmologies is one set of GEMMs; the group
+    # is sized so its fine-k source arrays fit the memory budget. The groups
+    # stay separate eager calls: under one ``jax.jit`` XLA merges the sliced
+    # einsums back into a single whole-batch one (2.3 GB at N=128), which the
+    # allocator cannot place beside the kernel's local memory and retries for
+    # tens of seconds.
     cls = []
     group = _projection_group_size(
         len(cosmologies), len(k_fine), len(tau_save), projection_dtype
@@ -937,8 +1078,8 @@ def compute_cl_power_spectrum_batch(
         theta = theta_ell_batch(
             channels[g0:g1],
             tau_d,
-            jnp.asarray(np.stack([st[0] for st in stencils[g0:g1]])),
-            jnp.asarray(np.stack([st[1] for st in stencils[g0:g1]])),
+            shift_idx[g0:g1],
+            shift_w[g0:g1],
             bands[g0:g1],
             interp,
             bessel,
@@ -964,6 +1105,7 @@ def cl_power_spectrum_jax(
     cosmology,
     densities=None,
     *,
+    grids: CMBGrids | None = None,
     k_values: np.ndarray | None = None,
     ells: np.ndarray | None = None,
     n_save: int = 1000,
@@ -1000,26 +1142,24 @@ def cl_power_spectrum_jax(
     cosmology = _as_cosmology(cosmology)
     prepared = _prepare_solve((cosmology,))
     cosmology = prepared.cosmologies[0]
-    if k_values is None:
-        k_values = cmb_k_grid(cosmology, n=128, mode="ode")
-    if ells is None:
-        ells = DEFAULT_CMB_ELLS
-    k_values = np.asarray(k_values, dtype=np.float64)
-    ells = np.asarray(ells, dtype=np.int64)
-
     tau0 = float(prepared.tau0[0])
-    tau_save = cmb_tau_grid(cosmology, k_values, n_save, tau_end=tau0)
-    if k_fine_values is None:
-        k_fine = cmb_k_grid(
+    if grids is None:
+        grids = cmb_grids(
             cosmology,
-            n=n_k_fine,
-            mode="cl",
-            k_min=float(k_values[0]),
-            k_max=float(k_values[-1]),
-            ell_max=int(np.max(ells)),
+            k_values=k_values,
+            ells=ells,
+            n_save=n_save,
+            n_k_fine=n_k_fine,
+            k_fine_values=k_fine_values,
+            tau_end=tau0,
         )
-    else:
-        k_fine = np.asarray(k_fine_values, dtype=np.float64)
+    k_values, ells, k_fine, tau_save = grids
+    tau0_ref = grids.tau_end
+    if tau0 > tau0_ref * (1.0 + 1.0e-12):
+        raise ValueError(
+            f"tau0 = {tau0:.1f} Mpc lies past the save grid's end {tau0_ref:.1f} Mpc: "
+            "build the grids with a larger tau_end_margin"
+        )
 
     history, densities, k_sorted, _ = _history_jax(
         prepared,
@@ -1039,16 +1179,16 @@ def cl_power_spectrum_jax(
     )
 
     interp, bessel, lnk_weights = projection_operator(
-        ells, k_sorted, k_fine, tau_save, tau0, projection_dtype
+        ells, k_sorted, k_fine, tau_save, tau0_ref, projection_dtype
     )
     ells_d = jnp.asarray(ells, dtype=jnp.float64)
     k_fine_d = jnp.asarray(k_fine)
-    idx, w = _lagrange_shift_stencil(tau_save, 0.0)
+    idx, w = _lagrange_shift_stencil(tau_save, tau0 - tau0_ref)
     band = _k_band(
         ells_d,
         k_fine_d,
-        float(tau0 - tau_save[0]),
-        float(tau0 - _cmb_grid_summary(cosmology)["tau_star"]),
+        float(tau0_ref - tau_save[0]),
+        float(tau0 - _visibility_peak(cosmology)),
     )
     theta = theta_ell_batch(
         channels[None],

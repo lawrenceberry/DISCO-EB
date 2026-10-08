@@ -1,5 +1,7 @@
 """GPU perturbation solves against CLASS: the matter power spectrum and its derivatives."""
 
+import time
+
 import numpy as np
 import pytest
 
@@ -53,6 +55,39 @@ def _perturbed_cosmologies(n):
         )
         cosmologies.append(param)
     return cosmologies
+
+
+def _successive_batches(n_batches, n_cosmologies):
+    """``n_batches`` batches of ``n_cosmologies`` distinct nearby cosmologies.
+
+    The ``n_batches * n_cosmologies`` cosmologies of :func:`_perturbed_cosmologies`
+    dealt out in turn, so every batch spans the whole parameter range the
+    single-batch tests' 128 do and takes comparable solver steps. The pattern
+    of an inference loop: batch after batch of fresh parameters, all of one
+    shape.
+    """
+
+    cosmologies = _perturbed_cosmologies(n_batches * n_cosmologies)
+    return [cosmologies[i::n_batches] for i in range(n_batches)]
+
+
+def _warmup_cosmologies(n):
+    """``n`` cosmologies distinct from :func:`_perturbed_cosmologies` of the same ``n``.
+
+    What a timing warms up on so the timed call, on ``_perturbed_cosmologies(n)``
+    itself, finds its compiled programs and nothing of its own in the caches:
+    it then pays everything a fresh batch pays, the thermodynamics included.
+    """
+
+    return _perturbed_cosmologies(n + 1)[1:]
+
+
+def _wall_time(run):
+    """``(seconds, result)`` of one ``run()``."""
+
+    start = time.perf_counter()
+    result = run()
+    return time.perf_counter() - start, result
 
 
 def _class_linear_pk(param, k_values):

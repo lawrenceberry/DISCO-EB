@@ -13,8 +13,21 @@ the analytic transfer function of a delta-like source, ``Theta_l(k) = j_l(k
 chi_rec)``, which pins the Bessel table, its derivative recurrences and the
 ``tau`` quadrature independently of any cosmology.
 
-The benchmark times one warmed call of :func:`compute_cl_power_spectrum_batch`
-at both batch sizes.
+The benchmark times one call of :func:`compute_cl_power_spectrum_batch` at
+both batch sizes on a *fresh* batch: the warm-up round runs a distinct batch of
+the same shape, so the timed round finds the kernels and JAX programs compiled
+but nothing of its own cosmologies cached, and pays what an iteration of an
+inference loop pays -- the RECFAST thermodynamics, the device tables, the
+perturbation solve and the projection. It waits for the device: the call
+returns JAX arrays as soon as the launches are queued, so the wall time of the
+call alone would be the host's dispatch, not the solve.
+
+A second timing (``test_tt_power_spectrum_successive_batches``) is the
+inference loop's pattern: one compile, then batch after batch of 128 fresh
+cosmologies, each paying its thermodynamics solve and table copy but never a
+kernel compilation. It issues four such batches back to back, waits once at
+the end, and holds them to four times one fresh batch, with modax's
+kernel-build counter checked to be unchanged.
 
 The derivative of the spectrum with respect to the five background densities
 (:func:`cl_power_spectrum_jax`, the CMB counterpart of
@@ -26,18 +39,37 @@ does for ``P(k)``.
 import numpy as np
 import pytest
 
-from test_perturbations import BATCH_SIZE_CASES, DENSITY_NAMES, _perturbed_cosmologies
+from test_perturbations import (
+    BATCH_SIZE_CASES,
+    DENSITY_NAMES,
+    _perturbed_cosmologies,
+    _successive_batches,
+    _wall_time,
+    _warmup_cosmologies,
+)
 
 # Multipoles spanning the Sachs-Wolfe plateau, the acoustic peaks and the onset
 # of Silk damping.
 TT_ELLS = np.asarray([2, 10, 20, 40, 80, 120, 180, 240, 320, 500, 800, 1200], dtype=np.int64)
 
 # Wave modes the perturbation hierarchy is solved on before the sources are
-# interpolated onto the finer line-of-sight grid, and the number of saved times.
+# interpolated onto the finer line-of-sight grid, and the number of saved times
+# (the grids of ``_spectrum_kwargs``).
 CMB_N_K = 128
 CMB_N_SAVE = 1000
 
 DL_GATE = 5.0e-3
+
+# Batches of ``CMB_N_K``-mode, 128-cosmology spectra issued in sequence by
+# ``test_tt_power_spectrum_successive_batches``, the cosmologies of each batch
+# checked against CLASS, and how far past ``SUCCESSIVE_BATCHES`` fresh single
+# batches the sequence may run. A fresh batch is dominated by its
+# thermodynamics solve and host table work, whose wall time is less steady
+# than the kernel's; a recompile would add ~45 s, far outside the tolerance.
+SUCCESSIVE_BATCHES = 4
+SUCCESSIVE_BATCH_SIZE = 128
+SUCCESSIVE_CLASS_CHECKS = 4
+SUCCESSIVE_TOLERANCE = 0.25
 
 # Gate on dD_l/d(density) as a fraction of the derivative's largest value over
 # the multipoles; see ``test_tt_power_spectrum_derivatives``.
@@ -98,10 +130,21 @@ def _class_unlensed_tt(param, ells):
 
 
 def _spectrum_kwargs(cosmologies):
-    from discoeb.cmb import cmb_k_grid
+    """The grids of every spectrum here, shaped by the first cosmology.
+
+    Built once and passed as ``grids``, as an inference loop would: the
+    projection operator is then shared by every batch, and the save grid ends a
+    margin past the fiducial's ``tau0`` to cover the batches' spread.
+    """
+
+    from discoeb.cmb import cmb_grids, cmb_k_grid
 
     k_values = cmb_k_grid(cosmologies[0], n=CMB_N_K, mode="ode", k_min=1.0e-5, k_max=0.5)
-    return dict(k_values=k_values, ells=TT_ELLS, n_save=CMB_N_SAVE, n_k_fine=1500)
+    return dict(
+        grids=cmb_grids(
+            cosmologies[0], k_values=k_values, ells=TT_ELLS, n_save=CMB_N_SAVE, n_k_fine=1500
+        )
+    )
 
 
 def test_projection_reproduces_the_bessel_transfer_of_a_delta_source():
@@ -142,19 +185,21 @@ def test_projection_reproduces_the_bessel_transfer_of_a_delta_source():
 @pytest.mark.skipif(not _cuda_available(), reason="numba-CUDA requires a CUDA GPU")
 @pytest.mark.parametrize("n_cosmologies", BATCH_SIZE_CASES)
 def test_tt_power_spectrum_matches_class(n_cosmologies, benchmark):
-    """Batched unlensed scalar TT ``D_ell`` vs CLASS, timed over the batch size."""
+    """Batched unlensed scalar TT ``D_ell`` vs CLASS, timed fresh over the batch size."""
+
+    import jax
 
     from discoeb.cmb import compute_cl_power_spectrum_batch
 
     cosmologies = _perturbed_cosmologies(n_cosmologies)
-    _, _, dl_ours = benchmark.pedantic(
-        compute_cl_power_spectrum_batch,
-        args=(cosmologies,),
-        kwargs=_spectrum_kwargs(cosmologies),
-        rounds=1,
-        warmup_rounds=1,
-        iterations=1,
-    )
+    kwargs = _spectrum_kwargs(cosmologies)
+    # The warm-up round compiles on other cosmologies; the timed round is fresh.
+    rounds = iter([_warmup_cosmologies(n_cosmologies), cosmologies])
+
+    def spectrum():
+        return jax.block_until_ready(compute_cl_power_spectrum_batch(next(rounds), **kwargs))
+
+    _, _, dl_ours = benchmark.pedantic(spectrum, rounds=1, warmup_rounds=1, iterations=1)
     dl_ours = np.asarray(dl_ours)
     assert dl_ours.shape == (n_cosmologies, len(TT_ELLS))
     assert np.isfinite(dl_ours).all()
@@ -165,6 +210,95 @@ def test_tt_power_spectrum_matches_class(n_cosmologies, benchmark):
     assert float(rel[i, j]) < DL_GATE, (
         f"D_ell off by {rel[i, j]:.3g} for cosmology {i} at l={TT_ELLS[j]}"
     )
+
+
+def _kernel_builds() -> int:
+    """How many Rodas5P kernels modax has built so far in this process."""
+
+    from modax.rodas5P import _make_kernel
+
+    return _make_kernel.cache_info().misses
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="numba-CUDA requires a CUDA GPU")
+def test_tt_power_spectrum_successive_batches(benchmark):
+    """One compile, then four fresh batches of 128 cosmologies at the cost of four single ones.
+
+    The pattern of an inference loop: a sampler proposes a new batch of
+    cosmologies every iteration and the model must not compile again for it.
+    The right-hand side and the source hook are compiled once per batch
+    *shape*, against device buffers that every batch's thermodynamics tables
+    and visibility are copied into (``DeviceTableSlot``); modax's kernel cache
+    is keyed on those device functions, so a fresh batch of the same size is a
+    cache hit.
+
+    A first batch warms up: it compiles the kernel and the projection, and
+    primes the JAX programs of the batched thermodynamics solve. A second fresh
+    batch, run alone and waited on, is the single-batch reference: its cost is
+    the thermodynamics solve, the host table work, the table copy, the launch
+    and the projection -- everything an iteration pays. Four more fresh batches
+    are then issued back to back and waited on once; they must take no longer
+    than four references (within :data:`SUCCESSIVE_TOLERANCE`), and modax must
+    have built no kernel since the warm-up. The copy into the slot waits for
+    the device, so the four run strictly in sequence, which is what the loop
+    does anyway: the sampler needs one batch's spectra before it proposes the
+    next.
+
+    Re-running the four afterwards (the benchmark's round, with every host
+    table cached) must reproduce the fresh run's spectra -- the slots are
+    reloaded batch by batch -- and a few cosmologies of each batch are gated
+    against CLASS as in the single-batch test.
+    """
+
+    import jax
+
+    from discoeb.cmb import compute_cl_power_spectrum_batch
+
+    warm, reference, *batches = _successive_batches(
+        2 + SUCCESSIVE_BATCHES, SUCCESSIVE_BATCH_SIZE
+    )
+    kwargs = _spectrum_kwargs(warm)
+
+    def alone(cosmologies):
+        return jax.block_until_ready(compute_cl_power_spectrum_batch(cosmologies, **kwargs))
+
+    def successive():
+        # Every batch is dispatched before any is waited for.
+        return jax.block_until_ready(
+            [compute_cl_power_spectrum_batch(cosmologies, **kwargs) for cosmologies in batches]
+        )
+
+    alone(warm)
+    builds = _kernel_builds()
+    assert builds >= 1
+
+    single, _ = _wall_time(lambda: alone(reference))
+    four, fresh = _wall_time(successive)
+    assert _kernel_builds() == builds, "a fresh batch of the same shape rebuilt the kernel"
+    assert four <= (1.0 + SUCCESSIVE_TOLERANCE) * SUCCESSIVE_BATCHES * single, (
+        f"{SUCCESSIVE_BATCHES} successive fresh batches took {four:.3f} s against "
+        f"{single:.3f} s for one fresh batch alone ({four / single:.2f}x)"
+    )
+    dl_fresh = [np.asarray(dl) for _, _, dl in fresh]
+
+    results = benchmark.pedantic(successive, rounds=1, warmup_rounds=0, iterations=1)
+    assert _kernel_builds() == builds
+
+    checked = np.linspace(0, SUCCESSIVE_BATCH_SIZE - 1, SUCCESSIVE_CLASS_CHECKS).astype(int)
+    for b, (cosmologies, (_, _, dl_ours)) in enumerate(zip(batches, results)):
+        dl_ours = np.asarray(dl_ours)
+        assert dl_ours.shape == (SUCCESSIVE_BATCH_SIZE, len(TT_ELLS))
+        assert np.isfinite(dl_ours).all()
+        np.testing.assert_allclose(
+            dl_ours, dl_fresh[b], rtol=1.0e-6, err_msg=f"batch {b} re-run vs fresh"
+        )
+        dl_class = np.stack([_class_unlensed_tt(cosmologies[i], TT_ELLS) for i in checked])
+        rel = np.abs(dl_ours[checked] / dl_class - 1.0)
+        i, j = np.unravel_index(np.argmax(rel), rel.shape)
+        assert float(rel[i, j]) < DL_GATE, (
+            f"D_ell off by {rel[i, j]:.3g} for cosmology {checked[i]} of batch {b} "
+            f"at l={TT_ELLS[j]}"
+        )
 
 
 @pytest.mark.skipif(not _cuda_available(), reason="numba-CUDA requires a CUDA GPU")

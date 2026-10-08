@@ -2,12 +2,12 @@ import math
 import os
 from dataclasses import dataclass
 from functools import partial
+from collections import OrderedDict
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from scipy import integrate, interpolate
 
 from .background import (
     batch_dimensions,
@@ -1034,12 +1034,13 @@ def _as_cosmology(cosmology):
 # Solver and grid presets for the accelerated matter-power path.
 N_THERMO_GRID = 2048
 N_BACKGROUND_GRID = 4096
-THERMO_BATCH_CHUNK = 32
+THERMO_BATCH_CHUNK = 128
 """Cosmologies per vmapped background solve in :func:`build_thermo_tables_batch`.
 
-Bounds the working set of one batched RECFAST solve, and keeps repeated batches
-on one compiled program: any batch of 32 or more reuses the same executable, so
-only a trailing partial chunk can trigger a second compilation.
+One lane per cosmology, so a launch costs the same whether it carries one
+cosmology or 128, and a batch is solved in as few launches as possible. A
+partial chunk is padded to this size by repeating its last cosmology, so every
+batch of up to 128 cosmologies runs the one compiled program.
 """
 PERTURB_RTOL = 1.0e-4
 PERTURB_ATOL = 1.0e-4
@@ -1169,7 +1170,44 @@ def density_coefficients(cosmology) -> tuple[float, float, float, float, float]:
     return (grhog_value, grhornomass_value, grhoc_value, grhob_value, grhov_value)
 
 
-_THERMO_TABLE_CACHE: dict = {}
+class BoundedCache(OrderedDict):
+    """A least-recently-used ``dict`` holding at most ``maxsize`` entries.
+
+    The module memoizes per-cosmology and per-batch host work (thermodynamics
+    tables, packed initial states, grid summaries). An inference loop proposes
+    a fresh batch every iteration, so an unbounded memo would grow without
+    limit; this one forgets the oldest entries instead.
+    """
+
+    def __init__(self, maxsize: int):
+        super().__init__()
+        self.maxsize = int(maxsize)
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        self.move_to_end(key)
+        return value
+
+    def get(self, key, default=None):
+        if key in self:
+            return self[key]
+        return default
+
+    def __setitem__(self, key, value):
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        while len(self) > self.maxsize:
+            self.popitem(last=False)
+
+
+THERMO_TABLE_CACHE_SIZE = 4096
+"""Cosmologies whose thermodynamics tables are kept: a few dozen 128-batches."""
+
+BATCH_CACHE_SIZE = 8
+"""Batches whose prepared solve and packed initial states are kept."""
+
+_THERMO_TABLE_CACHE: BoundedCache = BoundedCache(THERMO_TABLE_CACHE_SIZE)
 
 
 def build_thermo_tables(cosmology, n_grid: int = N_THERMO_GRID):
@@ -1179,25 +1217,23 @@ def build_thermo_tables(cosmology, n_grid: int = N_THERMO_GRID):
     quadrature, so it is far too expensive to repeat per evaluation -- a CMB batch
     needs every cosmology's ``tau0`` up front *and* again inside the solve
     preparation. The tables depend only on ``(cosmology, n_grid)``, so memoize
-    them.
+    them. A single cosmology is the one-lane case of
+    :func:`build_thermo_tables_batch`, on the same compiled program.
     """
 
-    key = (cosmology, n_grid)
-    cached = _THERMO_TABLE_CACHE.get(key)
-    if cached is None:
-        cached = _build_thermo_tables(cosmology, n_grid)
-        _THERMO_TABLE_CACHE[key] = cached
-    return cached
+    return build_thermo_tables_batch((_as_cosmology(cosmology),), n_grid)[0]
 
 
 def build_thermo_tables_batch(cosmologies, n_grid: int = N_THERMO_GRID):
     """Return one :func:`build_thermo_tables` tuple per cosmology, batched.
 
-    The same tables as mapping :func:`build_thermo_tables` over ``cosmologies``,
-    memoized in the same cache, but the misses are solved together: the RECFAST
-    recombination history and the background quadrature are ``jax.vmap``-ed over
-    the batch, turning 128 sequential solves of ~0.8 s each into one compiled
-    program and four launches -- about 100 s down to 10 s.
+    The tables of each cosmology, memoized per cosmology, with the misses solved
+    together: the RECFAST recombination history, the background quadrature *and*
+    the resampling onto the device tables (:func:`_thermo_tables_device`) are
+    one ``jax.vmap``-ed program over a chunk of :data:`THERMO_BATCH_CHUNK`
+    cosmologies, so a fresh batch of 128 costs one launch -- a few hundred
+    milliseconds, against ~0.8 s per cosmology solved one at a time, and against
+    ~5 s when the resampling was done on the host cosmology by cosmology.
 
     ``vmap`` rather than the parameter batch axis :func:`batch_dimensions`
     threads through the splines. Under ``vmap`` each cosmology keeps its own
@@ -1217,18 +1253,110 @@ def build_thermo_tables_batch(cosmologies, n_grid: int = N_THERMO_GRID):
 
     order = []
     todo = []
+    found = {}
     for cosmology in cosmologies:
-        key = (cosmology, n_grid)
-        if key not in _THERMO_TABLE_CACHE and key not in todo:
-            todo.append(key)
+        key = (_as_cosmology(cosmology), n_grid)
+        if key not in found:
+            cached = _THERMO_TABLE_CACHE.get(key)
+            if cached is not None:
+                found[key] = cached
+            elif key not in todo:
+                todo.append(key)
         order.append(key)
 
     for start in range(0, len(todo), THERMO_BATCH_CHUNK):
         chunk = todo[start : start + THERMO_BATCH_CHUNK]
         tables = _build_thermo_tables_batch([key[0] for key in chunk], n_grid)
+        found.update(zip(chunk, tables))
         _THERMO_TABLE_CACHE.update(zip(chunk, tables))
 
-    return tuple(_THERMO_TABLE_CACHE[key] for key in order)
+    return tuple(found[key] for key in order)
+
+
+_SPLINE_INVERSE_CACHE: dict[int, np.ndarray] = {}
+
+
+def _not_a_knot_inverse(n: int) -> np.ndarray:
+    """Inverse of the uniform-grid not-a-knot cubic-spline system for the knot second derivatives.
+
+    On a uniform grid of spacing ``h`` the second derivatives ``M`` of the
+    not-a-knot cubic spline through ``y`` solve ``A M = 6 D2 y / h**2`` with
+    ``D2`` the second difference, interior rows ``(1, 4, 1)`` and the end
+    rows ``(1, -2, 1)`` (continuity of the third derivative at the second and
+    second-to-last knots). ``A`` depends on ``n`` alone, so its inverse is built
+    once and the device forms every cosmology's ``seconds`` as one matrix
+    product -- the same numbers as ``scipy.interpolate.CubicSpline(x, y)(x, 2)``
+    on that grid, to 1e-13 of their scale.
+    """
+
+    cached = _SPLINE_INVERSE_CACHE.get(n)
+    if cached is None:
+        a = np.zeros((n, n))
+        idx = np.arange(1, n - 1)
+        a[idx, idx - 1] = 1.0
+        a[idx, idx] = 4.0
+        a[idx, idx + 1] = 1.0
+        a[0, :3] = (1.0, -2.0, 1.0)
+        a[-1, -3:] = (1.0, -2.0, 1.0)
+        cached = np.linalg.inv(a)
+        _SPLINE_INVERSE_CACHE[n] = cached
+    return cached
+
+
+@partial(jax.jit, static_argnames=("n_grid",))
+def _thermo_tables_device(stacked, spline_inverse, n_grid: int):
+    """The device tables of a stack of cosmologies, one vmap lane each.
+
+    Runs :func:`evolve_background` and then the resampling onto the layout the
+    numba-CUDA callbacks read -- the conformal-time quadrature, the uniform
+    ``log(tau)`` grid to each cosmology's own ``tau0``, the spline evaluations
+    of ``a``, ``kappa'``, ``c_s^2`` and ``rho_nu`` on it, and their not-a-knot
+    second derivatives (:func:`_not_a_knot_inverse`) -- as one program. Returns
+    ``(tau_grid, values, seconds, tau0)`` stacked over the lanes.
+    """
+
+    a_background = jnp.geomspace(1.0e-9, 1.0, N_BACKGROUND_GRID)
+
+    def one(params):
+        background = evolve_background(
+            param=params, thermo_module="RECFAST", num_thermo=n_grid
+        )
+        dtauda_values = dtauda(a_background, background)[:, 0]
+        steps = 0.5 * (dtauda_values[1:] + dtauda_values[:-1]) * jnp.diff(a_background)
+        tau_background = jnp.concatenate(
+            (jnp.zeros((1,)), jnp.cumsum(steps))
+        ) + jnp.reshape(background["taumin"], (-1,))[0]
+        tau0 = tau_background[-1]
+        log_tau_grid = jnp.linspace(jnp.log(TAU_START), jnp.log(tau0), n_grid)
+        tau_grid = jnp.exp(log_tau_grid)
+        a_vals = jnp.interp(tau_grid, tau_background, a_background)
+        loga_eval = jnp.log(a_vals)
+
+        xe_spline = background["xe_of_loga_spline"]
+        xe_vals = xe_spline.evaluate(loga_eval)[:, 0]
+        a_recfast_start = 1.0 / 3501.0
+        xe_recfast_start = xe_spline.evaluate(jnp.log(jnp.asarray([a_recfast_start])))[0, 0]
+        xe_vals = jnp.where(a_vals < a_recfast_start, xe_recfast_start, xe_vals)
+        akthom = (
+            2.3038921003709498e-9
+            * (1.0 - params["YHe"])
+            * params["Omegab"]
+            * params["H0"] ** 2
+        )
+        opacity_vals = xe_vals * akthom / a_vals**2
+        cs2_vals = background["cs2a_of_loga_spline"].evaluate(loga_eval)[:, 0] / a_vals
+        rhonu_vals = jnp.exp(
+            background["logrhonu_of_loga_spline"].evaluate(loga_eval)[:, 0]
+        )
+
+        values = jnp.stack((a_vals, opacity_vals, cs2_vals, rhonu_vals))
+        h = log_tau_grid[1] - log_tau_grid[0]
+        second_difference = values[:, 2:] - 2.0 * values[:, 1:-1] + values[:, :-2]
+        rhs = jnp.zeros_like(values).at[:, 1:-1].set(6.0 * second_difference / h**2)
+        seconds = rhs @ spline_inverse.T
+        return tau_grid, values, seconds, tau0
+
+    return jax.vmap(one)(stacked)
 
 
 @partial(jax.jit, static_argnames=("n_grid",))
@@ -1282,105 +1410,27 @@ def thermal_history_batch(cosmologies, n_grid: int = N_THERMO_GRID) -> dict:
 
 
 def _build_thermo_tables_batch(cosmologies, n_grid: int = N_THERMO_GRID):
-    """Uncached :func:`build_thermo_tables_batch`, for one chunk of cosmologies."""
+    """Uncached :func:`build_thermo_tables_batch`, for one chunk of cosmologies.
+
+    Returns one ``(tau_grid, values, seconds, tau0)`` tuple of host arrays per
+    cosmology. The chunk is padded to :data:`THERMO_BATCH_CHUNK` lanes with its
+    last cosmology so that every chunk runs the one compiled program.
+    """
 
     _check_background_param_fields(cosmologies[0])
+    n = len(cosmologies)
+    padded = tuple(cosmologies) + (cosmologies[-1],) * (THERMO_BATCH_CHUNK - n)
     stacked = {
-        key: jnp.asarray([getattr(c, attr) for c in cosmologies], dtype=jnp.float64)
+        key: jnp.asarray([getattr(c, attr) for c in padded], dtype=jnp.float64)
         for key, attr in _BACKGROUND_PARAM_FIELDS.items()
     }
-    backgrounds = _solve_backgrounds(stacked, n_grid)
-    # Lane i has the same leaves and shapes the serial solve returns for
-    # cosmologies[i], down to the width-1 spline batch axis, so the resampling
-    # tail below is the unmodified serial one.
+    tau_grid, values, seconds, tau0 = (
+        np.asarray(x)
+        for x in _thermo_tables_device(stacked, _not_a_knot_inverse(n_grid), n_grid)
+    )
     return tuple(
-        _thermo_tables_from_background(
-            jax.tree_util.tree_map(lambda leaf, j=i: leaf[j], backgrounds),
-            cosmology,
-            n_grid,
-        )
-        for i, cosmology in enumerate(cosmologies)
+        (tau_grid[i], values[i], seconds[i], float(tau0[i])) for i in range(n)
     )
-
-
-def _build_thermo_tables(cosmology, n_grid: int = N_THERMO_GRID):
-    """Return ``(tau_grid, values, seconds, tau0)`` thermodynamics spline tables.
-
-    ``values`` has rows ``(a, kappa', c_s,b^2, rho_nu)`` sampled on a uniform
-    ``log(tau)`` grid over ``[TAU_START, tau0]``. The background and RECFAST
-    histories come directly from :func:`discoeb.background.evolve_background`;
-    this function only resamples its existing splines into the layout required by
-    the numba-CUDA callbacks. ``seconds`` contains the matching cubic second
-    derivatives with respect to ``log(tau)``.
-    """
-
-    return _thermo_tables_from_background(
-        evolve_background(
-            param=cosmology.to_background_params(),
-            thermo_module="RECFAST",
-            num_thermo=n_grid,
-        ),
-        cosmology,
-        n_grid,
-    )
-
-
-def _thermo_tables_from_background(background, cosmology, n_grid: int):
-    """Resample a solved background into the device tables.
-
-    The half of :func:`_build_thermo_tables` after the RECFAST solve, split out
-    so the serial and batched builders share it verbatim. ``background`` is one
-    cosmology's ``evolve_background`` dict, i.e. with its spline batch axis at
-    width 1 -- either straight from the solver, or sliced out of a vmapped batch
-    by :func:`_build_thermo_tables_batch`.
-    """
-
-    a_background = np.geomspace(1.0e-9, 1.0, N_BACKGROUND_GRID)
-    dtauda_values = np.asarray(
-        dtauda(jnp.asarray(a_background), background)
-    )[:, 0]
-    tau_background = integrate.cumulative_trapezoid(
-        dtauda_values, a_background, initial=0.0
-    )
-    tau_background += float(np.asarray(background["taumin"]).reshape(-1)[0])
-    tau0 = float(tau_background[-1])
-    log_tau_grid = np.linspace(np.log(TAU_START), np.log(tau0), n_grid)
-    tau_grid = np.exp(log_tau_grid)
-    a_vals = np.interp(tau_grid, tau_background, a_background)
-    loga_eval = jnp.log(jnp.asarray(a_vals))
-
-    xe_vals = np.asarray(background["xe_of_loga_spline"].evaluate(loga_eval))[:, 0]
-    a_recfast_start = 1.0 / 3501.0
-    xe_recfast_start = float(
-        np.asarray(
-            background["xe_of_loga_spline"].evaluate(
-                jnp.log(jnp.asarray([a_recfast_start]))
-            )
-        ).reshape(-1)[0]
-    )
-    xe_vals = np.where(a_vals < a_recfast_start, xe_recfast_start, xe_vals)
-    akthom = (
-        2.3038921003709498e-9
-        * (1.0 - cosmology.Y_He)
-        * cosmology.Omegab
-        * cosmology.H0**2
-    )
-    opacity_vals = xe_vals * akthom / a_vals**2
-    cs2a_vals = np.asarray(
-        background["cs2a_of_loga_spline"].evaluate(loga_eval)
-    )[:, 0]
-    cs2_vals = cs2a_vals / a_vals
-    rhonu_vals = np.exp(
-        np.asarray(
-            background["logrhonu_of_loga_spline"].evaluate(jnp.log(a_vals))
-        )[:, 0]
-    )
-
-    values = np.stack((a_vals, opacity_vals, cs2_vals, rhonu_vals))
-    seconds = np.stack(
-        [interpolate.CubicSpline(log_tau_grid, row)(log_tau_grid, 2) for row in values]
-    )
-    return tau_grid, values, seconds, tau0
 
 
 def make_params(cosmology, k_values: np.ndarray, tau_end: float) -> np.ndarray:
@@ -1477,9 +1527,20 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, seconds):
     the ``IX_COSMOLOGY`` tag on each trajectory's parameter row, so one compiled
     kernel solves an arbitrary batch of cosmologies. A single-cosmology solve is
     just ``n_cosmologies == 1``.
+
+    The tables may be host arrays, uploaded here, or device arrays, used in
+    place. The returned closure reads the device arrays' *contents at launch*,
+    not at build time, so a caller that keeps one set of device buffers per
+    batch shape and refills them per batch (:class:`_TableSlot`) runs every
+    batch on the one kernel compiled against those buffers.
     """
 
     from numba_cuda_mlir import cuda
+
+    def on_device(table, dtype):
+        if cuda.is_cuda_array(table):
+            return table
+        return cuda.to_device(np.ascontiguousarray(table, dtype=dtype))
 
     ix_g, lmaxg = layout.ix_g, layout.lmaxg
     ix_pol, lmaxpol = layout.ix_pol, layout.lmaxpol
@@ -1503,10 +1564,10 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, seconds):
         raise ValueError(f"every hierarchy truncation must be >= 3; got {truncations}")
 
     n_grid = values.shape[-1]
-    tau_min_dev = cuda.to_device(np.ascontiguousarray(tau_min, dtype=np.float64))
-    inv_dtau_dev = cuda.to_device(np.ascontiguousarray(inv_dtau, dtype=np.float64))
-    values_dev = cuda.to_device(np.ascontiguousarray(values, dtype=THERMO_TABLE_DTYPE))
-    seconds_dev = cuda.to_device(np.ascontiguousarray(seconds, dtype=THERMO_TABLE_DTYPE))
+    tau_min_dev = on_device(tau_min, np.float64)
+    inv_dtau_dev = on_device(inv_dtau, np.float64)
+    values_dev = on_device(values, THERMO_TABLE_DTYPE)
+    seconds_dev = on_device(seconds, THERMO_TABLE_DTYPE)
 
     @cuda.jit(device=True)
     def spline_eval(x, p, channel):
@@ -1818,6 +1879,49 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, seconds):
     return perturbation_rhs
 
 
+class DeviceTableSlot:
+    """Device buffers of a fixed shape that one compiled kernel reads its tables from.
+
+    A numba-CUDA kernel that closes over a device array bakes in the array's
+    address, so the right-hand side (and the CMB source hook) built against a
+    batch's thermodynamics tables is a different kernel for every batch, and
+    every batch of an inference loop would compile its own, ~45 s each. A slot
+    instead owns device buffers sized for a batch *shape* -- the number of
+    cosmologies and the table length -- and the device function compiled
+    against them; :meth:`load` copies a batch's tables into the buffers, so the
+    same kernel serves every batch of that shape.
+
+    The copy is ordered against the launches by a device-wide synchronisation
+    on either side of it: every earlier launch (on XLA's streams too, which do
+    not synchronise with numba's) has finished reading the old tables before
+    they are overwritten, and the new ones have landed before anything is
+    launched against them. That wait is only taken when the slot changes hands,
+    never when a batch is re-solved. A kernel reads the tables loaded at its
+    launch, so one batch at a time per slot: loading the next batch waits for
+    the previous one's launches.
+    """
+
+    def __init__(self, shapes_dtypes, build):
+        from numba_cuda_mlir import cuda
+
+        self._cuda = cuda
+        self.buffers = tuple(cuda.device_array(shape, dtype) for shape, dtype in shapes_dtypes)
+        self.device_function = build(*self.buffers)
+        self.loaded = None
+
+    def load(self, key, *tables) -> None:
+        """Make ``tables`` (host arrays, one per buffer) the slot's contents, under ``key``."""
+
+        if self.loaded is not None and self.loaded == key:
+            return
+        self.loaded = None
+        self._cuda.synchronize()
+        for buffer, table in zip(self.buffers, tables, strict=True):
+            buffer.copy_to_device(np.ascontiguousarray(table, dtype=buffer.dtype))
+        self._cuda.synchronize()
+        self.loaded = key
+
+
 class _PreparedSolve(NamedTuple):
     """Compiled artifacts shared by every cosmology of a (possibly batched) solve."""
 
@@ -1827,10 +1931,22 @@ class _PreparedSolve(NamedTuple):
     tau0: np.ndarray  # (n_cosmologies,)
     ode_fn: object
     sparsity: object
+    slot: DeviceTableSlot
+    stacked: tuple  # host (tau_min, inv_dtau, values, seconds) the slot is loaded with
+
+    def bind(self) -> None:
+        """Load this batch's thermodynamics tables into the kernel's buffers.
+
+        Called right before every launch of ``ode_fn``; a no-op when the slot
+        already holds them (a repeated solve of the same batch).
+        """
+
+        self.slot.load(self.cosmologies, *self.stacked)
 
 
-_PREPARED_SOLVE_CACHE: dict = {}
-_PACKED_BATCH_CACHE: dict = {}
+_PREPARED_SOLVE_CACHE: BoundedCache = BoundedCache(BATCH_CACHE_SIZE)
+_PACKED_BATCH_CACHE: BoundedCache = BoundedCache(BATCH_CACHE_SIZE)
+_TABLE_SLOTS: dict = {}
 
 
 def _stack_thermo_tables(tables):
@@ -1872,21 +1988,23 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
     The thermodynamics tables, the numba-CUDA right-hand side device function and
     the Jacobian sparsity pattern depend only on the cosmologies (and the
     module-level grid and quadrature presets), not on the wave modes, the save
-    times, or the solver tolerances. They are also what triggers the *slow*
-    numba-CUDA kernel compilation: the returned ``ode_fn`` closure and the
-    sparsity pattern are the identity keys of modax's
-    ``modax.rodas5P`` compiled-kernel cache, so
-    reusing the same objects across solves of the same batch turns a repeated
-    solve from a full recompile (tens of seconds) into a bare kernel launch.
+    times, or the solver tolerances. The right-hand side and the sparsity
+    pattern are also the identity keys of modax's compiled-kernel cache, and
+    the kernel compilation is the *slow* step (tens of seconds). So the
+    right-hand side is not built per batch: it is compiled once per batch
+    *shape* against a :class:`DeviceTableSlot` of device buffers, and each
+    batch's tables are copied into those buffers before its launches
+    (:meth:`_PreparedSolve.bind`). A sampler proposing a fresh batch of the same
+    size every iteration thus pays the thermodynamics solve and the copy, never
+    a recompile.
 
     All cosmologies in a batch must share a perturbation layout (same dark-energy
     and massive-neutrino settings); one compiled kernel then solves them all,
     selecting each cosmology's thermodynamics table by the ``IX_COSMOLOGY`` tag.
 
-    The cache is unbounded and holds device memory (one thermodynamics table set
-    plus the compiled kernel per distinct batch); sweeping many batches
-    accumulates GPU allocations. Call :func:`clear_prepared_solve_cache` to
-    release them.
+    The prepared solves of the last :data:`BATCH_CACHE_SIZE` batches are kept
+    (host tables only); the slots hold the device memory, one set of buffers
+    per batch shape. :func:`clear_prepared_solve_cache` releases both.
     """
 
     cosmologies = tuple(_as_cosmology(cosmology) for cosmology in cosmologies)
@@ -1917,7 +2035,20 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
 
     tables = build_thermo_tables_batch(cosmologies)
     tau_min, inv_dtau, values, seconds, tau0 = _stack_thermo_tables(tables)
-    ode_fn = build_numba_rhs(layout, tau_min, inv_dtau, values, seconds)
+    n_cosmo, n_channels, n_grid = values.shape
+    slot_key = key[1:] + (layout, n_cosmo, n_channels, n_grid)
+    slot = _TABLE_SLOTS.get(slot_key)
+    if slot is None:
+        slot = DeviceTableSlot(
+            (
+                ((n_cosmo,), np.float64),
+                ((n_cosmo,), np.float64),
+                ((n_cosmo, n_channels, n_grid), THERMO_TABLE_DTYPE),
+                ((n_cosmo, n_channels, n_grid), THERMO_TABLE_DTYPE),
+            ),
+            lambda *buffers: build_numba_rhs(layout, *buffers),
+        )
+        _TABLE_SLOTS[slot_key] = slot
     # The pattern is all modax needs: it colours it for the Enzyme sweeps, and
     # orders it with AMD, factorises it symbolically and compiles a sparse LU
     # and sparse triangular solves for that exact structure.
@@ -1926,8 +2057,10 @@ def _prepare_solve(cosmologies) -> _PreparedSolve:
         layout,
         tables,
         tau0,
-        ode_fn,
+        slot.device_function,
         perturbation_sparsity(layout),
+        slot,
+        (tau_min, inv_dtau, values, seconds),
     )
     _PREPARED_SOLVE_CACHE[key] = prepared
     return prepared
@@ -1990,11 +2123,16 @@ def _pack_batch(prepared, k_values, tau_save=None):
 
 
 def clear_prepared_solve_cache() -> None:
-    """Drop all cached prepared and packed solves, releasing their device memory."""
+    """Drop all cached prepared and packed solves and the device table slots.
+
+    Releases the slots' device buffers; the next solve of each batch shape
+    compiles its kernel again.
+    """
 
     _PREPARED_SOLVE_CACHE.clear()
     _PACKED_BATCH_CACHE.clear()
     _THERMO_TABLE_CACHE.clear()
+    _TABLE_SLOTS.clear()
 
 
 def solve_perturbation_history(
@@ -2049,6 +2187,7 @@ def solve_perturbation_history(
     else:
         t_span = np.ascontiguousarray(np.asarray(tau_save, dtype=np.float64))
 
+    prepared.bind()
     sol = rodas5P_solve(
         prepared.ode_fn,
         y0,
@@ -2124,6 +2263,7 @@ def solve_perturbation_history_batch(
     params, y0, t_span, order, k_sorted = _pack_batch(prepared, k_values, tau_save)
     n_k = len(k_sorted)
 
+    prepared.bind()
     sol = rodas5P_solve(
         prepared.ode_fn,
         y0,
@@ -2322,6 +2462,7 @@ def _history_jax(
     from modax.rodas5P import solve as rodas5P_solve
 
     params, y0, t_span, order, k_sorted = _pack_batch(prepared, k_values, tau_save)
+    prepared.bind()
     columns = list(PHYSICAL_DENSITY_COLUMNS)
     n_dir = len(columns)
     n_k = params.shape[0]
@@ -2441,6 +2582,7 @@ def solve_matter_power_spectrum_batch(
     params, y0, t_span, order, k_sorted = _pack_batch(prepared, k_values)
     n_k = len(k_sorted)
 
+    prepared.bind()
     sol = rodas5P_solve(
         prepared.ode_fn,
         y0,
