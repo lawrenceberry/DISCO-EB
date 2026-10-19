@@ -1556,10 +1556,13 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, rescaled_seconds):
     bin's index base and quadrature node baked in, folded over the bins the
     same way.
 
-    The tables are stacked over cosmologies: ``values`` and ``seconds`` have
-    shape ``(n_cosmologies, n_channels, n_grid)`` and ``tau_min`` / ``inv_dtau``
-    are ``(n_cosmologies,)``. The device evaluator selects a cosmology's table by
-    the ``IX_COSMOLOGY`` tag on each trajectory's parameter row, so one compiled
+    The tables are stacked over cosmologies: ``values`` and ``rescaled_seconds``
+    (the spline's second derivatives times ``h^2 / 6`` for the uniform step ``h``
+    in ``log(tau)``, so the evaluator is a Horner polynomial in the local
+    coordinate) have shape ``(n_cosmologies, n_channels, n_grid)`` and
+    ``tau_min`` / ``inv_dtau`` are ``(n_cosmologies,)``. The device evaluator
+    selects a cosmology's table by the ``IX_COSMOLOGY`` tag on each
+    trajectory's parameter row, so one compiled
     kernel solves an arbitrary batch of cosmologies. A single-cosmology solve is
     just ``n_cosmologies == 1``.
 
@@ -1731,7 +1734,7 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, rescaled_seconds):
                 return (w * y[b] / vq, w * y[b + 1])
 
             @cuda.jit(device=True)
-            def derivatives(y, a, amnu, k, z, sigma, tau):
+            def derivatives(y, a, amnu, k, z, sigma, inv_tau):
                 # Massive-neutrino phase-space hierarchy (Ma & Bertschinger; CLASS
                 # perturbations.c, synchronous gauge with metric_continuity = h'/2,
                 # metric_euler = 0, metric_shear = k*sigma, and h' = 2 k z):
@@ -1747,7 +1750,7 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, rescaled_seconds):
                     -kv * psi1 + (k * z * (1.0 / 3.0)) * dl,
                     kv * (1.0 / 3.0) * (psi0 - 2.0 * psi2),
                     kv * (1.0 / 5.0) * (2.0 * psi1 - 3.0 * psi3) - (2.0 / 15.0) * k * sigma * dl,
-                ) + tail(y, kv, 0.0, tau)
+                ) + tail(y, kv, 0.0, inv_tau)
 
             return moments, derivatives
 
@@ -1785,77 +1788,12 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, rescaled_seconds):
     else:
         mnu_moments = mnu_derivatives = None
 
-    @cuda.jit(device=True, inline=True)
-    def bitcast_f64_to_u64(x):
-        buf = cuda.local.array(1, dtype=np.float64)
-        buf[0] = x
-        buf_u64 = buf.view(np.uint64)
-        return buf_u64[0]
-
-    @cuda.jit(device=True, inline=True)
-    def bitcast_u64_to_f64(u):
-        buf = cuda.local.array(1, dtype=np.uint64)
-        buf[0] = u
-        buf_f64 = buf.view(np.float64)
-        return buf_f64[0]
-
-    @cuda.jit(device=True, inline=True)
-    def fast_branchless_log_f64(x):
-        # Constants
-        SQRT2 = 1.4142135623730950488016887242097
-        LN2_HI = 0.69314718036912381649          # Exact in float64 top bits
-        LN2_LO = 1.90821492927058770002e-10      # Remainder tail bits
-
-        # 1. Extract Exponent and Mantissa via bit manipulation
-        LN2_HI = 0.69314718036912381649
-        LN2_LO = 1.90821492927058770002e-10
-
-        # 1. Zero-cost register bitcast
-        I = bitcast_f64_to_u64(x)
-
-        # 2. Extract biased exponent and convert to float without conditionals
-        # Emits: shr.u64, and.b64, cvt.rn.f64.s64, fsub.f64
-        E_biased = (I >> np.uint64(52)) & np.uint64(0x7FF)
-        e = (np.int64(E_biased) - 1023) * 1.0
-
-        # 3. Extract mantissa directly into range [1.0, 2.0)
-        # Emits: and.b64, or.b64
-        I_m = (I & np.uint64(0x000FFFFFFFFFFFFF)) | np.uint64(0x3FF0000000000000)
-        m = bitcast_u64_to_f64(I_m)
-
-        u = (m - 1.0) / (m + 1.0)
-        z = u * u
-
-        # 3. 16-term Horner Polynomial for R(z) = ln(m) / (2*u) over z in [0, 1/9]
-        # Yields full f64 accuracy (< 1e-16 error) without range reduction predicates
-        poly = 0.03030303030303030303          # 1/33
-        poly = poly * z + 0.03225806451612903226  # 1/31
-        poly = poly * z + 0.03448275862068965517  # 1/29
-        poly = poly * z + 0.03703703703703703704  # 1/27
-        poly = poly * z + 0.04000000000000000000  # 1/25
-        poly = poly * z + 0.04347826086956521739  # 1/23
-        poly = poly * z + 0.04761904761904761905  # 1/21
-        poly = poly * z + 0.05263157894736842105  # 1/19
-        poly = poly * z + 0.05882352941176470588  # 1/17
-        poly = poly * z + 0.06666666666666666667  # 1/15
-        poly = poly * z + 0.07692307692307692308  # 1/13
-        poly = poly * z + 0.09090909090909090909  # 1/11
-        poly = poly * z + 0.11111111111111111111  # 1/9
-        poly = poly * z + 0.14285714285714285714  # 1/7
-        poly = poly * z + 0.20000000000000000000  # 1/5
-        poly = poly * z + 0.33333333333333333333  # 1/3
-        poly = poly * z + 1.0
-
-        # 4. Reconstruction: ln(x) = e*ln(2) + 2*u*R(z)
-        log_m = 2.0 * u * poly
-        return e * LN2_HI + (e * LN2_LO + log_m)
-
     def perturbation_rhs(y, tau, p):
         k = p[IX_K]
-        log_tau = fast_branchless_log_f64(tau)#math.log(tau)
-        #cosmology_idx = int(p[IX_COSMOLOGY])
-        #cosmology_idx = fast_float_to_int(p[IX_COSMOLOGY])
-        cosmology_idx = (p.view(np.int64))[IX_COSMOLOGY]
+        log_tau = math.log(tau)
+        # Converted once here, not once per spline lookup; the row is a tuple in
+        # modax's JVP path, so it cannot be read back by bit pattern.
+        cosmology_idx = int(p[IX_COSMOLOGY])
         a = uniform_spline_eval(log_tau, cosmology_idx, 0)
         opacity = uniform_spline_eval(log_tau, cosmology_idx, 1)
         cs2 = uniform_spline_eval(log_tau, cosmology_idx, 2)
@@ -1975,7 +1913,7 @@ def build_numba_rhs(layout, tau_min, inv_dtau, values, rescaled_seconds):
             dark_energy = ()
 
         if ENABLE_MNU:
-            massive_neutrinos = mnu_derivatives(y, a, amnu, k, z, sigma, tau)
+            massive_neutrinos = mnu_derivatives(y, a, amnu, k, z, sigma, inv_tau)
         else:
             massive_neutrinos = ()
 
@@ -2044,7 +1982,7 @@ class _PreparedSolve(NamedTuple):
     ode_fn: object
     sparsity: object
     slot: DeviceTableSlot
-    stacked: tuple  # host (tau_min, inv_dtau, values, seconds) the slot is loaded with
+    stacked: tuple  # host (tau_min, inv_dtau, values, rescaled_seconds) the slot is loaded with
 
     def bind(self) -> None:
         """Load this batch's thermodynamics tables into the kernel's buffers.
@@ -2064,10 +2002,12 @@ _TABLE_SLOTS: dict = {}
 def _stack_thermo_tables(tables):
     """Stack per-cosmology thermo tables for the multi-cosmology device evaluator.
 
-    Returns ``(tau_min, inv_dtau, values, seconds, tau0)`` where ``values`` and
-    ``seconds`` are ``(n_cosmologies, n_channels, n_grid)`` and the rest are
-    ``(n_cosmologies,)``. The device spline evaluator selects a cosmology's row
-    by the per-trajectory ``IX_COSMOLOGY`` tag.
+    Returns ``(tau_min, inv_dtau, values, rescaled_seconds, tau0)`` where
+    ``values`` and ``rescaled_seconds`` (second derivatives times ``h^2 / 6``,
+    the form :func:`build_numba_rhs`'s Horner evaluator reads) are
+    ``(n_cosmologies, n_channels, n_grid)`` and the rest are ``(n_cosmologies,)``.
+    The device spline evaluator selects a cosmology's row by the per-trajectory
+    ``IX_COSMOLOGY`` tag.
     """
 
     tau_min = np.array([np.log(t[0][0]) for t in tables], dtype=np.float64)
@@ -2215,7 +2155,7 @@ def _pack_batch(prepared, k_values, tau_save=None):
     y0 = np.empty((n_traj, layout.nvar), dtype=np.float64)
     for ci, cosmology in enumerate(prepared.cosmologies):
         base = make_params(cosmology, k_sorted, float(prepared.tau0[ci]))
-        base[:, IX_COSMOLOGY] = ci.view(np.float64)#float(ci)
+        base[:, IX_COSMOLOGY] = float(ci)
         params[ci::n_cosmo] = base
         y0[ci::n_cosmo] = make_initial_states(cosmology, k_sorted, layout)
     params = np.ascontiguousarray(params)
