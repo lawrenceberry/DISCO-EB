@@ -54,7 +54,9 @@ from test_perturbations import (
 
 # Multipoles spanning the Sachs-Wolfe plateau, the acoustic peaks and the onset
 # of Silk damping.
-TT_ELLS = np.asarray([2, 10, 20, 40, 80, 120, 180, 240, 320, 500, 800, 1200], dtype=np.int64)
+TT_ELLS = np.asarray(
+    [2, 10, 20, 40, 80, 120, 180, 240, 320, 500, 800, 1200], dtype=np.int64
+)
 
 # Wave modes the perturbation hierarchy is solved on before the sources are
 # interpolated onto the finer line-of-sight grid, and the number of saved times
@@ -156,14 +158,18 @@ def _assert_matches_class(dl_ours, dl_class, ells, who=lambda i: f"cosmology {i}
     names cosmology ``i`` in the failure message.
     """
 
-    tt_c, te_c, ee_c = (np.stack([d[name] for d in dl_class]) for name in ("tt", "te", "ee"))
+    tt_c, te_c, ee_c = (
+        np.stack([d[name] for d in dl_class]) for name in ("tt", "te", "ee")
+    )
     tt, te, ee = (np.asarray(s) for s in dl_ours)
     assert tt.shape == te.shape == ee.shape == tt_c.shape
     assert np.isfinite(tt).all() and np.isfinite(te).all() and np.isfinite(ee).all()
 
     def gate(err, limit, name):
         i, j = np.unravel_index(np.argmax(err), err.shape)
-        assert float(err[i, j]) < limit, f"{name} off by {err[i, j]:.3g} for {who(i)} at l={ells[j]}"
+        assert float(err[i, j]) < limit, (
+            f"{name} off by {err[i, j]:.3g} for {who(i)} at l={ells[j]}"
+        )
 
     gate(np.abs(tt / tt_c - 1.0), DL_GATE, "TT D_ell")
     gate(np.abs(ee / ee_c - 1.0), POL_GATE, "EE D_ell")
@@ -185,10 +191,16 @@ def _spectrum_kwargs(cosmologies):
 
     from discoeb.cmb import cmb_grids, cmb_k_grid
 
-    k_values = cmb_k_grid(cosmologies[0], n=CMB_N_K, mode="ode", k_min=1.0e-5, k_max=0.5)
+    k_values = cmb_k_grid(
+        cosmologies[0], n=CMB_N_K, mode="ode", k_min=1.0e-5, k_max=0.5
+    )
     return dict(
         grids=cmb_grids(
-            cosmologies[0], k_values=k_values, ells=TT_ELLS, n_save=CMB_N_SAVE, n_k_fine=1500
+            cosmologies[0],
+            k_values=k_values,
+            ells=TT_ELLS,
+            n_save=CMB_N_SAVE,
+            n_k_fine=1500,
         )
     )
 
@@ -210,7 +222,9 @@ def test_projection_reproduces_the_bessel_transfer_of_a_delta_source():
     tau = np.linspace(tau_rec - 20.0 * width, tau_rec + 20.0 * width, 4001)
     k = np.asarray([0.01, 0.05, 0.1])
     ells = np.asarray([2, 8, 20])
-    gaussian = np.exp(-0.5 * ((tau - tau_rec) / width) ** 2) / (width * np.sqrt(2.0 * np.pi))
+    gaussian = np.exp(-0.5 * ((tau - tau_rec) / width) ** 2) / (
+        width * np.sqrt(2.0 * np.pi)
+    )
 
     # The j_l channel and the quadrupole channel (j_l'' for the temperature,
     # j_l / x^2 for E) are fed; phi = 0 leaves no ISW term, and the fine k grid
@@ -218,12 +232,20 @@ def test_projection_reproduces_the_bessel_transfer_of_a_delta_source():
     channels = np.zeros((1, SOURCE_CHANNELS, len(k), len(tau)))
     channels[0, 0] = gaussian[None, :]
     channels[0, 2] = gaussian[None, :]
-    interp, bessel, bessel_e, _ = projection_operator(ells, k, k, tau, tau0, dtype=jnp.float64)
+    interp, bessel, bessel_e, _ = projection_operator(
+        ells, k, k, tau, tau0, dtype=jnp.float64
+    )
     idx, w = _lagrange_shift_stencil(tau, 0.0)
     band = jnp.ones((1, len(ells), len(k)), dtype=bool)
     theta, theta_e = theta_ell_batch(
-        jnp.asarray(channels), jnp.asarray(tau), jnp.asarray(idx)[None], jnp.asarray(w)[None],
-        band, interp, bessel, bessel_e,
+        jnp.asarray(channels),
+        jnp.asarray(tau),
+        jnp.asarray(idx)[None],
+        jnp.asarray(w)[None],
+        band,
+        interp,
+        bessel,
+        bessel_e,
     )
 
     x = k * (tau0 - tau_rec)
@@ -233,9 +255,15 @@ def test_projection_reproduces_the_bessel_transfer_of_a_delta_source():
         jld = special.spherical_jn(int(ell), x, derivative=True)
         jldd = -2.0 / x * jld + (ell * (ell + 1.0) / x**2 - 1.0) * jl
         expected_t.append(jl + jldd)
-        expected_e.append(np.sqrt((ell + 2.0) * (ell + 1.0) * ell * (ell - 1.0)) * jl / x**2)
-    np.testing.assert_allclose(np.asarray(theta[0]), np.stack(expected_t), rtol=5e-3, atol=1e-6)
-    np.testing.assert_allclose(np.asarray(theta_e[0]), np.stack(expected_e), rtol=5e-3, atol=1e-6)
+        expected_e.append(
+            np.sqrt((ell + 2.0) * (ell + 1.0) * ell * (ell - 1.0)) * jl / x**2
+        )
+    np.testing.assert_allclose(
+        np.asarray(theta[0]), np.stack(expected_t), rtol=5e-3, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        np.asarray(theta_e[0]), np.stack(expected_e), rtol=5e-3, atol=1e-6
+    )
 
 
 @pytest.mark.skipif(not _cuda_available(), reason="numba-CUDA requires a CUDA GPU")
@@ -253,11 +281,17 @@ def test_power_spectra_match_class(n_cosmologies, benchmark):
     rounds = iter([_warmup_cosmologies(n_cosmologies), cosmologies])
 
     def spectrum():
-        return jax.block_until_ready(compute_cl_power_spectrum_batch(next(rounds), **kwargs))
+        return jax.block_until_ready(
+            compute_cl_power_spectrum_batch(next(rounds), **kwargs)
+        )
 
-    _, _, dl_ours = benchmark.pedantic(spectrum, rounds=1, warmup_rounds=1, iterations=1)
+    _, _, dl_ours = benchmark.pedantic(
+        spectrum, rounds=1, warmup_rounds=1, iterations=1
+    )
     assert np.asarray(dl_ours.tt).shape == (n_cosmologies, len(TT_ELLS))
-    _assert_matches_class(dl_ours, [_class_unlensed(c, TT_ELLS) for c in cosmologies], TT_ELLS)
+    _assert_matches_class(
+        dl_ours, [_class_unlensed(c, TT_ELLS) for c in cosmologies], TT_ELLS
+    )
 
 
 def _kernel_builds() -> int:
@@ -308,12 +342,17 @@ def test_power_spectra_successive_batches(benchmark):
     kwargs = _spectrum_kwargs(warm)
 
     def alone(cosmologies):
-        return jax.block_until_ready(compute_cl_power_spectrum_batch(cosmologies, **kwargs))
+        return jax.block_until_ready(
+            compute_cl_power_spectrum_batch(cosmologies, **kwargs)
+        )
 
     def successive():
         # Every batch is dispatched before any is waited for.
         return jax.block_until_ready(
-            [compute_cl_power_spectrum_batch(cosmologies, **kwargs) for cosmologies in batches]
+            [
+                compute_cl_power_spectrum_batch(cosmologies, **kwargs)
+                for cosmologies in batches
+            ]
         )
 
     alone(warm)
@@ -322,7 +361,9 @@ def test_power_spectra_successive_batches(benchmark):
 
     single, _ = _wall_time(lambda: alone(reference))
     four, fresh = _wall_time(successive)
-    assert _kernel_builds() == builds, "a fresh batch of the same shape rebuilt the kernel"
+    assert _kernel_builds() == builds, (
+        "a fresh batch of the same shape rebuilt the kernel"
+    )
     assert four <= (1.0 + SUCCESSIVE_TOLERANCE) * SUCCESSIVE_BATCHES * single, (
         f"{SUCCESSIVE_BATCHES} successive fresh batches took {four:.3f} s against "
         f"{single:.3f} s for one fresh batch alone ({four / single:.2f}x)"
@@ -332,10 +373,16 @@ def test_power_spectra_successive_batches(benchmark):
     results = benchmark.pedantic(successive, rounds=1, warmup_rounds=0, iterations=1)
     assert _kernel_builds() == builds
 
-    checked = np.linspace(0, SUCCESSIVE_BATCH_SIZE - 1, SUCCESSIVE_CLASS_CHECKS).astype(int)
+    checked = np.linspace(0, SUCCESSIVE_BATCH_SIZE - 1, SUCCESSIVE_CLASS_CHECKS).astype(
+        int
+    )
     for b, (cosmologies, (_, _, dl_ours)) in enumerate(zip(batches, results)):
         dl_ours = np.stack([np.asarray(s) for s in dl_ours])
-        assert dl_ours.shape == (len(SPECTRUM_NAMES), SUCCESSIVE_BATCH_SIZE, len(TT_ELLS))
+        assert dl_ours.shape == (
+            len(SPECTRUM_NAMES),
+            SUCCESSIVE_BATCH_SIZE,
+            len(TT_ELLS),
+        )
         assert np.isfinite(dl_ours).all()
         np.testing.assert_allclose(
             dl_ours, dl_fresh[b], rtol=1.0e-6, err_msg=f"batch {b} re-run vs fresh"
@@ -429,9 +476,13 @@ def test_power_spectra_derivatives(one_column_per_trajectory, benchmark):
         minus = np.asarray(spectrum(densities.at[i].add(-step)))
         finite = (plus - minus) / (2.0 * step)
         resolvable = 2.0 * step * np.abs(finite) > FD_RESOLVABLE * np.abs(plus)
-        assert resolvable[0].any(), f"dD_l^TT/d{name} below the finite-difference resolution everywhere"
+        assert resolvable[0].any(), (
+            f"dD_l^TT/d{name} below the finite-difference resolution everywhere"
+        )
         scale = np.max(np.abs(np.where(resolvable, finite, 0.0)), axis=1, keepdims=True)
-        err = np.where(resolvable, np.abs(sens - finite) / np.where(scale > 0.0, scale, 1.0), 0.0)
+        err = np.where(
+            resolvable, np.abs(sens - finite) / np.where(scale > 0.0, scale, 1.0), 0.0
+        )
         s, worst = np.unravel_index(np.argmax(err), err.shape)
         assert err[s, worst] < CL_DERIV_GATE, (
             f"dD_l^{SPECTRUM_NAMES[s]}/d{name} at l={TT_ELLS[worst]}: sensitivity {sens[s, worst]:.8e} "
