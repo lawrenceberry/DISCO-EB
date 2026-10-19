@@ -1,4 +1,4 @@
-"""Weak lensing of the CMB temperature spectrum.
+"""Weak lensing of the CMB temperature and polarization spectra.
 
 Two pieces, both batched over cosmologies:
 
@@ -19,22 +19,28 @@ Two pieces, both batched over cosmologies:
    projection is a small matrix product per cosmology
    (:func:`lensing_potential_operator`, :func:`lensing_potential_cl`).
 
-2. **The lensed temperature spectrum** by the full-sky correlation-function
-   method of Challinor & Lewis (2005, Phys. Rev. D 71, 103010), the method of
-   CAMB and CLASS: the lensed correlation function is
+2. **The lensed spectra** by the full-sky correlation-function method of
+   Challinor & Lewis (2005, Phys. Rev. D 71, 103010), the method of CAMB and
+   CLASS, in the form of CAMB's ``CorrFuncFullSky``: the isotropic part of the
+   deflection is kept to all orders, ``F_l = exp(-l(l+1) sigma^2/2)``, and the
+   anisotropic part to second order in ``c_l = l(l+1) C_gl,2 / 2``.  With
+   ``b_l = (2l+1)/(4pi)`` the lensed correlation functions are
 
-   ``xi~(beta) = sum_l (2l+1)/(4pi) C_l [X_000^2 d^l_00 + 8/(l(l+1)) C_gl,2 X'_000^2 d^l_{1-1} + C_gl,2^2 X_220^2 d^l_{2-2}]``
+   ``xi   = sum_l b_l C_l^TT F_l [d_00 + c_l d_{1-1} + c_l^2/4 (d_00 + d_{2-2})]``,
+   ``xi_+ = sum_l b_l C_l^EE F_l [d_22 + c_l d_13 + c_l^2/4 (d_22 + d_04)]``,
+   ``xi_- = sum_l b_l C_l^EE F_l [d_{2-2} + c_l/2 (d_{1-1} + d_{3-3}) + c_l^2/8 (2 d_{2-2} + d_00 + d_{4-4})]``,
+   ``xi_X = sum_l b_l C_l^TE F_l [d_20 + c_l/2 (d_11 + d_{1-3}) + c_l^2/8 (3 d_20 + d_{2-4})]``,
 
-   to second order in ``C_gl,2``, with ``X_000 = exp(-l(l+1) sigma^2/4)``,
-   ``X'_000 = -l(l+1)/4 X_000``, ``X_220 = sqrt((l+2)(l-1)l(l+1))/4 X_000``,
-   ``sigma^2(beta) = C_gl(0) - C_gl(beta)``, ``C_gl = sum_l (2l+1)/(4pi) l(l+1)
-   C_l^psi d^l_11`` and ``C_gl,2`` the same sum with ``d^l_{1-1}``; the lensed
-   spectrum is the Legendre transform back, ``C~_l = 2 pi int xi~(beta)
-   d^l_00(beta) dcos(beta)``, by Gauss-Legendre quadrature.  The Wigner
+   where ``d_{mm'} = d^l_{mm'}(beta)`` are Wigner d-functions,
+   ``sigma^2(beta) = C_gl(0) - C_gl(beta)``, ``C_gl = sum_l b_l l(l+1) C_l^psi
+   d^l_11`` and ``C_gl,2`` the same sum with ``d^l_{1-1}``.  The lensed
+   spectra are the transforms back by Gauss-Legendre quadrature in
+   ``cos(beta)``: ``C~_l^TT = 2 pi int xi d^l_00``, ``C~_l^TE = 2 pi int xi_X
+   d^l_20``, ``C~_l^EE +- C~_l^BB = 2 pi int xi_+- d^l_{2 +-2}``.  The
    d-functions on the quadrature nodes depend on nothing but ``l_max`` and the
    number of nodes and are tabulated once (:func:`lensing_tables`);
-   :func:`lensed_tt` is then a handful of matrix products per cosmology and
-   runs batched on the device.  It sums over every multipole;
+   :func:`lensed_spectra` is then a few dozen matrix products per cosmology
+   and runs batched on the device.  It sums over every multipole;
    :func:`cl_on_every_ell` splines the sampled spectra onto them.
 """
 
@@ -159,32 +165,68 @@ def lensing_potential_cl(phi, shift_idx, shift_w, chi, chi_star, operator, limbe
 
 
 class LensingTables(NamedTuple):
-    """Gauss-Legendre nodes and the Wigner d-functions on them, for :func:`lensed_tt`."""
+    """Gauss-Legendre nodes and the Wigner d-functions on them, for :func:`lensed_spectra`.
+
+    Each table is ``d^l_{mm'}(beta)`` for ``l = 0..lmax`` on the nodes ``x = cos(beta)``,
+    shape ``(lmax + 1, n)``; the name gives ``m m'`` with ``m`` for ``-m``.
+    """
 
     lmax: int
     x: jax.Array  # (n,) cos(beta)
     weights: jax.Array  # (n,)
-    d00: jax.Array  # (lmax + 1, n)
+    d00: jax.Array
     d11: jax.Array
     d1m1: jax.Array
     d2m2: jax.Array
+    d22: jax.Array
+    d13: jax.Array
+    d04: jax.Array
+    d3m3: jax.Array
+    d4m4: jax.Array
+    d20: jax.Array
+    d1m3: jax.Array
+    d2m4: jax.Array
+
+
+D_TABLES = ((0, 0), (1, 1), (1, -1), (2, -2), (2, 2), (1, 3), (0, 4), (3, -3), (4, -4), (2, 0), (1, -3), (2, -4))
+"""The ``(m, m')`` of the d-function tables of :class:`LensingTables`, in field order."""
+
+
+def _wigner_d_start(m, mp, x):
+    """``d^j_{m m'}(beta)`` at the lowest ``j = max(|m|, |m'|)``, from the closed form.
+
+    ``d^j_{j mu} = sqrt((2j)! / ((j+mu)! (j-mu)!)) cos^{j+mu}(beta/2) (-sin(beta/2))^{j-mu}``,
+    reached through the symmetries ``d^j_{m m'} = (-1)^{m-m'} d^j_{m' m} = d^j_{-m -m'}``.
+    """
+
+    from math import factorial
+
+    sign = 1.0
+    if abs(mp) > abs(m):
+        sign = (-1.0) ** (m - mp)
+        m, mp = mp, m
+    if m < 0:
+        m, mp = -m, -mp
+    j, mu = m, mp
+    coefficient = np.sqrt(factorial(2 * j) / (factorial(j + mu) * factorial(j - mu)))
+    cos_half = np.sqrt(0.5 * (1.0 + x))
+    sin_half = np.sqrt(0.5 * (1.0 - x))
+    return sign * coefficient * cos_half ** (j + mu) * (-sin_half) ** (j - mu)
 
 
 def _wigner_d(m, mp, x, lmax):
-    """``d^l_{m m'}(beta)`` for ``l = 0..lmax`` on ``x = cos(beta)``, by upward recursion."""
+    """``d^l_{m m'}(beta)`` for ``l = 0..lmax`` on ``x = cos(beta)``, by upward recursion in ``l``."""
 
     x = np.asarray(x, dtype=np.float64)
     out = np.zeros((lmax + 1, len(x)))
     l0 = max(abs(m), abs(mp))
-    start = {
-        (0, 0): np.ones_like(x),
-        (1, 1): 0.5 * (1.0 + x),
-        (1, -1): 0.5 * (1.0 - x),
-        (2, -2): (0.5 * (1.0 - x)) ** 2,
-    }[(m, mp)]
-    out[l0] = start
+    if l0 > lmax:
+        return out
+    out[l0] = _wigner_d_start(m, mp, x)
     prev = np.zeros_like(x)
     if l0 == 0:  # the recursion divides by l; seed it with d^1_00 = cos(beta)
+        if lmax == 0:
+            return out
         out[1], prev, l0 = x, out[0], 1
     for l in range(l0, lmax):
         num = (2 * l + 1) * (l * (l + 1) * x - m * mp) * out[l] - (l + 1) * np.sqrt((l * l - m * m) * (l * l - mp * mp)) * prev
@@ -195,38 +237,35 @@ def _wigner_d(m, mp, x, lmax):
 
 
 def lensing_tables(lmax: int, n_points: int | None = None, dtype=jnp.float32) -> LensingTables:
-    """Tabulate the quadrature and the d-functions for :func:`lensed_tt`.
+    """Tabulate the quadrature and the d-functions for :func:`lensed_spectra`.
 
     ``n_points`` Gauss-Legendre nodes in ``cos(beta)`` (``lmax + 1024`` by
-    default, which resolves the lensed correlation function to better than
-    1e-4 of the spectrum).  Takes a few seconds of host time for ``lmax ~ 3000``
-    and ~200 MB on the device in float32.
+    default, which resolves the lensed correlation functions to better than
+    1e-4 of the spectra).  Takes several seconds of host time for ``lmax ~
+    3000`` and ~600 MB on the device in float32 (twelve tables).
     """
 
     n = n_points or (lmax + 1024)
     x, w = np.polynomial.legendre.leggauss(n)
     return LensingTables(
-        lmax=lmax,
-        x=jnp.asarray(x, dtype=jnp.float64),
-        weights=jnp.asarray(w, dtype=jnp.float64),
-        d00=jnp.asarray(_wigner_d(0, 0, x, lmax), dtype=dtype),
-        d11=jnp.asarray(_wigner_d(1, 1, x, lmax), dtype=dtype),
-        d1m1=jnp.asarray(_wigner_d(1, -1, x, lmax), dtype=dtype),
-        d2m2=jnp.asarray(_wigner_d(2, -2, x, lmax), dtype=dtype),
+        lmax,
+        jnp.asarray(x, dtype=jnp.float64),
+        jnp.asarray(w, dtype=jnp.float64),
+        *(jnp.asarray(_wigner_d(m, mp, x, lmax), dtype=dtype) for m, mp in D_TABLES),
     )
 
 
 def cl_on_every_ell(ells, cl, lmax: int, power: int = 1):
     """``C_l`` at every ``l = 0..lmax``, ``(n_c, lmax + 1)``, from samples ``(n_c, n_ell)`` at sorted ``ells``.
 
-    :func:`lensed_tt` sums over every multipole, the spectra are computed at a
+    :func:`lensed_spectra` sums over every multipole, the spectra are computed at a
     few dozen; this is a natural cubic spline in ``ln l`` of
-    ``[l(l+1)]^power C_l`` (``power = 1`` for the temperature, 2 for the
-    lensing potential, so that the splined quantity is flat), zero below
-    ``ells[0]``. ``ells[-1]`` must reach ``lmax``. Multipoles the spline
-    must bridge where the spectrum curves sharply in ``ln l`` cost accuracy: a
-    temperature sampled at ``l = 2, 4`` is off by 5e-3 at ``l = 3``, so sample
-    every multipole there.
+    ``[l(l+1)]^power C_l`` (``power = 1`` for the temperature and polarization
+    spectra, 2 for the lensing potential, so that the splined quantity is
+    flat), zero below ``ells[0]``. ``ells[-1]`` must reach ``lmax``. Multipoles
+    the spline must bridge where the spectrum curves sharply in ``ln l`` cost
+    accuracy: a temperature sampled at ``l = 2, 4`` is off by 5e-3 at ``l = 3``,
+    so sample every multipole there.
     """
 
     from .spline_interpolation import spline_interpolation
@@ -243,8 +282,17 @@ def cl_on_every_ell(ells, cl, lmax: int, power: int = 1):
     return jnp.where(inside[None, :], (values / unweight[:, None]).T, 0.0)
 
 
-def _lensed_tt_one(cl_tt, cl_pp, tables: LensingTables):
-    """Lensed ``C_l`` for ``l = 0..lmax`` of one cosmology (float64 in, float64 out)."""
+class LensedSpectra(NamedTuple):
+    """The lensed spectra of :func:`lensed_spectra`, each ``(n_c, lmax + 1)``."""
+
+    tt: jax.Array
+    te: jax.Array
+    ee: jax.Array
+    bb: jax.Array
+
+
+def _lensed_one(cl_tt, cl_te, cl_ee, cl_pp, tables: LensingTables):
+    """Lensed ``(TT, TE, EE, BB)`` for ``l = 0..lmax`` of one cosmology (float64 in, float64 out)."""
 
     hi = jax.lax.Precision.HIGHEST
     dtype = tables.d00.dtype
@@ -256,40 +304,77 @@ def _lensed_tt_one(cl_tt, cl_pp, tables: LensingTables):
     c_gl = jnp.einsum("l,ln->n", a, tables.d11, precision=hi)
     c_gl2 = jnp.einsum("l,ln->n", a, tables.d1m1, precision=hi)
     sigma2 = (jnp.sum(a.astype(jnp.float64)) - c_gl.astype(jnp.float64)).astype(dtype)
-    # xi~(beta) = sum_l b_l X_000^2 [d00 + (l(l+1)/2) C_gl,2 d1m1 + C_gl,2^2 c_l^2 d2m2],
-    # since X'_000 = -l(l+1)/4 X_000 and X_220 = c_l X_000, c_l^2 = (l+2)(l-1)l(l+1)/16.
-    b = (norm * cl_tt).astype(dtype)
-    half = (0.5 * llp1).astype(dtype)
-    c2 = ((ell + 2.0) * (ell - 1.0) * llp1 / 16.0).astype(dtype)
-    damping = jnp.exp(-0.5 * llp1.astype(dtype)[:, None] * sigma2[None, :])  # X_000^2, (l, n)
+    damping = jnp.exp(-0.5 * llp1.astype(dtype)[:, None] * sigma2[None, :])  # F_l, (l, n)
+    # The anisotropic expansion parameter is c_l = h_l C_gl,2 with h_l = l(l+1)/2:
+    # every term is F_l times a power of C_gl,2(beta) times a sum over l.
+    h = 0.5 * llp1
+    b_t, b_x, b_e = (norm * cl_tt, norm * cl_te, norm * cl_ee)
+
+    def term(b, coefficient, d):
+        return jnp.einsum("l,ln,ln->n", (b * coefficient).astype(dtype), damping, d, precision=hi)
+
     xi = (
-        jnp.einsum("l,ln,ln->n", b, damping, tables.d00, precision=hi)
-        + c_gl2 * jnp.einsum("l,ln,ln->n", b * half, damping, tables.d1m1, precision=hi)
-        + c_gl2**2 * jnp.einsum("l,ln,ln->n", b * c2, damping, tables.d2m2, precision=hi)
+        term(b_t, 1.0, tables.d00)
+        + c_gl2 * term(b_t, h, tables.d1m1)
+        + c_gl2**2 * (term(b_t, h**2 / 4.0, tables.d00) + term(b_t, h**2 / 4.0, tables.d2m2))
     )
-    integrand = (tables.weights * xi.astype(jnp.float64)).astype(dtype)
-    return 2.0 * jnp.pi * jnp.einsum("ln,n->l", tables.d00, integrand, precision=hi).astype(jnp.float64)
+    xi_plus = (
+        term(b_e, 1.0, tables.d22)
+        + c_gl2 * term(b_e, h, tables.d13)
+        + c_gl2**2 * (term(b_e, h**2 / 4.0, tables.d22) + term(b_e, h**2 / 4.0, tables.d04))
+    )
+    xi_minus = (
+        term(b_e, 1.0, tables.d2m2)
+        + c_gl2 * (term(b_e, h / 2.0, tables.d1m1) + term(b_e, h / 2.0, tables.d3m3))
+        + c_gl2**2
+        * (
+            term(b_e, h**2 / 4.0, tables.d2m2)
+            + term(b_e, h**2 / 8.0, tables.d00)
+            + term(b_e, h**2 / 8.0, tables.d4m4)
+        )
+    )
+    xi_cross = (
+        term(b_x, 1.0, tables.d20)
+        + c_gl2 * (term(b_x, h / 2.0, tables.d11) + term(b_x, h / 2.0, tables.d1m3))
+        + c_gl2**2 * (term(b_x, 3.0 * h**2 / 8.0, tables.d20) + term(b_x, h**2 / 8.0, tables.d2m4))
+    )
+
+    def back(xi_n, d):
+        integrand = (tables.weights * xi_n.astype(jnp.float64)).astype(dtype)
+        return 2.0 * jnp.pi * jnp.einsum("ln,n->l", d, integrand, precision=hi).astype(jnp.float64)
+
+    tt = back(xi, tables.d00)
+    te = back(xi_cross, tables.d20)
+    plus = back(xi_plus, tables.d22)
+    minus = back(xi_minus, tables.d2m2)
+    return tt, te, 0.5 * (plus + minus), 0.5 * (plus - minus)
 
 
 @partial(jax.jit, static_argnames=("chunk",))
-def lensed_tt(cl_tt, cl_pp, tables: LensingTables, chunk: int = 4):
-    """Lensed ``C_l^{TT}`` for a batch, shape ``(n_c, lmax + 1)``.
+def lensed_spectra(cl_tt, cl_te, cl_ee, cl_pp, tables: LensingTables, chunk: int = 4) -> LensedSpectra:
+    """Lensed ``TT, TE, EE, BB`` for a batch, a :class:`LensedSpectra` of ``(n_c, lmax + 1)`` arrays.
 
-    ``cl_tt`` and ``cl_pp`` are the unlensed temperature and the lensing
-    potential spectra, ``(n_c, lmax + 1)`` indexed by ``l`` from 0 (the
-    monopole and dipole are ignored; :func:`cl_on_every_ell` fills them in from
-    the sampled spectra of :func:`discoeb.cmb.compute_cl_power_spectrum_batch`).  The unlensed spectra must extend a few
-    hundred multipoles past the highest lensed multipole wanted.  Cosmologies
-    are processed ``chunk`` at a time: the per-cosmology work is an
-    ``(lmax + 1, n_points)`` array of damping factors.
+    ``cl_tt``, ``cl_te`` and ``cl_ee`` are the unlensed scalar spectra and
+    ``cl_pp`` the lensing potential spectrum, ``(n_c, lmax + 1)`` indexed by
+    ``l`` from 0 (the monopole and dipole are ignored; :func:`cl_on_every_ell`
+    fills them in from the sampled spectra of
+    :func:`discoeb.cmb.compute_cl_power_spectrum_batch`).  The unlensed
+    spectra must extend a few hundred multipoles past the highest lensed
+    multipole wanted.  Cosmologies are processed ``chunk`` at a time: the
+    per-cosmology work is an ``(lmax + 1, n_points)`` array of damping factors.
     """
 
-    cl_tt = jnp.asarray(cl_tt, dtype=jnp.float64).at[:, :2].set(0.0)
-    cl_pp = jnp.asarray(cl_pp, dtype=jnp.float64).at[:, :2].set(0.0)
-    n_c = cl_tt.shape[0]
+    spectra = [jnp.asarray(c, dtype=jnp.float64).at[:, :2].set(0.0) for c in (cl_tt, cl_te, cl_ee, cl_pp)]
+    n_c, n_l = spectra[0].shape
     pad = (-n_c) % chunk
-    cl_tt = jnp.pad(cl_tt, ((0, pad), (0, 0)))
-    cl_pp = jnp.pad(cl_pp, ((0, pad), (0, 0)))
-    one = jax.vmap(_lensed_tt_one, in_axes=(0, 0, None))
-    out = jax.lax.map(lambda args: one(args[0], args[1], tables), (cl_tt.reshape(-1, chunk, cl_tt.shape[1]), cl_pp.reshape(-1, chunk, cl_pp.shape[1])))
-    return out.reshape(-1, cl_tt.shape[1])[:n_c]
+    spectra = [jnp.pad(c, ((0, pad), (0, 0))).reshape(-1, chunk, n_l) for c in spectra]
+    one = jax.vmap(_lensed_one, in_axes=(0, 0, 0, 0, None))
+    out = jax.lax.map(lambda args: one(*args, tables), tuple(spectra))
+    return LensedSpectra(*(c.reshape(-1, n_l)[:n_c] for c in out))
+
+
+def lensed_tt(cl_tt, cl_pp, tables: LensingTables, chunk: int = 4):
+    """Lensed ``C_l^{TT}`` for a batch, shape ``(n_c, lmax + 1)``: :func:`lensed_spectra` without polarization."""
+
+    zeros = jnp.zeros_like(jnp.asarray(cl_tt, dtype=jnp.float64))
+    return lensed_spectra(cl_tt, zeros, zeros, cl_pp, tables, chunk=chunk).tt

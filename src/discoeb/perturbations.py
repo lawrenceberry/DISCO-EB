@@ -2476,6 +2476,7 @@ def _history_jax(
     max_steps: int = PERTURB_MAX_STEPS,
     one_column_per_trajectory: bool = True,
     sens_error_control: bool = False,
+    error_weights=None,
 ):
     """The saved history of one cosmology's modes, differentiable in the densities.
 
@@ -2483,7 +2484,10 @@ def _history_jax(
     :func:`discoeb.cmb.cl_power_spectrum_jax`, which documents the two thread
     layouts (``one_column_per_trajectory``) and the solver settings. ``prepared``
     is the :func:`_prepare_solve` of the single cosmology; ``tau_save`` is the
-    save grid (default: the two endpoints, i.e. the final state only).
+    save grid (default: the two endpoints, i.e. the final state only);
+    ``error_weights`` are optional per-mode weights ``(n_k, nvar)`` in
+    ascending ``k`` for the solver's error norm (modax's ``error_weights``),
+    replicated for the sensitivity layout.
 
     Returns ``(history, densities, k_sorted, order)``: ``history`` is
     ``(n_k, n_save, nvar)`` in ascending ``k`` as a JAX array whose derivative
@@ -2518,6 +2522,13 @@ def _history_jax(
         tf_index=IX_TAU_END,
         max_registers=CUDA_MAX_REGISTERS,
         sens_error_control=sens_error_control,
+        error_weights=error_weights,
+    )
+    settings_rep = dict(
+        settings,
+        error_weights=None
+        if error_weights is None
+        else np.repeat(np.asarray(error_weights), n_dir, axis=0),
     )
     t_span_j = jnp.asarray(t_span)
 
@@ -2562,7 +2573,7 @@ def _history_jax(
                     t_span_j,
                     p_rep.at[:, IX_EPS].set(eps),
                     sens_param_columns=(IX_EPS,),
-                    **settings,
+                    **settings_rep,
                 )
 
             # d/d(eps) at eps = 0 along every replica at once: one joint launch

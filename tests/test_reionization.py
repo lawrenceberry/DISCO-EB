@@ -6,22 +6,23 @@ reionization redshift set by bisection on the optical depth.  Checked here:
 the integrated Thomson opacity of the low-redshift step reproduces the
 requested optical depth, the reionization redshift agrees with CLASS's for the
 same ``tau_reio`` (both use the same parametrization), ``tau_reio = 0``
-leaves the history untouched, and the unlensed TT spectrum of a batch of
-cosmologies with different optical depths matches CLASS's ``reio_camb`` to the
-TT gate of ``tests/test_cmb.py``, from the reionization bump at low ``l`` to
-the ``exp(-2 tau_reio)`` suppression of the acoustic peaks.
+leaves the history untouched, and the unlensed TT, TE and EE spectra of a batch
+of cosmologies with different optical depths match CLASS's ``reio_camb`` to the
+gates of ``tests/test_cmb.py``, from the reionization bumps at low ``l`` (the
+EE bump is the signature of reionization) to the ``exp(-2 tau_reio)``
+suppression of the acoustic peaks.
 """
 
 import numpy as np
 import pytest
 
+from test_cmb import _assert_matches_class
 from test_perturbations import REFERENCE_COSMOLOGY, _perturbed_cosmologies
 
 TAU_REIO = 0.0544
 
-# Multipoles of the TT check: the reionization bump (l < 20) and the peaks.
+# Multipoles of the spectrum check: the reionization bumps (l < 20) and the peaks.
 TT_ELLS = np.asarray([2, 3, 4, 6, 8, 10, 15, 20, 30, 40, 80, 120, 180, 240, 320, 500, 800, 1200], dtype=np.int64)
-DL_GATE = 5.0e-3
 
 
 def _cuda_available() -> bool:
@@ -102,8 +103,8 @@ def test_no_reionization_by_default():
 
 
 @pytest.mark.skipif(not _cuda_available(), reason="numba-CUDA requires a CUDA GPU")
-def test_tt_power_spectrum_with_reionization_matches_class():
-    """Unlensed TT D_l of a batch with tau_reio from 0.04 to 0.07 against CLASS reio_camb."""
+def test_power_spectra_with_reionization_match_class():
+    """Unlensed TT, TE and EE D_l of a batch with tau_reio from 0.04 to 0.07 against CLASS reio_camb."""
 
     import jax
 
@@ -116,16 +117,19 @@ def test_tt_power_spectrum_with_reionization_matches_class():
     k_values = cmb_k_grid(cosmologies[0], n=128, mode="ode", k_min=1.0e-5, k_max=0.5)
     grids = cmb_grids(cosmologies[0], k_values=k_values, ells=TT_ELLS, n_save=1000, n_k_fine=1500)
     _, _, dl = compute_cl_power_spectrum_batch(cosmologies, grids=grids)
-    dl = np.asarray(jax.block_until_ready(dl))
+    dl = jax.block_until_ready(dl)
 
-    for i, cosmology in enumerate(cosmologies):
-        c = _class(cosmology, {"output": "tCl", "modes": "s", "lensing": "no", "l_max_scalars": 2500})
+    dl_class = []
+    for cosmology in cosmologies:
+        c = _class(cosmology, {"output": "tCl,pCl", "modes": "s", "lensing": "no", "l_max_scalars": 2500})
         try:
             raw = c.raw_cl(int(TT_ELLS.max()) + 1)
         finally:
             c.struct_cleanup()
             c.empty()
         ell = raw["ell"]
-        dl_class = (ell * (ell + 1.0) * raw["tt"] * (cosmology["Tcmb"] * 1.0e6) ** 2 / (2.0 * np.pi))[TT_ELLS]
-        rel = np.abs(dl[i] / dl_class - 1.0)
-        assert rel.max() < DL_GATE, f"cosmology {i} (tau_reio {cosmology['tau_reio']:.3f}): D_l off by {rel.max():.3g} at l={TT_ELLS[np.argmax(rel)]}"
+        factor = ell * (ell + 1.0) * (cosmology["Tcmb"] * 1.0e6) ** 2 / (2.0 * np.pi)
+        dl_class.append({name: (raw[name] * factor)[TT_ELLS] for name in ("tt", "te", "ee")})
+    _assert_matches_class(
+        dl, dl_class, TT_ELLS, who=lambda i: f"cosmology {i} (tau_reio {cosmologies[i]['tau_reio']:.3f})"
+    )

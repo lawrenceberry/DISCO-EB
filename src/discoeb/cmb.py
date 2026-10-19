@@ -1,4 +1,4 @@
-"""CMB temperature source functions, transfer functions, and power spectra.
+"""CMB temperature and polarization sources, transfer functions, and power spectra.
 
 Once the perturbation hierarchy has been evolved (:mod:`discoeb.perturbations`,
 on modax's Rodas5P kernel), the CMB anisotropy today is obtained by
@@ -23,6 +23,26 @@ The angular power spectrum then follows from the primordial curvature spectrum,
     ``C_l = 4 pi int dln k  P_R(k) Theta_l(k)^2``,   ``P_R = A_s (k/k_p)^{n_s - 1}``
 
 and is reported as ``D_l = l(l+1) C_l / 2pi`` in ``muK^2`` (:func:`dl_power_spectrum`).
+
+**Polarization.** The E-mode transfer function needs no further source: in
+CAMB's form it is the quadrupole/polarization term against ``j_l(x) / x^2``,
+
+    ``E_l(k) = sqrt((l+2)!/(l-2)!) int_0^{tau_0} dtau S_j2 j_l(x) / x^2``
+
+(Zaldarriaga & Seljak 1997; CAMB's ``sources(2)``), so the projection carries
+a fourth Bessel row, ``j_l(x) / x^2`` with the ``l``-dependent prefactor folded
+in, tabulated directly (not divided after interpolation, since ``j_l`` is
+interpolated linearly and ``j_2(x) / x^2 -> 1/15`` at the end of the line of
+sight, where a reionized universe still has visibility). Then
+``C_l^{EE} = 4 pi int dln k P_R E_l^2`` and ``C_l^{TE} = 4 pi int dln k P_R
+Theta_l E_l``; the three spectra are returned together as a :class:`Spectra`
+(``tt, te, ee``). The lensed TE, EE and BB follow in :mod:`discoeb.lensing`.
+The polarization source is a small state component at low ``k``, below the
+scalar absolute tolerance of the solve, so the CMB solves weight the photon
+quadrupole and ``E_2`` up in the solver's error norm in proportion to ``1/k``
+(:func:`polarization_error_weights`); without that the low multipoles of EE
+and TE come out 10 to 40 percent low, at no gain in speed.
+
 
 **Where the sources are evaluated.** Inside the kernel launch: modax's Rodas5P
 save hook calls :func:`build_source_device_function` at every save time with
@@ -74,6 +94,7 @@ from .perturbations import (
     IX_CLXC,
     IX_ETAK,
     IX_G,
+    IX_K,
     IX_POL,
     IX_R,
     IX_VB,
@@ -104,6 +125,19 @@ Z_REION_SEARCH_MAX = 30.0
 SOURCE_CHANNELS = 5
 """Numbers per save: ``S_noisw, S_j1, S_j2, phi, exp(-kappa)``."""
 
+
+class Spectra(NamedTuple):
+    """The scalar CMB spectra of one computation: temperature, cross and E-mode.
+
+    Each field is an array over the multipoles (with a leading batch axis from
+    :func:`compute_cl_power_spectrum_batch`); as a tuple it stacks and maps like
+    one, ``jnp.stack(spectra)`` giving ``(3, ...)`` in the order ``tt, te, ee``.
+    """
+
+    tt: jax.Array
+    te: jax.Array
+    ee: jax.Array
+
 SHIFT_STENCIL = 4
 """Points of the Lagrange stencil that shifts a cosmology's sources in ``tau`` onto
 the shared ``chi`` grid: 4 (cubic) leaves 2e-4 in ``D_l``, 2 (linear) 7e-3."""
@@ -120,6 +154,43 @@ the 128 nearby cosmologies of the tests, the shift onto the fiducial's grid
 moves ``D_l`` by at most 2.7e-4 at 1 percent, 1.0e-3 at 2 percent and 4.4e-3
 at 5 percent (the low multipoles' late-time sources sit on the coarse end of
 the grid)."""
+
+POLARIZATION_WEIGHT_K = 0.1
+"""Wave number (Mpc^-1) below which the photon quadrupole and ``E_2`` are weighted
+up in the solver's error norm, by ``POLARIZATION_WEIGHT_K / k``."""
+
+POLARIZATION_WEIGHT_MAX = 1000.0
+"""Cap of that weight."""
+
+
+def polarization_error_weights(k, nvar):
+    """Per-trajectory solver error weights ``(n_traj, nvar)`` that resolve the polarization source at low ``k``.
+
+    The E-mode source is ``g polter`` with ``polter = pig/10 + 3/5 E_2``. At
+    ``k`` well below the acoustic scale both moments are tiny through
+    recombination -- of the order of the solve's scalar ``atol = 1e-4`` at
+    ``k ~ 1e-3 Mpc^-1`` -- so the step-size control, which measures each
+    component's error against ``atol + rtol |y|``, does not resolve them, and
+    the low multipoles of EE and TE, which those modes source, came out 10 to
+    40 percent low (TT, whose sources are unit-size, was unaffected).
+    Weighting the two components by ``clip(POLARIZATION_WEIGHT_K / k, 1,
+    POLARIZATION_WEIGHT_MAX)`` divides their tolerance by that factor. The
+    trajectories it slows are the low-``k`` ones, which take the fewest steps
+    of a launch, so a batch costs the same within 3 percent at N=128, and EE
+    agrees with CLASS to 1.2 percent at every multipole from 2 (TE to 0.4
+    percent of ``sqrt(TT EE)``). A scalar ``atol`` of 1e-8 does the same at
+    six times the cost.
+
+    ``k`` is each trajectory's wave number in launch order; the modax solves
+    take the result as ``error_weights``.
+    """
+
+    k = np.asarray(k, dtype=np.float64)
+    weights = np.ones((len(k), int(nvar)))
+    w = np.clip(POLARIZATION_WEIGHT_K / k, 1.0, POLARIZATION_WEIGHT_MAX)
+    weights[:, IX_G + 2] = w
+    weights[:, IX_POL] = w
+    return jnp.asarray(weights)
 
 _BESSEL_CACHE: BoundedCache = BoundedCache(BATCH_CACHE_SIZE)
 _CMB_GRID_CACHE: BoundedCache = BoundedCache(THERMO_TABLE_CACHE_SIZE)
@@ -268,11 +339,14 @@ def source_channels_jax(history, k_sorted, a_tab, g_tab, emk_tab, densities):
 # =============================================================================
 
 
-def _bessel_row(ell: int, n_x: int, dx: float) -> np.ndarray:
+def _bessel_row(ell: int, n_x: int, dx: float, over_x2: bool = False) -> np.ndarray:
     """Return ``j_ell`` sampled on the uniform grid ``x = 0, dx, ..., dx (n_x-1)``.
 
     ``j_ell(x)`` is exponentially small below its turning point ``x ~ ell``, so
-    the row is left at zero until ``ell - 4 ell^{1/3}``.
+    the row is left at zero until ``ell - 4 ell^{1/3}``. With ``over_x2`` the
+    row is ``j_ell(x) / x^2``, the E-mode kernel, which is smooth through
+    ``x = 0`` (``1/15`` there for ``ell = 2``, zero above) and so interpolates
+    accurately where ``j_ell`` itself, divided afterwards, would not.
     """
 
     x = np.linspace(0.0, dx * (n_x - 1), n_x)
@@ -282,13 +356,16 @@ def _bessel_row(ell: int, n_x: int, dx: float) -> np.ndarray:
     x_min = max(0.0, float(ell) - 4.0 * float(ell) ** (1.0 / 3.0))
     start = max(0, int(x_min / dx) - 1)
     values[start:] = pref[start:] * special.jv(float(ell) + 0.5, x[start:])
-    if ell == 0:
+    if over_x2:
+        values = values / x_safe**2
+        values[0] = 1.0 / 15.0 if ell == 2 else 0.0
+    elif ell == 0:
         values[0] = 1.0
     return values
 
 
 def _build_bessel_tables(ells, x_max: float, dx: float):
-    """Return cached uniform ``j_ell`` and ``j_{ell+1}`` interpolation tables."""
+    """Return cached uniform ``j_ell``, ``j_{ell+1}`` and ``j_ell / x^2`` interpolation tables."""
 
     key = (
         tuple(np.asarray(ells, dtype=np.int64)),
@@ -308,6 +385,7 @@ def _build_bessel_tables(ells, x_max: float, dx: float):
         n_x,
         jnp.asarray(np.stack([rows[int(ell)] for ell in ell_arr])),
         jnp.asarray(np.stack([rows[int(ell) + 1] for ell in ell_arr])),
+        jnp.asarray(np.stack([_bessel_row(int(ell), n_x, dx, over_x2=True) for ell in ell_arr])),
     )
     _BESSEL_CACHE[key] = result
     return result
@@ -367,6 +445,15 @@ def _lagrange_shift_stencil(tau, delta, order=SHIFT_STENCIL):
     return i0, w
 
 
+class ProjectionOperator(NamedTuple):
+    """The shared factors of the line-of-sight projection, from :func:`projection_operator`."""
+
+    interp: jax.Array
+    bessel: jax.Array
+    bessel_e: jax.Array
+    lnk_weights: jax.Array
+
+
 def projection_operator(ells, k_values, k_fine, tau_save, tau0_ref, dtype=jnp.float32):
     """Return the shared factors of the line-of-sight projection, cached per grids.
 
@@ -379,8 +466,11 @@ def projection_operator(ells, k_values, k_fine, tau_save, tau0_ref, dtype=jnp.fl
 
         ``Theta_l(k) = sum_s sum_j A[s, k, j] bessel[k, l, s, j]``
 
-    for the three shifted, refined source channels ``A``; ``lnk_weights`` are the
-    trapezoid weights of the ``C_l`` quadrature in ``ln k``.
+    for the three shifted, refined source channels ``A``; ``bessel_e`` is the
+    ``(n_k_fine, n_ell, n_chi)`` table of the E-mode kernel
+    ``sqrt((l+2)!/(l-2)!) j_l(x) / x^2`` with the same weights, contracted
+    against the third channel alone; ``lnk_weights`` are the trapezoid weights
+    of the ``C_l`` quadrature in ``ln k``.
     """
 
     ells = np.asarray(ells, dtype=np.int64)
@@ -404,7 +494,7 @@ def projection_operator(ells, k_values, k_fine, tau_save, tau0_ref, dtype=jnp.fl
 
     chi = tau0_ref - tau_save
     x = jnp.asarray(k_fine)[:, None] * jnp.asarray(chi)[None, :]
-    x0, inv_dx, n_x, jl_tab, jl1_tab = _build_bessel_tables(
+    x0, inv_dx, n_x, jl_tab, jl1_tab, jlx2_tab = _build_bessel_tables(
         ells, float(np.max(k_fine) * np.max(chi)) + 2.0, 0.03
     )
     weights = np.zeros(len(tau_save))
@@ -419,6 +509,10 @@ def projection_operator(ells, k_values, k_fine, tau_save, tau0_ref, dtype=jnp.fl
         jldd = -2.0 * inv_x * jld + (ell * (ell + 1.0) * inv_x * inv_x - 1.0) * jl
         return jnp.stack([jl, jld, jldd]) * jnp.asarray(weights)
 
+    def row_e(i, ell):
+        prefactor = math.sqrt((ell + 2.0) * (ell + 1.0) * ell * (ell - 1.0))
+        jlx2 = _interp_uniform_table(x, x0, inv_dx, n_x, jlx2_tab[i])
+        return jlx2 * (prefactor * jnp.asarray(weights))
     # Stored as (n_k_fine, n_ell, 3, n_chi), the operand layout of the
     # contraction in :func:`theta_ell_batch`: with (n_ell, 3, n_k_fine, n_chi)
     # XLA transposes the table (gigabytes at inference grids) at every call.
@@ -426,26 +520,28 @@ def projection_operator(ells, k_values, k_fine, tau_save, tau0_ref, dtype=jnp.fl
         [jnp.transpose(rows(i, float(ell)), (1, 0, 2)).astype(dtype) for i, ell in enumerate(ells)],
         axis=1,
     )
+    bessel_e = jnp.stack([row_e(i, float(ell)).astype(dtype) for i, ell in enumerate(ells)], axis=1)
 
     lnk_weights = np.zeros(len(k_fine))
     dlnk = np.diff(np.log(k_fine))
     lnk_weights[1:] += 0.5 * dlnk
     lnk_weights[:-1] += 0.5 * dlnk
 
-    op = (interp.astype(dtype), bessel, jnp.asarray(lnk_weights))
+    op = ProjectionOperator(interp.astype(dtype), bessel, bessel_e, jnp.asarray(lnk_weights))
     _OPERATOR_CACHE[key] = op
     return op
 
 
 @jax.jit
-def theta_ell_batch(channels, tau, shift_idx, shift_w, band, interp, bessel):
-    """``Theta_l(k_fine)`` of a group of cosmologies from their source channels, as matrix products.
+def theta_ell_batch(channels, tau, shift_idx, shift_w, band, interp, bessel, bessel_e):
+    """``(Theta_l, E_l)`` at ``k_fine`` of a group of cosmologies from their source channels, as matrix products.
 
     ``channels`` is ``(n_c, 5, n_k, n_tau)`` on the shared save grid; ``shift_idx``
     and ``shift_w`` are each cosmology's stencil onto the shared ``chi`` grid
     (:func:`_lagrange_shift_stencil`); ``band`` is the ``(n_c, n_ell, n_k_fine)``
-    mask of :func:`_k_band`; ``interp`` and ``bessel`` come from
-    :func:`projection_operator`. Returns ``(n_c, n_ell, n_k_fine)`` in float64.
+    mask of :func:`_k_band`; ``interp``, ``bessel`` and ``bessel_e`` come from
+    :func:`projection_operator`. Returns the temperature and E-mode transfer
+    functions, each ``(n_c, n_ell, n_k_fine)`` in float64.
     """
 
     dtype = bessel.dtype
@@ -457,15 +553,34 @@ def theta_ell_batch(channels, tau, shift_idx, shift_w, band, interp, bessel):
     ).astype(dtype)
     refined = jnp.einsum("fk,cskt->csft", interp, shifted)  # (c, 3, k_fine, chi)
     theta = jnp.einsum("csft,flst->clf", refined, bessel)  # (c, l, k_fine)
-    return jnp.where(band, theta, 0.0).astype(jnp.float64)
+    theta_e = jnp.einsum("cft,flt->clf", refined[:, 2], bessel_e)
+    return (
+        jnp.where(band, theta, 0.0).astype(jnp.float64),
+        jnp.where(band, theta_e, 0.0).astype(jnp.float64),
+    )
 
 
 @jax.jit
-def cl_from_theta(theta, lnk_weights, n_s, A_s, k_pivot, k_fine):
-    """``C_l = 4 pi int dln k P_R(k) Theta_l(k)^2`` for ``theta`` of shape ``(n_c, n_ell, n_k_fine)``."""
+def cl_from_theta(theta, lnk_weights, n_s, A_s, k_pivot, k_fine, theta2=None):
+    """``C_l = 4 pi int dln k P_R(k) Theta_l(k) Theta2_l(k)`` for transfer functions of shape ``(n_c, n_ell, n_k_fine)``.
+
+    The auto spectrum of ``theta`` by default; the cross spectrum with ``theta2``.
+    """
 
     primordial = A_s[:, None] * (k_fine[None, :] / k_pivot) ** (n_s[:, None] - 1.0)
-    return 4.0 * jnp.pi * jnp.einsum("clf,cf,f->cl", theta**2, primordial, lnk_weights)
+    product = theta**2 if theta2 is None else theta * theta2
+    return 4.0 * jnp.pi * jnp.einsum("clf,cf,f->cl", product, primordial, lnk_weights)
+
+
+def spectra_from_theta(theta, theta_e, lnk_weights, n_s, A_s, k_pivot, k_fine) -> Spectra:
+    """The ``(tt, te, ee)`` :class:`Spectra` of the two transfer functions of :func:`theta_ell_batch`."""
+
+    args = (lnk_weights, n_s, A_s, k_pivot, k_fine)
+    return Spectra(
+        cl_from_theta(theta, *args),
+        cl_from_theta(theta, *args, theta2=theta_e),
+        cl_from_theta(theta_e, *args),
+    )
 
 
 def dl_power_spectrum(cl, ells, T_cmb):
@@ -476,7 +591,7 @@ def dl_power_spectrum(cl, ells, T_cmb):
 
 
 def _projection_group_size(n_cosmologies, n_k_fine, n_tau, dtype) -> int:
-    per_cosmology = 3 * n_k_fine * n_tau * jnp.dtype(dtype).itemsize * 2
+    per_cosmology = 4 * n_k_fine * n_tau * jnp.dtype(dtype).itemsize * 2
     return max(
         1, min(n_cosmologies, int(PROJECTION_BUDGET_BYTES // max(per_cosmology, 1)))
     )
@@ -788,6 +903,7 @@ def _kernel_settings(prepared, solve_kwargs) -> dict:
         rtol=solve_kwargs.get("rtol", PERTURB_RTOL),
         atol=solve_kwargs.get("atol", PERTURB_ATOL),
         max_steps=solve_kwargs.get("max_steps", PERTURB_MAX_STEPS),
+        error_weights=solve_kwargs.get("error_weights"),
         pcoeff=0.3,
         icoeff=0.4,
         trajectories_per_block=TRAJECTORIES_PER_BLOCK,
@@ -926,7 +1042,9 @@ def build_source_hook(sources):
 def _solve_with_hook(prepared, k_values, tau_save, hook, hook_size, solve_kwargs):
     """One hooked launch of the whole chunk; returns ``(hook_out, k_sorted)``.
 
-    ``hook_out`` is ``(n_k, n_cosmo, hook_size)``; no history is kept.
+    ``hook_out`` is ``(n_k, n_cosmo, hook_size)``; no history is kept. Unless
+    ``solve_kwargs`` carries ``error_weights``, the launch uses
+    :func:`polarization_error_weights`.
     """
 
     from modax.rodas5P import solve as rodas5P_solve
@@ -935,6 +1053,11 @@ def _solve_with_hook(prepared, k_values, tau_save, hook, hook_size, solve_kwargs
 
     params, y0, t_span, _, k_sorted = _pack_batch(prepared, k_values, tau_save)
     prepared.bind()
+    if solve_kwargs.get("error_weights") is None:
+        solve_kwargs = {
+            **solve_kwargs,
+            "error_weights": polarization_error_weights(params[:, IX_K], y0.shape[-1]),
+        }
     _, out = rodas5P_solve(
         prepared.ode_fn,
         y0,
@@ -968,20 +1091,23 @@ def compute_cl_power_spectrum_batch(
     lensing_potential_ells: np.ndarray | None = None,
     **solve_kwargs,
 ):
-    """Return ``(ells, C_l, D_l)`` for a batch of cosmologies, shape ``(N, n_ell)``.
+    """Return ``(ells, C_l, D_l)`` for a batch of cosmologies, each a :class:`Spectra` of ``(N, n_ell)``.
 
-    With ``lensing_potential_ells`` the lensing potential spectrum
-    ``C_l^{psi psi}`` at those multipoles (:mod:`discoeb.lensing`) is returned
-    as a fourth element, ``(N, n_ell_psi)``, from the Weyl potential the same
-    launch recorded; :func:`discoeb.lensing.lensed_tt` turns the two into the
-    lensed temperature spectrum.
+    ``C_l`` holds the unlensed scalar ``tt``, ``te`` and ``ee`` spectra
+    (dimensionless, relative to ``T_cmb``) and ``D_l = l(l+1) C_l / 2pi`` the
+    same in ``muK^2``. With ``lensing_potential_ells`` the lensing potential
+    spectrum ``C_l^{psi psi}`` at those multipoles (:mod:`discoeb.lensing`) is
+    returned as a fourth element, ``(N, n_ell_psi)``, from the Weyl potential
+    the same launch recorded; :func:`discoeb.lensing.lensed_spectra` turns the
+    two into the lensed TT, TE, EE and BB.
+
 
     One modax launch integrates the perturbation hierarchy of every wave mode of
     every cosmology, with the sources evaluated at the save times by the save
     hook; the launch returns ``5 n_save`` numbers per trajectory and no history,
     so nothing bounds the batch but the kernel's own memory. The sources are
     then refined in ``ln k`` onto the fine grid and projected by
-    :func:`theta_ell_batch` and :func:`cl_from_theta`.
+    :func:`theta_ell_batch` and :func:`spectra_from_theta`.
 
     ``grids`` fixes the wave modes, multipoles, fine ``k`` grid and save grid
     (:func:`cmb_grids`); built once from a fiducial cosmology, it makes the
@@ -1049,7 +1175,7 @@ def compute_cl_power_spectrum_batch(
     )
     del out
 
-    interp, bessel, lnk_weights = projection_operator(
+    interp, bessel, bessel_e, lnk_weights = projection_operator(
         ells, k_sorted, k_fine, tau_save, tau0_ref, projection_dtype
     )
     ells_d = jnp.asarray(ells, dtype=jnp.float64)
@@ -1080,13 +1206,13 @@ def compute_cl_power_spectrum_batch(
     # einsums back into a single whole-batch one (2.3 GB at N=128), which the
     # allocator cannot place beside the kernel's local memory and retries for
     # tens of seconds.
-    cls = []
+    groups = []
     group = _projection_group_size(
         len(cosmologies), len(k_fine), len(tau_save), projection_dtype
     )
     for g0 in range(0, len(cosmologies), group):
         g1 = min(g0 + group, len(cosmologies))
-        theta = theta_ell_batch(
+        theta, theta_e = theta_ell_batch(
             channels[g0:g1],
             tau_d,
             shift_idx[g0:g1],
@@ -1094,12 +1220,15 @@ def compute_cl_power_spectrum_batch(
             bands[g0:g1],
             interp,
             bessel,
+            bessel_e,
         )
-        cls.append(
-            cl_from_theta(theta, lnk_weights, n_s[g0:g1], A_s[g0:g1], k_pivot, k_fine_d)
+        groups.append(
+            spectra_from_theta(
+                theta, theta_e, lnk_weights, n_s[g0:g1], A_s[g0:g1], k_pivot, k_fine_d
+            )
         )
-    cl = jnp.concatenate(cls)
-    dl = dl_power_spectrum(cl, ells_d, T_cmb[:, None])
+    cl = Spectra(*(jnp.concatenate(parts) for parts in zip(*groups)))
+    dl = Spectra(*(dl_power_spectrum(c, ells_d, T_cmb[:, None]) for c in cl))
     if lensing_potential_ells is None:
         return ells, cl, dl
     from .lensing import lensing_potential_cl
@@ -1134,13 +1263,13 @@ def _lensing_operators(ells, k_sorted, tau_save, tau0_ref, dtype):
 
 
 def compute_cl_power_spectrum(cosmology, **kwargs):
-    """Return ``(ells, C_l, D_l)`` for the unlensed scalar TT spectrum of one cosmology.
+    """Return ``(ells, C_l, D_l)`` of one cosmology, each spectrum a :class:`Spectra` of ``(n_ell,)``.
 
     See :func:`compute_cl_power_spectrum_batch` for the options.
     """
 
     ells_out, cl, dl = compute_cl_power_spectrum_batch([cosmology], **kwargs)
-    return ells_out, cl[0], dl[0]
+    return ells_out, Spectra(*(c[0] for c in cl)), Spectra(*(d[0] for d in dl))
 
 
 def cl_power_spectrum_jax(
@@ -1160,7 +1289,8 @@ def cl_power_spectrum_jax(
     """``(ells, C_l, D_l)`` of one cosmology as JAX arrays, differentiable in the densities.
 
     The counterpart of :func:`discoeb.perturbations.matter_power_spectrum_jax`
-    for the unlensed TT spectrum. ``densities`` is the five-vector of
+    for the unlensed spectra (a :class:`Spectra` each, ``tt, te, ee`` of
+    shape ``(n_ell,)``). ``densities`` is the five-vector of
     :data:`~discoeb.perturbations.PHYSICAL_DENSITY_COLUMNS`, defaulting to the
     cosmology's own; differentiating with respect to it runs modax's forward
     sensitivity system alongside the state, in either of the two thread layouts
@@ -1169,7 +1299,8 @@ def cl_power_spectrum_jax(
     and again through the source algebra (:func:`source_channels_jax`), and
     both paths are differentiated. As for ``P(k)``, the thermodynamics -- here
     the visibility and ``a(tau)`` on the save grid -- and the grids are held
-    fixed, so this is the derivative at fixed ionisation history.
+    fixed, so this is the derivative at fixed ionisation history. The solve
+    uses :func:`polarization_error_weights` unless ``error_weights`` is given.
 
     A hooked modax launch cannot be differentiated (the hook's accumulator is
     outside the sensitivity rule), so unlike :func:`compute_cl_power_spectrum`
@@ -1214,13 +1345,18 @@ def cl_power_spectrum_jax(
         max_steps=solve_kwargs.get("max_steps", PERTURB_MAX_STEPS),
         one_column_per_trajectory=one_column_per_trajectory,
         sens_error_control=solve_kwargs.get("sens_error_control", False),
+        error_weights=solve_kwargs.get("error_weights")
+        if solve_kwargs.get("error_weights") is not None
+        else polarization_error_weights(
+            np.sort(np.asarray(k_values, dtype=np.float64)), prepared.layout.nvar
+        ),
     )
     a_tab, g_tab, emk_tab = _source_tables(prepared, tau_save)
     channels = source_channels_jax(
         history, k_sorted, a_tab[0], g_tab[0], emk_tab[0], densities
     )
 
-    interp, bessel, lnk_weights = projection_operator(
+    interp, bessel, bessel_e, lnk_weights = projection_operator(
         ells, k_sorted, k_fine, tau_save, tau0_ref, projection_dtype
     )
     ells_d = jnp.asarray(ells, dtype=jnp.float64)
@@ -1232,7 +1368,7 @@ def cl_power_spectrum_jax(
         float(tau0_ref - tau_save[0]),
         float(tau0 - _visibility_peak(cosmology)),
     )
-    theta = theta_ell_batch(
+    theta, theta_e = theta_ell_batch(
         channels[None],
         jnp.asarray(tau_save),
         jnp.asarray(idx)[None],
@@ -1240,13 +1376,17 @@ def cl_power_spectrum_jax(
         band[None],
         interp,
         bessel,
+        bessel_e,
     )
-    cl = cl_from_theta(
+    cl = spectra_from_theta(
         theta,
+        theta_e,
         lnk_weights,
         jnp.asarray([float(cosmology.n_s)]),
         jnp.asarray([float(cosmology.A_s)]),
         float(cosmology.k_pivot),
         k_fine_d,
-    )[0]
-    return ells, cl, dl_power_spectrum(cl, ells_d, float(cosmology.T_cmb))
+    )
+    cl = Spectra(*(c[0] for c in cl))
+    dl = Spectra(*(dl_power_spectrum(c, ells_d, float(cosmology.T_cmb)) for c in cl))
+    return ells, cl, dl
