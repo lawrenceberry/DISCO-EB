@@ -965,9 +965,16 @@ def compute_cl_power_spectrum_batch(
     n_k_fine: int = 1500,
     k_fine_values: np.ndarray | None = None,
     projection_dtype=jnp.float32,
+    lensing_potential_ells: np.ndarray | None = None,
     **solve_kwargs,
 ):
     """Return ``(ells, C_l, D_l)`` for a batch of cosmologies, shape ``(N, n_ell)``.
+
+    With ``lensing_potential_ells`` the lensing potential spectrum
+    ``C_l^{psi psi}`` at those multipoles (:mod:`discoeb.lensing`) is returned
+    as a fourth element, ``(N, n_ell_psi)``, from the Weyl potential the same
+    launch recorded; :func:`discoeb.lensing.lensed_tt` turns the two into the
+    lensed temperature spectrum.
 
     One modax launch integrates the perturbation hierarchy of every wave mode of
     every cosmology, with the sources evaluated at the save times by the save
@@ -1092,7 +1099,38 @@ def compute_cl_power_spectrum_batch(
             cl_from_theta(theta, lnk_weights, n_s[g0:g1], A_s[g0:g1], k_pivot, k_fine_d)
         )
     cl = jnp.concatenate(cls)
-    return ells, cl, dl_power_spectrum(cl, ells_d, T_cmb[:, None])
+    dl = dl_power_spectrum(cl, ells_d, T_cmb[:, None])
+    if lensing_potential_ells is None:
+        return ells, cl, dl
+    from .lensing import lensing_potential_cl
+
+    ells_pp = np.asarray(lensing_potential_ells, dtype=np.int64)
+    operator, limber_weights, ells_limber = _lensing_operators(ells_pp, k_sorted, tau_save, tau0_ref, projection_dtype)
+    cl_pp = lensing_potential_cl(
+        channels[:, 3], shift_idx, shift_w, jnp.asarray(tau0_ref - tau_save), jnp.asarray(chi_star),
+        operator, limber_weights, jnp.asarray(ells_limber, dtype=jnp.float64), jnp.asarray(k_sorted), n_s, A_s, k_pivot,
+    )
+    return ells, cl, dl, cl_pp
+
+
+def _lensing_operators(ells, k_sorted, tau_save, tau0_ref, dtype):
+    """The exact-projection table and the Limber weights of :mod:`discoeb.lensing`, cached per grids.
+
+    Multipoles below :data:`discoeb.lensing.LIMBER_LMIN` are projected exactly,
+    the rest in the Limber approximation; ``ells`` must be sorted.
+    """
+
+    from .lensing import LIMBER_LMIN, lensing_potential_operator, limber_interpolation
+
+    key = ("lensing", ells.tobytes(), np.asarray(k_sorted).tobytes(), np.asarray(tau_save).tobytes(), float(tau0_ref), dtype)
+    if key not in _OPERATOR_CACHE:
+        exact, limber = ells[ells < LIMBER_LMIN], ells[ells >= LIMBER_LMIN]
+        _OPERATOR_CACHE[key] = (
+            lensing_potential_operator(exact, k_sorted, tau_save, tau0_ref, dtype),
+            limber_interpolation(limber, k_sorted, tau0_ref - np.asarray(tau_save)),
+            limber,
+        )
+    return _OPERATOR_CACHE[key]
 
 
 def compute_cl_power_spectrum(cosmology, **kwargs):
