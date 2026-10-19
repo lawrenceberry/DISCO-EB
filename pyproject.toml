@@ -14,6 +14,7 @@ dependencies = [
     # fill-reducing ordering is SuiteSparse's AMD (through cvxopt's wheel since
     # modax-solvers 0.0.3; the `sparse` extra is kept for older checkouts).
     "modax-solvers[sparse]",
+    "equinox>=0.13",
     "xprof>=2.21.6",
     "tensorflow>=2.20.0",
     "pytest>=8.4.2",

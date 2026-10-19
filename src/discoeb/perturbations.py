@@ -10,7 +10,6 @@ import jax.numpy as jnp
 import numpy as np
 
 from .background import (
-    batch_dimensions,
     dtauda,
     evolve_background,
     get_neutrino_momentum_bins,
@@ -1327,7 +1326,7 @@ def _thermo_tables_device(stacked, spline_inverse, n_grid: int):
             param={k: v for k, v in params.items() if k != "tau_reio"},
             thermo_module="RECFAST", num_thermo=n_grid,
         )
-        dtauda_values = dtauda(a_background, background)[:, 0]
+        dtauda_values = jax.vmap(dtauda, in_axes=(0, None))(a_background, background["species"])
         steps = 0.5 * (dtauda_values[1:] + dtauda_values[:-1]) * jnp.diff(a_background)
         tau_background = jnp.concatenate(
             (jnp.zeros((1,)), jnp.cumsum(steps))
@@ -1410,9 +1409,7 @@ def _solve_thermal_histories(stacked, n_grid: int):
     """The RECFAST solve of ``evolve_background`` alone, one vmap lane per cosmology."""
 
     def one(params):
-        param = setup_background_evolution(
-            amin=1e-9, amax=1.01, param=batch_dimensions(dict(params))
-        )
+        param = setup_background_evolution(amin=1e-9, amax=1.01, param=dict(params))
         return evaluate_thermo(param=param, num_thermo=n_grid, rtol=1e-5, atol=1e-7)
 
     return jax.vmap(one)(stacked)

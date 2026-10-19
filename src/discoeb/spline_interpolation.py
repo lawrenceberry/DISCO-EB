@@ -408,7 +408,9 @@ class FastUniformCubicSpline1D(object):
 
     def _find_index_t(self, x_new):
         i = (x_new - self._x0_) * self._dx_inv_
-        idx = jax.lax.clamp(0, jnp.floor(i).astype(jnp.int32), self._max_idx_)
+        # The default integer type (int64 under x64, else int32), so the index
+        # matches the literal indices in the dynamic slices below.
+        idx = jnp.clip(jnp.floor(i).astype(int), 0, self._max_idx_)
         return idx, i - idx.astype(x_new.dtype)
 
     def evaluate(self, x_new: jnp.ndarray):
