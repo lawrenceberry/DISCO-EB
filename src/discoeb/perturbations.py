@@ -929,6 +929,7 @@ class _ParamCosmology(NamedTuple):
     num_massive_neutrinos: float
     mnu: float
     k_pivot: float
+    tau_reio: float = 0.0  # reionization optical depth (0: no reionization)
 
     @property
     def h(self):
@@ -948,7 +949,7 @@ class _ParamCosmology(NamedTuple):
 
     @property
     def tau_reion(self):
-        return 0.0
+        return self.tau_reio
 
     @property
     def N_eff(self):
@@ -970,6 +971,7 @@ class _ParamCosmology(NamedTuple):
             "Neff": self.Neff_massless,
             "Nmnu": self.num_massive_neutrinos,
             "mnu": self.mnu,
+            "tau_reio": self.tau_reio,
         }
 
 
@@ -988,6 +990,7 @@ _BACKGROUND_PARAM_FIELDS = {
     "Neff": "Neff_massless",
     "Nmnu": "num_massive_neutrinos",
     "mnu": "mnu",
+    "tau_reio": "tau_reio",
 }
 """Attribute behind each :meth:`_ParamCosmology.to_background_params` key.
 
@@ -1029,6 +1032,7 @@ def _as_cosmology(cosmology):
         num_massive_neutrinos=float(cosmology.get("Nmnu", 0.0)),
         mnu=float(cosmology.get("mnu", 0.0)),
         k_pivot=float(cosmology.get("k_p", 0.05)),
+        tau_reio=float(cosmology.get("tau_reio", 0.0)),
     )
 
 # Solver and grid presets for the accelerated matter-power path.
@@ -1318,8 +1322,10 @@ def _thermo_tables_device(stacked, spline_inverse, n_grid: int):
     a_background = jnp.geomspace(1.0e-9, 1.0, N_BACKGROUND_GRID)
 
     def one(params):
+        tau_reio = params["tau_reio"]
         background = evolve_background(
-            param=params, thermo_module="RECFAST", num_thermo=n_grid
+            param={k: v for k, v in params.items() if k != "tau_reio"},
+            thermo_module="RECFAST", num_thermo=n_grid,
         )
         dtauda_values = dtauda(a_background, background)[:, 0]
         steps = 0.5 * (dtauda_values[1:] + dtauda_values[:-1]) * jnp.diff(a_background)
@@ -1343,6 +1349,35 @@ def _thermo_tables_device(stacked, spline_inverse, n_grid: int):
             * params["Omegab"]
             * params["H0"] ** 2
         )
+        # Reionization (CAMB's parametrization): hydrogen and HeII reionize
+        # together in a tanh step of width delta_z = 0.5 in y = (1 + z)^1.5
+        # about z_re, HeIII at z = 3.5; z_re is set by the optical depth
+        # tau_reio = int kappa' dtau, found by bisection on the background grid.
+        f_he = params["YHe"] / (4.0 * (1.0 - params["YHe"]))  # n_He / n_H
+        xe_rec_background = xe_spline.evaluate(jnp.log(a_background))[:, 0]
+        xe_rec_background = jnp.where(a_background < a_recfast_start, xe_recfast_start, xe_rec_background)
+        dtau_background = jnp.gradient(tau_background)
+
+        def xe_reio(a, xe_rec, z_re):
+            z = 1.0 / a - 1.0
+            y, y_re = (1.0 + z) ** 1.5, (1.0 + z_re) ** 1.5
+            delta_y = 1.5 * jnp.sqrt(1.0 + z_re) * 0.5
+            step = 0.5 * (1.0 + jnp.tanh((y_re - y) / delta_y))
+            he3 = 0.5 * (1.0 + jnp.tanh((3.5 - z) / 0.5))
+            return (1.0 + f_he - xe_rec) * step + f_he * he3
+
+        def tau_of(z_re):
+            return jnp.sum(xe_reio(a_background, xe_rec_background, z_re) * akthom / a_background**2 * dtau_background)
+
+        def bisect(carry, _):
+            lo, hi = carry
+            mid = 0.5 * (lo + hi)
+            too_much = tau_of(mid) > tau_reio
+            return (jnp.where(too_much, lo, mid), jnp.where(too_much, mid, hi)), None
+
+        (lo, hi), _ = jax.lax.scan(bisect, (jnp.asarray(1.0), jnp.asarray(40.0)), None, length=40)
+        z_re = 0.5 * (lo + hi)
+        xe_vals = xe_vals + jnp.where(tau_reio > 0.0, xe_reio(a_vals, xe_vals, z_re), 0.0)
         opacity_vals = xe_vals * akthom / a_vals**2
         cs2_vals = background["cs2a_of_loga_spline"].evaluate(loga_eval)[:, 0] / a_vals
         rhonu_vals = jnp.exp(

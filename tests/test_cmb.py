@@ -5,8 +5,9 @@ CMB wave modes with the sources evaluated in-kernel by the save hook, then the
 batched line-of-sight projection and the ``C_l`` quadrature -- is run for the
 same cosmologies as ``test_matter_power_spectrum_matches_class`` (one, and a
 batch of 128 nearby flat LCDM models) and each is checked against its own
-CLASS reference, run with CLASS's own recfast and no reionization, since the
-DISCO-EB thermal history has none.
+CLASS reference, run with CLASS's own recfast and no reionization (the
+cosmologies here have ``tau_reio = 0``; ``tests/test_reionization.py`` checks
+the spectrum with reionization).
 
 One internal check backs that up: the matrix-product projection must reproduce
 the analytic transfer function of a delta-like source, ``Theta_l(k) = j_l(k

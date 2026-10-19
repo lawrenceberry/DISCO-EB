@@ -551,8 +551,8 @@ def _cmb_grid_summary(cosmology) -> dict[str, float]:
     )
     k_D = float(1.0 / np.sqrt(np.trapezoid(integrand_d, a_silk)))
 
-    # A secondary visibility bump from reionization, if the thermal history has
-    # one (it does not at present, so the fall-back below is what is used).
+    # The secondary visibility bump from reionization when tau_reio > 0; without
+    # one, the save grid's late-time weight falls back to a broad bump.
     post_rec = a_vals > 1.0 / (1.0 + Z_REION_SEARCH_MAX)
     if np.any(post_rec) and np.max(np.where(post_rec, vis, 0.0)) > 1.0e-3 * vis[peak]:
         reion_idx = int(np.argmax(np.where(post_rec, vis, 0.0)))
