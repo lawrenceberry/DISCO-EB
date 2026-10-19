@@ -373,11 +373,11 @@ def projection_operator(ells, k_values, k_fine, tau_save, tau0_ref, dtype=jnp.fl
     ``interp`` is the ``(n_k_fine, n_k)`` natural-cubic-spline matrix in ``ln k``
     (the spline applied to the identity, so it reproduces
     :class:`~discoeb.spline_interpolation.spline_interpolation` to rounding);
-    ``bessel`` is the ``(n_ell, 3, n_k_fine, n_chi)`` table of ``j_l``, ``j_l'``
+    ``bessel`` is the ``(n_k_fine, n_ell, 3, n_chi)`` table of ``j_l``, ``j_l'``
     and ``j_l''`` at ``x = k chi`` on the shared grid ``chi = tau0_ref - tau_save``
     with the trapezoid weights of the ``tau`` integral folded in, so that
 
-        ``Theta_l(k) = sum_s sum_j A[s, k, j] bessel[l, s, k, j]``
+        ``Theta_l(k) = sum_s sum_j A[s, k, j] bessel[k, l, s, j]``
 
     for the three shifted, refined source channels ``A``; ``lnk_weights`` are the
     trapezoid weights of the ``C_l`` quadrature in ``ln k``.
@@ -419,8 +419,12 @@ def projection_operator(ells, k_values, k_fine, tau_save, tau0_ref, dtype=jnp.fl
         jldd = -2.0 * inv_x * jld + (ell * (ell + 1.0) * inv_x * inv_x - 1.0) * jl
         return jnp.stack([jl, jld, jldd]) * jnp.asarray(weights)
 
-    bessel = jnp.stack([rows(i, float(ell)) for i, ell in enumerate(ells)]).astype(
-        dtype
+    # Stored as (n_k_fine, n_ell, 3, n_chi), the operand layout of the
+    # contraction in :func:`theta_ell_batch`: with (n_ell, 3, n_k_fine, n_chi)
+    # XLA transposes the table (gigabytes at inference grids) at every call.
+    bessel = jnp.stack(
+        [jnp.transpose(rows(i, float(ell)), (1, 0, 2)).astype(dtype) for i, ell in enumerate(ells)],
+        axis=1,
     )
 
     lnk_weights = np.zeros(len(k_fine))
@@ -452,7 +456,7 @@ def theta_ell_batch(channels, tau, shift_idx, shift_w, band, interp, bessel):
         for a in range(shift_w.shape[-1])
     ).astype(dtype)
     refined = jnp.einsum("fk,cskt->csft", interp, shifted)  # (c, 3, k_fine, chi)
-    theta = jnp.einsum("csft,lsft->clf", refined, bessel)  # (c, l, k_fine)
+    theta = jnp.einsum("csft,flst->clf", refined, bessel)  # (c, l, k_fine)
     return jnp.where(band, theta, 0.0).astype(jnp.float64)
 
 
