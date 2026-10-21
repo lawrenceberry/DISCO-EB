@@ -40,11 +40,7 @@ class Background(Component):
 
 
 class ColdDarkMatter(Species):
-    clxc = State()
-
-    @clxc.initial
-    def _(clxg):
-        return 0.75 * clxg
+    clxc = State(initial=lambda clxg: 0.75 * clxg)
 
     def grho(grhoc, inv_a):
         return grhoc * inv_a
@@ -54,12 +50,8 @@ class ColdDarkMatter(Species):
 
 
 class Baryons(Species):
-    clxb = State()
+    clxb = State(initial=lambda clxg: 0.75 * clxg)
     vb = State()
-
-    @clxb.initial
-    def _(clxg):
-        return 0.75 * clxg
 
     def grho(grhob, inv_a):
         return grhob * inv_a
@@ -72,12 +64,8 @@ class Baryons(Species):
 
 
 class Photons(Species):
-    clxg = State()
+    clxg = State(initial=lambda k, tau: (k * tau) ** 2 / 3.0)
     qg = State()
-
-    @clxg.initial
-    def _(k, tau):
-        return (k * tau) ** 2 / 3.0
 
     def grho(grhog, inv_a):
         return grhog * inv_a * inv_a
@@ -187,12 +175,12 @@ def stream(kv, x, inv_tau, output):
 
 class Hierarchy(Species):
     LMAX = Setting(3)
-    x = State(lambda self: self.LMAX + 1, tail_from=1)
 
-    @x.initial
-    def _(k, output):
+    def _x_initial(k, output):
         output[0] = k
         output[1] = -k
+
+    x = State(lambda self: self.LMAX + 1, tail_from=1, initial=_x_initial)
 
     def inv_tau(tau):
         return 1.0 / tau
@@ -331,16 +319,16 @@ def test_matrix_states_and_tuple_constants():
 
     class Bins(Species):
         NQ = Setting(2)
-        psi = State(lambda self: (self.NQ, 2), tail_from=1)
+
+        def _psi_initial(k, output):
+            for i in range(NQ):  # noqa: F821
+                output[i, 0] = k * weight[i]  # noqa: F821
+
+        psi = State(lambda self: (self.NQ, 2), tail_from=1, initial=_psi_initial)
 
         def __init__(self, weights, **settings):
             super().__init__(**settings)
             self.weight = tuple(weights)
-
-        @psi.initial
-        def _(k, output):
-            for i in range(NQ):  # noqa: F821
-                output[i, 0] = k * weight[i]  # noqa: F821
 
         def grho(a, psi):
             total = 0.0
@@ -472,11 +460,7 @@ def test_output_is_only_for_vector_derivatives_and_initial_conditions():
         Model([Hierarchy(), Quantity()]).build({"k": 0}, **HOST)
 
     class BadInitial(Species):
-        v = State(2)
-
-        @v.initial
-        def _(k):
-            return k
+        v = State(2, initial=lambda k: k)
 
         def d_v(k, v, output):
             output[0] = k
@@ -503,11 +487,7 @@ def test_cycles_are_reported():
         Model([Loop(), Reads()]).build({}, **HOST)
 
     class Chicken(Species):
-        c = State()
-
-        @c.initial
-        def _(c):
-            return c
+        c = State(initial=lambda c: c)
 
         def d_c(c):
             return c

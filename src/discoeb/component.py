@@ -6,12 +6,8 @@ Python functions whose **parameter names are the names of the quantities they
 depend on**::
 
     class Baryons(Species):
-        clxb = State()
+        clxb = State(initial=lambda clxg: 0.75 * clxg)
         vb = State()
-
-        @clxb.initial
-        def _(clxg):
-            return 0.75 * clxg
 
         def grhob_t(grhob, inv_a):
             return grhob * inv_a
@@ -57,8 +53,9 @@ settings. The flat state vector holds the components' states in declaration
 order, a vector ``theta`` as the elements ``theta_0, theta_1, ...``
 (``psi_0_0, psi_0_1, ...``). A state carries two more things about itself:
 
-* its *initial condition*, a function under ``@theta.initial`` whose
-  parameters are injected like a provider's, from the quantities
+* its *initial condition*, ``State(..., initial=fn)``, a function (a lambda
+  for a scalar, a ``_``-prefixed function defined just above for a vector)
+  whose parameters are injected like a provider's, from the quantities
   :meth:`Model.initial_state` is given (``k``, ``tau``, the background
   densities), from other states' initial values, and from providers that can
   be evaluated on the host (``clxg`` for ``theta[0]``). A scalar's returns the
@@ -237,22 +234,18 @@ class State:
     ``shape`` is ``()`` for a scalar, ``n`` for a vector, ``(n, m)`` for a
     matrix, or a function of the component instance returning one of those.
     ``tail_from`` marks the elements from that index on (of every row, for a
-    matrix) as a free-streaming tail of the Jacobian's sparsity pattern. The
-    decorator :meth:`initial` attaches the initial condition.
+    matrix) as a free-streaming tail of the Jacobian's sparsity pattern.
+    ``initial`` is the initial condition; see the module docstring.
     """
 
-    def __init__(self, shape=(), tail_from: int | None = None):
+    def __init__(self, shape=(), tail_from: int | None = None, initial: Callable | None = None):
         self.shape = shape
         self.tail_from = tail_from
-        self.initial_fn: Callable | None = None
+        self.initial_fn = initial
         if tail_from is not None and tail_from < 1:
             raise ValueError("tail_from must leave at least one core element for the tail to couple to")
-
-    def initial(self, fn: Callable) -> Callable:
-        """Attach the initial condition; see the module docstring."""
-
-        self.initial_fn = fn
-        return fn
+        if initial is not None and not callable(initial):
+            raise TypeError("initial must be a function of the quantities the initial condition reads")
 
     def resolve(self, component) -> tuple[int, ...]:
         spec = self.shape(component) if callable(self.shape) else self.shape

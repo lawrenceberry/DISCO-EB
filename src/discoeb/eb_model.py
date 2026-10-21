@@ -132,12 +132,7 @@ class Metric(Component):
     ``sigma = k alpha = (z + 1.5 dgq/k^2) / s2^2``.
     """
 
-    etak = State()
-
-    @etak.initial
-    def _(k, x, Rp15):
-        """``etak = k eta ~ -k`` at leading order."""
-        return -k * (1.0 - x * x / 12.0 * (-10.0 / Rp15 + 1.0))
+    etak = State(initial=lambda k, x, Rp15: -k * (1.0 - x * x / 12.0 * (-10.0 / Rp15 + 1.0)))
 
     def z(dgrho, k, s2, etak, adotoa):
         return (0.5 * dgrho / k + s2 * etak) / adotoa
@@ -156,12 +151,7 @@ class Metric(Component):
 
 
 class ColdDarkMatter(Species):
-    clxc = State()
-
-    @clxc.initial
-    def _(clxg):
-        """The adiabatic mode shares the photon density, with the 3/4 of a matter species."""
-        return 0.75 * clxg
+    clxc = State(initial=lambda clxg: 0.75 * clxg)  # the adiabatic mode: 3/4 of the photon density
 
     def grhoc(grhoc_nominal, eps, dir_grhoc):
         return grhoc_nominal + eps * dir_grhoc
@@ -183,16 +173,8 @@ class ColdDarkMatter(Species):
 class Baryons(Species):
     """Baryon continuity and Euler equations; the Thomson drag is :class:`ThomsonScattering`."""
 
-    clxb = State()
-    vb = State()
-
-    @clxb.initial
-    def _(clxg):
-        return 0.75 * clxg
-
-    @vb.initial
-    def _(qg):
-        return 0.75 * qg
+    clxb = State(initial=lambda clxg: 0.75 * clxg)
+    vb = State(initial=lambda qg: 0.75 * qg)
 
     def grhob(grhob_nominal, eps, dir_grhob):
         return grhob_nominal + eps * dir_grhob
@@ -250,14 +232,14 @@ class Photons(Species):
 
     LMAX_G = Setting(15)
     LMAX_POL = Setting(15)
-    theta = State(lambda self: self.LMAX_G + 1, tail_from=3)
-    e = State(lambda self: self.LMAX_POL - 1, tail_from=1)
 
-    @theta.initial
-    def _(x, omtau, output):
+    def _theta_initial(x, omtau, output):
         """The monopole ``delta_gamma`` and dipole ``q_gamma`` of the growing mode."""
         output[0] = x * x / 3.0 * (1.0 - omtau / 5.0)
         output[1] = x**3 / 27.0 * (1.0 - omtau / 5.0)
+
+    theta = State(lambda self: self.LMAX_G + 1, tail_from=3, initial=_theta_initial)
+    e = State(lambda self: self.LMAX_POL - 1, tail_from=1)
 
     def __init__(self, **settings):
         super().__init__(**settings)
@@ -347,15 +329,15 @@ class MasslessNeutrinos(Species):
     """Massless neutrinos ``n`` (``N_0 .. N_LMAX_NR``): collisionless free streaming."""
 
     LMAX_NR = Setting(15)
-    n = State(lambda self: self.LMAX_NR + 1, tail_from=3)
 
-    @n.initial
-    def _(x, Rv, Rp15, omtau, clxg, output):
+    def _n_initial(x, Rv, Rp15, omtau, clxg, output):
         """The growing mode's neutrino monopole, dipole, quadrupole and octupole."""
         output[0] = clxg
         output[1] = (4.0 * Rv + 23.0) / Rp15 * x**3 / 27.0
         output[2] = -4.0 / 3.0 * x * x / Rp15 * (1.0 + omtau / 4.0 * (4.0 * Rv - 5.0) / (2.0 * Rv + 15.0))
         output[3] = -4.0 / 21.0 / Rp15 * x**3
+
+    n = State(lambda self: self.LMAX_NR + 1, tail_from=3, initial=_n_initial)
 
     def __init__(self, **settings):
         super().__init__(**settings)
@@ -423,13 +405,14 @@ class MassiveNeutrinos(Species):
 
     LMAX_NU = Setting(15)
     NQMAX = Setting(3)
-    psi = State(lambda self: (self.NQMAX, self.LMAX_NU + 1), tail_from=3)
 
-    @psi.initial
-    def _(n, output):
+    def _psi_initial(n, output):
+        """Still relativistic: each bin starts as the massless hierarchy scaled by dlnf0/dlnq."""
         for i in range(NQMAX):
             for l in range(4):
                 output[i, l] = -0.25 * n[l] * dlnf0[i]
+
+    psi = State(lambda self: (self.NQMAX, self.LMAX_NU + 1), tail_from=3, initial=_psi_initial)
 
     def __init__(self, **settings):
         super().__init__(**settings)
@@ -499,12 +482,8 @@ class DarkEnergy(Species):
     The fluid starts in the adiabatic mode, ``clxq = (1 + w_0) clxc`` at rest.
     """
 
-    clxq = State()
+    clxq = State(initial=lambda w_DE_0, clxc: (1.0 + w_DE_0) * clxc)  # adiabatic, at rest
     thetaq = State()
-
-    @clxq.initial
-    def _(w_DE_0, clxc):
-        return (1.0 + w_DE_0) * clxc
 
     def grhov(grhov_nominal, eps, dir_grhov):
         return grhov_nominal + eps * dir_grhov
