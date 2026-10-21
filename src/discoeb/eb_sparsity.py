@@ -3,9 +3,9 @@
 modax's Rodas5P kernel takes a sparsity pattern and does two things with it: it
 colours the column intersection graph, so the Jacobian costs ``n_colours + 1``
 Enzyme sweeps rather than ``nvar + 1``; and it hands the pattern to
-``solvers._sparse_direct``, which orders it, factorises it symbolically and
+``modax._sparse_direct``, which orders it, factorises it symbolically and
 compiles a sparse LU and a pair of sparse triangular solves for that exact
-structure. Neither needs to know any physics -- only this module does.
+structure. Neither needs to know any physics -- only the components do.
 
 The structure is a densely coupled **core** bordered by free-streaming
 **hierarchies**:
@@ -23,6 +23,10 @@ The structure is a densely coupled **core** bordered by free-streaming
   multipole, through the quadrupole it streams out of, which is one entry in
   each direction.
 
+Each state declares which of these it is (``State(..., tail_from=3)`` in
+:mod:`discoeb.eb_model`), and :meth:`discoeb.component.Model.sparsity` assembles
+the pattern; this module keeps the layout-level entry point.
+
 Declaring the core dense makes this a **superset** of the true Jacobian, which
 is what the pattern must be: colouring a superset only costs sweeps, colouring a
 subset silently corrupts the entries where two columns of a colour group turn out
@@ -36,63 +40,10 @@ variable has degree two, and reaches the core with nothing left to fill.
 
 import numpy as np
 
+from .eb_model import perturbation_model
+
 
 def perturbation_sparsity(layout) -> np.ndarray:
     """The ``(nnz, 2)`` index array of the Jacobian's nonzeros for ``layout``."""
 
-    core, hierarchies = _blocks(layout)
-    entries = set()
-    for r in core:
-        for c in core:
-            entries.add((r, c))
-    for parent, tail in hierarchies:
-        for i, idx in enumerate(tail):
-            entries.add((idx, idx))
-            if i:
-                entries.add((idx, tail[i - 1]))
-            if i + 1 < len(tail):
-                entries.add((idx, tail[i + 1]))
-        entries.add((tail[0], parent))
-        entries.add((parent, tail[0]))
-    return np.array(sorted(entries), dtype=np.int64)
-
-
-def _blocks(layout):
-    """``(core_indices, [(parent, tail_indices), ...])`` for a layout."""
-
-    core = [layout.ix_etak, layout.ix_clxc, layout.ix_clxb, layout.ix_vb]
-    hierarchies = []
-
-    # Photon temperature: Theta_0..2 in the core, Theta_3.. streaming off the
-    # quadrupole Theta_2.
-    core += [layout.ix_g + l for l in (0, 1, 2)]
-    hierarchies.append(
-        (layout.ix_g + 2, [layout.ix_g + l for l in range(3, layout.lmaxg + 1)])
-    )
-
-    # E-mode polarization starts at l = 2, so E_2 is the core member and the
-    # tail is E_3.. -- stored from ix_pol + (l - 2).
-    core.append(layout.ix_pol)
-    hierarchies.append(
-        (layout.ix_pol, [layout.ix_pol + l - 2 for l in range(3, layout.lmaxpol + 1)])
-    )
-
-    core += [layout.ix_r + l for l in (0, 1, 2)]
-    hierarchies.append(
-        (layout.ix_r + 2, [layout.ix_r + l for l in range(3, layout.lmaxr + 1)])
-    )
-
-    if layout.enable_dark_energy:
-        core += [layout.ix_clxq, layout.ix_thetaq]
-
-    if layout.has_massive_neutrinos:
-        for q in range(layout.nqmax):
-            core += [layout.ix_psi(l, q) for l in (0, 1, 2)]
-            hierarchies.append(
-                (
-                    layout.ix_psi(2, q),
-                    [layout.ix_psi(l, q) for l in range(3, layout.lmaxnu + 1)],
-                )
-            )
-
-    return core, hierarchies
+    return perturbation_model(layout).sparsity()
