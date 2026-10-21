@@ -9,23 +9,23 @@ depend on**::
         clxb = State(initial=lambda clxg: 0.75 * clxg)
         vb = State()
 
-        def grhob_t(grhob, inv_a):
+        def grhob_t(self, grhob, inv_a):
             return grhob * inv_a
 
-        def dgrho(grhob_t, clxb):
+        def dgrho(self, grhob_t, clxb):
             return grhob_t * clxb
 
-        def d_vb(adotoa, vb, k, cs2, clxb):
+        def d_vb(self, adotoa, vb, k, cs2, clxb):
             return -adotoa * vb + k * cs2 * clxb
 
     class MasslessNeutrinos(Species):
         LMAX_NR = Setting(15)                               # DISCO_LMAX_NR overrides
         n = State(lambda self: self.LMAX_NR + 1, tail_from=3)   # N_0 .. N_LMAX_NR
 
-        def d_n(k, z, sigma, n, inv_tau, output):
+        def d_n(self, k, z, sigma, n, inv_tau, output):
             output[0] = -k * ((4.0 / 3.0) * z + n[1])
             ...
-            for l in range(3, len(n) - 1):
+            for l in range(3, self.LMAX_NR):
                 output[l] = k * (l * n[l - 1] - (l + 1) * n[l + 1]) * (1.0 / (2 * l + 1))
             ...
 
@@ -41,10 +41,8 @@ everything else is derived.
 is loaded when the class is created, from the environment variable
 ``DISCO_<NAME>`` when set (cast to the default's type), and reads as a plain
 value on the class and on its instances; the constructor takes an override as
-a keyword argument (``Photons(LMAX_G=11)``). Inside the component's providers
-every setting, and every other public numeric attribute of the instance (a
-tuple of quadrature weights the constructor derived), is available by its bare
-name as a compile-time constant.
+a keyword argument (``Photons(LMAX_G=11)``). A provider reads it as
+``self.LMAX_G``, like any other attribute of its component.
 
 **States.** ``theta = State(shape)`` declares a state variable: a scalar
 (``State()``), a vector (``State(16)``) or a matrix (``State((3, 16))``); the
@@ -68,26 +66,37 @@ order, a vector ``theta`` as the elements ``theta_0, theta_1, ...``
   :meth:`Model.sparsity` is the Jacobian pattern this implies.
 
 **Providers.** Every method of a component is a provider, named after the
-quantity it provides -- written without ``self`` and without ``@staticmethod``,
-since it is never called through the instance -- and so is a function stored
-on the instance in ``__init__``. Three kinds of name are special. ``d_<state>`` provides a
-contribution to that state's derivative: for a scalar state it returns the
-contribution; for a vector state it takes ``output``, which the framework
-hands it filled with zeros, and writes its contribution into it. A function
-named in the model's ``sums`` (for the Einstein-Boltzmann system, ``grho``,
-``dgrho`` and ``dgq``) contributes to that sum over components. Names starting
-with an underscore are the component's own business. Several components may
-write one state (the baryon Euler equation and the Thomson drag both write
-``vb``); the derivative is the sum of their contributions. A vector state
-reaches a provider as a 1-D array (a matrix as a 2-D one), so ``len()``,
-indexing and loops over multipoles are the ordinary Python ones, and a
-provider may call a plain module-level helper (``stream``), which is compiled
-for the device alongside it. Wherever a function fills an array instead of
-returning, that array is its parameter ``output``.
+quantity it provides, and so is a function stored on the instance in
+``__init__``. It is an ordinary method: ``self`` is the component, whose
+settings and other public numeric attributes (a tuple of quadrature weights
+the constructor derived) it reads as ``self.NQMAX`` or ``self.weight[i]``; the
+remaining parameters are the quantities it depends on. A method or a lambda
+that reads nothing of its component may leave ``self`` out. Three kinds of
+name are special. ``d_<state>`` provides a contribution to that state's
+derivative: for a scalar state it returns the contribution; for a vector state
+it takes ``output``, which the framework hands it filled with zeros, and
+writes its contribution into it. A function named in the model's ``sums`` (for
+the Einstein-Boltzmann system, ``grho``, ``dgrho`` and ``dgq``) contributes to
+that sum over components. Names starting with an underscore are the
+component's own business. Several components may write one state (the baryon
+Euler equation and the Thomson drag both write ``vb``); the derivative is the
+sum of their contributions. A vector state reaches a provider as a 1-D array
+(a matrix as a 2-D one), so ``len()``, indexing and loops over multipoles are
+the ordinary Python ones, and a provider may call a plain module-level helper
+(``stream``), which is compiled for the device alongside it. Wherever a
+function fills an array instead of returning, that array is its parameter
+``output``.
+
+On the device ``self`` is a named tuple of the component's constants
+(:meth:`Component.device_self`), passed to each provider by the generated
+driver as a compile-time constant, so ``self.NQMAX`` folds into the loop bound
+and ``self.weight[i]`` into the unrolled sum exactly as a literal would. On
+the host (:meth:`Model.evaluate`) it is the component itself.
 
 **Device names.** A provider that needs scratch space may use ``cuda`` and
-``float64`` imported from this module (``cuda.local.array(N, float64)`` with
-``N`` a constant); they are placeholders, replaced by the real objects when a
+``float64`` imported from this module (``cuda.local.array(16, float64)``; the
+size must be a literal, since numba types it before the optimiser folds
+``self.N``); they are placeholders, replaced by the real objects when a
 provider is compiled, or by the stand-ins a host test passes to
 :meth:`Model.build`, so a model imports nothing from CUDA and runs as plain
 Python under test.
@@ -114,7 +123,9 @@ import linecache
 import math
 import os
 import types
+from collections import namedtuple
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from typing import Generic, TypeVar
 
 import numpy as np
 
@@ -187,14 +198,18 @@ def load_setting(name: str, default):
         raise ValueError(f"{SETTINGS_PREFIX}{name}={text!r} is not a {type(default).__name__}") from e
 
 
-class Setting:
+T = TypeVar("T", bool, int, float, str)
+
+
+class Setting(Generic[T]):
     """A component setting, ``LMAX_G = Setting(15)``, loaded from ``DISCO_LMAX_G``.
 
     On the class it reads as the loaded value; on an instance, as the
-    constructor's override or the loaded value.
+    constructor's override or the loaded value. The descriptor is typed by its
+    default, so ``self.LMAX_G`` is an ``int`` to a type checker.
     """
 
-    def __init__(self, default):
+    def __init__(self, default: T):
         if not isinstance(default, (bool, int, float, str)):
             raise TypeError(f"a Setting needs a bool, int, float or str default, not {default!r}")
         self.default = default
@@ -207,7 +222,7 @@ class Setting:
         self.name = name
         self.value = load_setting(name, self.default)
 
-    def __get__(self, instance, owner=None):
+    def __get__(self, instance, owner=None) -> T:
         if instance is None:
             return self.value
         return instance.__dict__.get(self.name, self.value)
@@ -300,13 +315,27 @@ class Component:
         return found
 
     def constants(self) -> dict[str, object]:
-        """The settings and every other public numeric attribute, for the providers."""
+        """The settings and every other public numeric attribute: what ``self`` holds on the device."""
 
         found = {name: getattr(self, name) for name in self.setting_names()}
         for name, value in vars(self).items():
             if not name.startswith("_") and name not in found and _is_constant(value):
                 found[name] = value
         return found
+
+    def device_self(self):
+        """``self`` as the device sees it: a named tuple of :meth:`constants`.
+
+        numba types a named tuple's fields individually, so an ``int`` setting,
+        a ``float`` and a tuple of floats each keep their type, and a global
+        instance is a compile-time constant the optimiser folds.
+        """
+
+        constants = self.constants()
+        key = (self.label, tuple(constants))
+        if key not in _SELF_TYPES:
+            _SELF_TYPES[key] = namedtuple(self.label, constants)
+        return _SELF_TYPES[key](**constants)
 
     @property
     def label(self) -> str:
@@ -328,6 +357,7 @@ class Interaction(Component):
 
 
 _FRAMEWORK_CLASSES = (Component, Species, Interaction, object)
+_SELF_TYPES: dict[tuple, type] = {}
 
 
 # --- quantities -----------------------------------------------------------------------
@@ -369,17 +399,15 @@ class _State:
 # --- providers ------------------------------------------------------------------------
 
 
-def _positional_names(fn: Callable, label: str) -> list[str]:
+def _positional_names(fn: Callable, label: str) -> tuple[bool, list[str]]:
+    """``(takes self, the names after it)`` of a provider or initial condition."""
+
     params = list(inspect.signature(fn).parameters.values())
-    if params and params[0].name == "self":
-        raise TypeError(
-            f"{label}: a provider has no self; its parameters are the quantities it "
-            "reads, and the component's constants are available by name"
-        )
     for p in params:
         if p.kind not in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) or p.default is not p.empty:
             raise TypeError(f"{label}: functions take plain positional parameters only")
-    return [p.name for p in params]
+    takes_self = bool(params) and params[0].name == "self"
+    return takes_self, [p.name for p in params[takes_self:]]
 
 
 class _Provider:
@@ -390,7 +418,8 @@ class _Provider:
         self.owner = component.label
         self.label = f"{self.owner}.{attr}"
         self.symbol = f"{self.owner}__{attr}"
-        names = _positional_names(fn, self.label)
+        self.self_symbol = f"{self.owner}_self"
+        self.takes_self, names = _positional_names(fn, self.label)
         self.written = None
         if attr.startswith("d_"):
             state = states.get(attr[2:])
@@ -421,8 +450,7 @@ def _providers(component: Component, states: Mapping[str, _State]) -> list[_Prov
             if attr in seen or attr.startswith("_"):
                 continue
             seen.add(attr)
-            # Every non-magic method is a provider, with or without @staticmethod:
-            # it is never called through the instance, so it has no self.
+            # Every non-magic method is a provider, a staticmethod one without self.
             if isinstance(member, staticmethod):
                 found.append(_Provider(component, attr, member.__func__, states))
             elif isinstance(member, types.FunctionType):
@@ -434,38 +462,33 @@ def _providers(component: Component, states: Mapping[str, _State]) -> list[_Prov
     return found
 
 
-def _bound_function(fn: Callable, jit: Callable, names: Mapping[str, object],
-                    constants: Mapping[str, object], memo: dict) -> Callable:
+def _bound_function(fn: Callable, jit: Callable, names: Mapping[str, object], memo: dict) -> Callable:
     """``fn`` compiled by ``jit`` with its globals resolved.
 
     numba resolves a global at compile time, so the function is rebound to a
     copy of its globals in which the device-name placeholders are the real
     objects (``names``), ``math`` is whatever ``names["math"]`` says (``math``
     itself on the device, ``jax.numpy`` when a quantity is evaluated on JAX
-    arrays), the component's constants appear by name, and the plain helpers
-    it calls are bound the same way (recursively, with the device names but
-    not the constants, since a helper belongs to no component). With an
-    identity ``jit`` this is how a function runs on the host.
+    arrays), and the plain helpers it calls are bound the same way,
+    recursively. With an identity ``jit`` this is how a function runs on the
+    host.
     """
 
-    key = (fn, tuple(sorted(constants)) if constants else ())
-    if key in memo:
-        return memo[key]
+    if fn in memo:
+        return memo[fn]
     g = fn.__globals__
     rebound = dict(g)
     for name in fn.__code__.co_names:
         value = g.get(name)
-        if name in constants:
-            rebound[name] = constants[name]
-        elif isinstance(value, _Ambient):
+        if isinstance(value, _Ambient):
             rebound[name] = names[value.name]
         elif value is math:
             rebound[name] = names.get("math", math)
         elif isinstance(value, types.FunctionType) and value.__module__ != "builtins":
-            rebound[name] = _bound_function(value, jit, names, {}, memo)
+            rebound[name] = _bound_function(value, jit, names, memo)
     fn_bound = types.FunctionType(fn.__code__, rebound, fn.__name__, fn.__defaults__, fn.__closure__)
     compiled = jit(fn_bound)
-    memo[key] = compiled
+    memo[fn] = compiled
     return compiled
 
 
@@ -489,8 +512,9 @@ class _HostValues:
         self.providers, self.contributions = model._host_providers()
         self.resolving: list[str] = []
 
-    def _bind(self, fn, component):
-        return _bound_function(fn, lambda f: f, self.names, component.constants(), self.memo)
+    def _call(self, fn, component, takes_self, args):
+        bound = _bound_function(fn, lambda f: f, self.names, self.memo)
+        return bound(component, *args) if takes_self else bound(*args)
 
     def __getitem__(self, name):
         if name in self.values:
@@ -503,19 +527,18 @@ class _HostValues:
             result = np.zeros(s.shape) if s.shape else 0.0
             fn = s.declared.initial_fn
             if fn is not None:
-                params = _positional_names(fn, f"{name}.initial")
+                takes_self, params = _positional_names(fn, f"{name}.initial")
                 if s.shape and OUTPUT not in params:
                     raise TypeError(f"{name}.initial: a vector's initial condition takes {OUTPUT!r} and fills it")
                 if not s.shape and OUTPUT in params:
                     raise TypeError(f"{name}.initial: a scalar's initial condition returns the value")
                 args = [result if p == OUTPUT else self[p] for p in params]
-                if s.shape:
-                    self._bind(fn, s.component)(*args)
-                else:
-                    result = self._bind(fn, s.component)(*args)
+                filled = self._call(fn, s.component, takes_self, args)
+                if not s.shape:
+                    result = filled
         elif name in self.model.sums:
             parts = [
-                self._bind(p.fn, p.component)(*(self[d] for d in p.params))
+                self._call(p.fn, p.component, p.takes_self, [self[d] for d in p.params])
                 for p in self.contributions.get(name, ())
             ]
             if not parts:
@@ -525,7 +548,7 @@ class _HostValues:
                 result = result + part
         elif name in self.providers:
             p = self.providers[name]
-            result = self._bind(p.fn, p.component)(*(self[d] for d in p.params))
+            result = self._call(p.fn, p.component, p.takes_self, [self[d] for d in p.params])
         else:
             raise NameError(f"{name!r} is neither given nor provided by any component")
         self.resolving.pop()
@@ -591,13 +614,11 @@ class Model:
 
     # -- what the components declare about their state ------------------------------
 
-    def sparsity(self) -> np.ndarray:
-        """The ``(nnz, 2)`` index array of the Jacobian's nonzeros.
+    def blocks(self) -> tuple[list[int], list[tuple[int, list[int]]]]:
+        """``(core, tails)`` of the flat state: the core indices, and each tail with its parent.
 
-        Every element not in a tail is core and couples densely to every other
-        core element; a tail is tridiagonal and meets the core only through
-        the element it streams out of. This is a superset of the true
-        Jacobian, which is what a colouring needs.
+        Every element not in a tail is core; a tail is the run of a row from
+        its state's ``tail_from`` on, and its parent the element before it.
         """
 
         core: list[int] = []
@@ -610,6 +631,17 @@ class Model:
                 else:
                     core += row[:cut]
                     tails.append((row[cut - 1], row[cut:]))
+        return core, tails
+
+    def sparsity(self) -> np.ndarray:
+        """The ``(nnz, 2)`` index array of the Jacobian's nonzeros.
+
+        The core couples densely to itself; a tail is tridiagonal and meets the
+        core only through its parent. This is a superset of the true Jacobian,
+        which is what a colouring needs.
+        """
+
+        core, tails = self.blocks()
         entries = {(r, c) for r in core for c in core}
         for parent, tail in tails:
             for i, idx in enumerate(tail):
@@ -656,7 +688,121 @@ class Model:
                 y0[i, s.offset:s.offset + s.size] = np.ravel(values[s.name])
         return y0
 
-    # -- the right-hand side ---------------------------------------------------------
+    # -- compiled functions -----------------------------------------------------------
+
+    def _collect(self, params, base, shadow=False):
+        """Providers by quantity, contributions by sum, derivative providers by state.
+
+        A provider of a quantity in ``base`` is an error for the right-hand
+        side, whose only base quantity is the time; with ``shadow`` (a
+        :meth:`build_function` input) the given value wins and the provider is
+        left out, which is how a kernel supplies a density directly.
+        """
+
+        producers: dict[str, _Provider] = {}
+        contributions: dict[str, list[_Provider]] = {s: [] for s in self.sums}
+        derivatives: dict[str, list[_Provider]] = {s: [] for s in self.states}
+        for c in self.components:
+            for provider in _providers(c, self.states):
+                q = provider.attr
+                if provider.written is not None:
+                    derivatives[provider.written.name].append(provider)
+                elif q in self.sums:
+                    contributions[q].append(provider)
+                elif q in producers:
+                    raise ValueError(
+                        f"{provider.label} and {producers[q].label} both provide {q!r}"
+                    )
+                elif q in self.states or q in self.index:
+                    raise ValueError(f"{provider.label} provides {q!r}, which is a state variable")
+                elif q in params:
+                    raise ValueError(f"{provider.label} provides {q!r}, which is a parameter")
+                elif q in base and not shadow:
+                    raise ValueError(f"{provider.label} provides {q!r}, which is given")
+                elif q not in base:
+                    producers[q] = provider
+        return producers, contributions, derivatives
+
+    @staticmethod
+    def _order(wanted, producers, contributions, given):
+        """The quantities ``wanted`` (``(label, name)`` pairs) need, in dependency order."""
+
+        def deps_of(quantity):
+            if quantity in producers:
+                return producers[quantity].params
+            return [d for p in contributions[quantity] for d in p.params]
+
+        needed: set[str] = set()
+        stack = list(wanted)
+        while stack:
+            label, dep = stack.pop()
+            if dep in given or dep in needed:
+                continue
+            if dep not in producers and dep not in contributions:
+                raise NameError(f"{label} needs {dep!r}, which nothing provides")
+            needed.add(dep)
+            owner = producers[dep].label if dep in producers else f"sum {dep}"
+            stack.extend((owner, d) for d in deps_of(dep))
+        graph = {
+            q: [d for d in deps_of(q) if d in needed]
+            for q in itertools.chain(producers, contributions)
+            if q in needed
+        }
+        try:
+            return list(graphlib.TopologicalSorter(graph).static_order())
+        except graphlib.CycleError as e:
+            raise ValueError(f"circular dependency: {' -> '.join(e.args[1])}") from None
+
+    def _device(self, jit, cuda, float64):
+        """The compiler and the device names a build uses, or the stand-ins."""
+
+        if jit is None:
+            import sys
+
+            names = _device_names()
+            jit = names["cuda"].jit(device=True)
+            # numba's SSA pass recurses once per basic block, and the driver
+            # has a few blocks per provider call under the Python error model.
+            sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
+        elif cuda is None or float64 is None:
+            raise TypeError("a custom jit needs cuda and float64 stand-ins too")
+        else:
+            names = {"cuda": cuda, "float64": float64}
+        return jit, names
+
+    def _state_reads(self):
+        for s in self.states.values():
+            if not s.shape:
+                yield f"    {s.name} = y[{s.offset}]"
+            elif len(s.shape) == 1:
+                yield f"    {s.name} = cuda.local.array({s.shape[0]}, float64)"
+                yield f"    for i in range({s.shape[0]}):"
+                yield f"        {s.name}[i] = y[{s.offset} + i]"
+            else:
+                n, m = s.shape
+                yield f"    {s.name} = cuda.local.array(({n}, {m}), float64)"
+                yield f"    for i in range({n}):"
+                yield f"        for j in range({m}):"
+                yield f"            {s.name}[i, j] = y[{s.offset} + i * {m} + j]"
+
+    def state_values(self, y, xp=np) -> dict:
+        """The states of a flat state array ``y`` (last axis), by name.
+
+        A vector state comes back with its components as the leading axis (a
+        matrix with two), so a provider's ``theta[l]`` and ``psi[i, l]`` index
+        the component and broadcast over the rest, which is how
+        :meth:`evaluate` runs the model over a whole history on the host.
+        ``xp`` is ``numpy`` or ``jax.numpy``, whichever ``y`` is.
+        """
+
+        values = {}
+        for s in self.states.values():
+            block = y[..., s.offset:s.offset + s.size]
+            if not s.shape:
+                values[s.name] = block[..., 0]
+            else:
+                values[s.name] = xp.moveaxis(block, -1, 0).reshape(s.shape + block.shape[:-1])
+        return values
 
     def build(
         self,
@@ -677,83 +823,29 @@ class Model:
         run the model on the host.
         """
 
-        if jit is None:
-            import sys
-
-            names = _device_names()
-            jit = names["cuda"].jit(device=True)
-            # numba's SSA pass recurses once per basic block, and the driver
-            # has a few blocks per provider call under the Python error model.
-            sys.setrecursionlimit(max(sys.getrecursionlimit(), 20000))
-        elif cuda is None or float64 is None:
-            raise TypeError("a custom jit needs cuda and float64 stand-ins too")
-        else:
-            names = {"cuda": cuda, "float64": float64}
+        jit, names = self._device(jit, cuda, float64)
         if time in self.states or time in params or time in self.index:
             raise ValueError(f"the time {time!r} clashes with a state or parameter")
         for pname in params:
             if pname in self.states or pname in self.index:
                 raise ValueError(f"parameter {pname!r} clashes with a state variable")
-
-        # -- collect: providers of scalars, contributions to sums, derivatives
-        producers: dict[str, _Provider] = {}
-        contributions: dict[str, list[_Provider]] = {s: [] for s in self.sums}
-        derivatives: dict[str, list[_Provider]] = {s: [] for s in self.states}
-        for c in self.components:
-            for provider in _providers(c, self.states):
-                q = provider.attr
-                if provider.written is not None:
-                    derivatives[provider.written.name].append(provider)
-                elif q in self.sums:
-                    contributions[q].append(provider)
-                elif q in producers:
-                    raise ValueError(
-                        f"{provider.label} and {producers[q].label} both provide {q!r}"
-                    )
-                elif q in self.states or q in self.index or q in params:
-                    raise ValueError(f"{provider.label} provides {q!r}, which is a state or parameter")
-                else:
-                    producers[q] = provider
+        producers, contributions, derivatives = self._collect(params, {time})
         missing = [s for s, ps in derivatives.items() if not ps]
         if missing:
             raise ValueError(f"no component writes the derivatives of {missing}")
+        given = {time, *self.states, *params}
+        wanted = [(p.label, d) for ps in derivatives.values() for p in ps for d in p.params]
+        order = self._order(wanted, producers, contributions, given)
 
-        # -- reach: what the derivatives need, with every dependency accounted for
-        def deps_of_quantity(quantity):
-            if quantity in producers:
-                return producers[quantity].params
-            return [d for p in contributions[quantity] for d in p.params]
-
-        needed: set[str] = set()
-        stack = [(p.label, d) for ps in derivatives.values() for p in ps for d in p.params]
-        while stack:
-            label, dep = stack.pop()
-            if dep == time or dep in self.states or dep in params or dep in needed:
-                continue
-            if dep not in producers and dep not in contributions:
-                raise NameError(f"{label} needs {dep!r}, which nothing provides")
-            needed.add(dep)
-            owner = producers[dep].label if dep in producers else f"sum {dep}"
-            stack.extend((owner, d) for d in deps_of_quantity(dep))
-        graph = {
-            q: [d for d in deps_of_quantity(q) if d in needed]
-            for q in itertools.chain(producers, contributions)
-            if q in needed
-        }
-        try:
-            order = list(graphlib.TopologicalSorter(graph).static_order())
-        except graphlib.CycleError as e:
-            raise ValueError(f"circular dependency: {' -> '.join(e.args[1])}") from None
-
-        # -- compile the providers, and generate the driver
         memo: dict = {}
         namespace: dict[str, object] = {"cuda": names["cuda"], "float64": names["float64"]}
 
         def call(provider, buffer=None):
-            namespace[provider.symbol] = _bound_function(
-                provider.fn, jit, names, provider.component.constants(), memo
-            )
+            namespace[provider.symbol] = _bound_function(provider.fn, jit, names, memo)
             args = [buffer if n == OUTPUT else n for n in provider.signature]
+            if provider.takes_self:
+                namespace[provider.self_symbol] = provider.component.device_self()
+                args.insert(0, provider.self_symbol)
             return f"{provider.symbol}({', '.join(args)})"
 
         def zeros(target, shape):
@@ -779,22 +871,7 @@ class Model:
                 yield f"        for j in range({m}):"
                 yield f"            {target}[i, j] += {source}[i, j]"
 
-        lines = [f"def {name}(y, {time}, p):"]
-        lines.append("    # states")
-        for s in self.states.values():
-            if not s.shape:
-                lines.append(f"    {s.name} = y[{s.offset}]")
-            elif len(s.shape) == 1:
-                lines.append(f"    {s.name} = cuda.local.array({s.shape[0]}, float64)")
-                lines.append(f"    for i in range({s.shape[0]}):")
-                lines.append(f"        {s.name}[i] = y[{s.offset} + i]")
-            else:
-                n, m = s.shape
-                lines.append(f"    {s.name} = cuda.local.array(({n}, {m}), float64)")
-                lines.append(f"    for i in range({n}):")
-                lines.append(f"        for j in range({m}):")
-                lines.append(f"            {s.name}[i, j] = y[{s.offset} + i * {m} + j]")
-        lines.append("    # parameters")
+        lines = [f"def {name}(y, {time}, p):", "    # states", *self._state_reads(), "    # parameters"]
         for pname, column in params.items():
             lines.append(f"    {pname} = p[{int(column)}]")
         lines.append("    # quantities")
@@ -828,6 +905,68 @@ class Model:
         lines.append("    )")
         self.source = "\n".join(lines) + "\n"
         return _compile(name, self.source, namespace)
+
+    def build_function(
+        self,
+        outputs: Sequence[str],
+        *,
+        inputs: Sequence[str] = (),
+        params: Mapping[str, int] | None = None,
+        name: str = "quantities",
+        jit: Callable | None = None,
+        cuda=None,
+        float64=None,
+    ) -> Callable:
+        """Generate a device function returning the quantities ``outputs``.
+
+        ``inputs`` are the base quantities it takes as positional arguments, in
+        that order; the name ``"y"`` among them stands for the flat state, read
+        into the states as :meth:`build` does. With ``params`` the function
+        takes the parameter row ``p`` last. Everything else the outputs need is
+        provided by the components, so a kernel that needs the expansion rate
+        or the line-of-sight sources computes them from the same equations as
+        the right-hand side. Returns a scalar for one output, a tuple otherwise.
+        """
+
+        jit, names = self._device(jit, cuda, float64)
+        params = dict(params or {})
+        inputs = tuple(inputs)
+        with_state = "y" in inputs
+        given = {*inputs, *params}
+        if with_state:
+            given |= set(self.states)
+        producers, contributions, _ = self._collect(params, given, shadow=True)
+        order = self._order([(name, o) for o in outputs], producers, contributions, given)
+
+        memo: dict = {}
+        namespace: dict[str, object] = {"cuda": names["cuda"], "float64": names["float64"]}
+
+        def call(provider):
+            namespace[provider.symbol] = _bound_function(provider.fn, jit, names, memo)
+            args = list(provider.signature)
+            if provider.takes_self:
+                namespace[provider.self_symbol] = provider.component.device_self()
+                args.insert(0, provider.self_symbol)
+            return f"{provider.symbol}({', '.join(args)})"
+
+        signature = list(inputs) + (["p"] if params else [])
+        lines = [f"def {name}({', '.join(signature)}):"]
+        if with_state:
+            lines.extend(self._state_reads())
+        for pname, column in params.items():
+            lines.append(f"    {pname} = p[{int(column)}]")
+        for quantity in order:
+            if quantity in producers:
+                lines.append(f"    {quantity} = {call(producers[quantity])}")
+            else:
+                lines.append(f"    {quantity} = " + " + ".join(call(p) for p in contributions[quantity]))
+        for o in outputs:
+            if o not in given and o not in producers and o not in contributions:
+                raise NameError(f"{name}: {o!r} is neither an input nor provided")
+        lines.append("    return " + (outputs[0] if len(outputs) == 1 else "(" + ", ".join(outputs) + ")"))
+        source = "\n".join(lines) + "\n"
+        fn = _compile(name, source, namespace)
+        return jit(fn)
 
 
 def _compile(name: str, source: str, namespace: dict[str, object]) -> Callable:

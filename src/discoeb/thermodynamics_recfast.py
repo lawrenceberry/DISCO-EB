@@ -204,21 +204,28 @@ def recfast_rhs():
 
     rhonu_of = neutrino_density(list(zip(q_nodes, w_nodes)))
 
+    # The conformal Hubble rate from the species' own Friedmann sum, the same
+    # equations the perturbation kernel integrates; only the massive-neutrino
+    # density ratio is supplied, from the quadrature above.
+    from .eb_model import background_model
+
+    adotoa_of = background_model().build_function(
+        ("adotoa",),
+        inputs=("a", "rhonu", "grhog", "grhornomass", "grhoc", "grhob", "grhok",
+                "grhov", "grhor_nu", "n_mnu", "w_DE_0", "w_DE_a"),
+        name="adotoa",
+    )
+
     @cuda.jit(device=True)
     def hubble(a, p):
         """H(a) in 1/s, from the densities :func:`eb_model.setup_background_evolution` sets on the row."""
         rhonu = rhonu_of(a, p[P_AMNU])
-        w0 = p[P_W_DE_0]
-        wa = p[P_W_DE_A]
-        rho_Q = a ** (-3.0 * (1.0 + w0 + wa)) * math.exp(3.0 * (a - 1.0) * wa)
         grhom = p[P_GRHOM]
-        grho = (
-            grhom * p[P_OMEGAM] / a
-            + (p[P_GRHOG] + p[P_GRHOR] * (p[P_NEFF] + p[P_NMNU] * rhonu)) / (a * a)
-            + grhom * p[P_OMEGADE] * rho_Q * a * a
-            + grhom * p[P_OMEGAK]
-        )
-        aprimeoa = math.sqrt(grho / 3.0)  # conformal H in 1/Mpc, times 1e5 below
+        aprimeoa = adotoa_of(
+            a, rhonu, p[P_GRHOG], p[P_GRHOR] * p[P_NEFF], grhom * p[P_OMEGAM], 0.0,
+            grhom * p[P_OMEGAK], grhom * p[P_OMEGADE], p[P_GRHOR], p[P_NMNU],
+            p[P_W_DE_0], p[P_W_DE_A],
+        )  # conformal H in 1/Mpc, times 1e5 below
         return 1.0e-5 * aprimeoa / a * const_c * bigH
 
     @cuda.jit(device=True)

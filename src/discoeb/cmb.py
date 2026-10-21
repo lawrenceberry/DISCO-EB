@@ -85,19 +85,18 @@ import jax.numpy as jnp
 import numpy as np
 from scipy import integrate, special
 
+from .component import Component
+from .eb_model import perturbation_model
 from .perturbations import (
     BATCH_CACHE_SIZE,
+    PARAM_COLUMNS,
+    PHYSICAL_DENSITY_COLUMNS,
     THERMO_TABLE_CACHE_SIZE,
     BoundedCache,
     DeviceTableSlot,
-    IX_CLXB,
-    IX_CLXC,
-    IX_ETAK,
     IX_G,
     IX_K,
     IX_POL,
-    IX_R,
-    IX_VB,
     PERTURB_ATOL,
     PERTURB_FIRST_STEP,
     PERTURB_MAX_STEPS,
@@ -124,6 +123,46 @@ Z_REION_SEARCH_MAX = 30.0
 
 SOURCE_CHANNELS = 5
 """Numbers per save: ``S_noisw, S_j1, S_j2, phi, exp(-kappa)``."""
+
+SOURCE_QUANTITIES = ("s_noisw", "s_j1", "s_j2", "phi")
+"""The first four channels, as the component model provides them; the fifth is a table."""
+
+
+class LineOfSightSources(Component):
+    """The CAMB-form temperature and polarization sources, as a component.
+
+    Appended to the perturbation model, it provides the Weyl potential
+    ``phi = -(dgrho + 3 aH dgq / k + dgpi) / (2 k^2)`` from the Einstein
+    sources every species contributes to, and the three sources against
+    ``j_l``, ``j_l'`` and ``j_l''`` of the module docstring, without the ISW
+    term: ``g (monopole + 5/8 Pi)``, ``g (sigma + v_b)`` and ``15/8 g Pi``,
+    with the visibility ``g`` given and the scattering source ``Pi``
+    (``polter``) and the shear ``sigma`` from the Thomson interaction and the
+    metric. One set of equations serves the device hook and the differentiable
+    host path (:func:`source_channels_jax`), and any species the layout enables
+    enters through the sums.
+    """
+
+    def phi(self, dgrho, dgq, dgpi, adotoa, k, inv_k2):
+        return -(dgrho + 3.0 * dgq * adotoa / k + dgpi) * 0.5 * inv_k2
+
+    def monopole(self, etak, k, phi, clxg):
+        return -etak / k + 2.0 * phi + 0.25 * clxg
+
+    def s_noisw(self, g, monopole, polter):
+        return g * (monopole + 0.625 * polter)
+
+    def s_j1(self, g, sigma, vb):
+        return g * (sigma + vb)
+
+    def s_j2(self, g, polter):
+        return 1.875 * g * polter
+
+
+def source_model(layout, thermal_history=None):
+    """The perturbation model of ``layout`` with the :class:`LineOfSightSources` appended."""
+
+    return perturbation_model(layout, thermal_history, extra=[LineOfSightSources()])
 
 
 class Spectra(NamedTuple):
@@ -283,55 +322,30 @@ def assemble_sources(channels, tau):
     return jnp.stack([s_j0, s_j1, s_j2], axis=-3)
 
 
-def source_channels_jax(history, k_sorted, a_tab, g_tab, emk_tab, densities):
+def source_channels_jax(model, history, k_sorted, a_tab, g_tab, emk_tab, row):
     """The five source channels of a saved history, as JAX arithmetic.
 
-    The same algebra as the device function of
-    :func:`build_source_device_function`, evaluated on the host over a history
-    ``(n_k, n_tau, nvar)`` in ascending ``k`` so that it can be differentiated:
-    the densities enter the sources through the metric combinations and the
-    background expansion rate, and that path is part of the total derivative of
-    ``C_l`` with respect to them. ``a_tab``, ``g_tab`` and ``emk_tab`` are one
-    cosmology's rows of :func:`_source_tables`. Returns ``(5, n_k, n_tau)``.
+    The :func:`source_model`'s equations evaluated on the host over a history
+    ``(n_k, n_tau, nvar)`` in ascending ``k`` so that they can be
+    differentiated: the densities enter the sources through the metric
+    combinations and the background expansion rate, and that path is part of
+    the total derivative of ``C_l`` with respect to them. ``row`` is the
+    parameter row of :data:`~discoeb.perturbations.PARAM_COLUMNS` by name,
+    with the densities as the traced values; ``a_tab``, ``g_tab`` and
+    ``emk_tab`` are one cosmology's rows of :func:`_source_tables`. Returns
+    ``(5, n_k, n_tau)``.
     """
 
-    y = jnp.asarray(history)
-    k = jnp.asarray(k_sorted)[:, None]
-    a = jnp.asarray(a_tab)[None, :]
-    g = jnp.asarray(g_tab)[None, :]
-    emk = jnp.asarray(emk_tab)[None, :]
-    grhog, grhor, grhoc, grhob, grhov = (densities[i] for i in range(5))
-
-    etak = y[..., IX_ETAK]
-    clxc, clxb, vb = y[..., IX_CLXC], y[..., IX_CLXB], y[..., IX_VB]
-    clxg, qg, pig = y[..., IX_G], y[..., IX_G + 1], y[..., IX_G + 2]
-    e2 = y[..., IX_POL]
-    clxr, qr, pir = y[..., IX_R], y[..., IX_R + 1], y[..., IX_R + 2]
-
-    a2 = a * a
-    grhog_t = grhog / a2
-    grhor_t = grhor / a2
-    grhoc_t = grhoc / a
-    grhob_t = grhob / a
-    grhov_t = grhov * a2
-    adotoa = jnp.sqrt((grhog_t + grhor_t + grhoc_t + grhob_t + grhov_t) / 3.0)
-
-    dgrho = grhob_t * clxb + grhoc_t * clxc + grhog_t * clxg + grhor_t * clxr
-    dgq = grhob_t * vb + grhog_t * qg + grhor_t * qr
-    dgpi = grhog_t * pig + grhor_t * pir
-    k2 = k * k
-    phi = -(dgrho + 3.0 * dgq * adotoa / k + dgpi) / (2.0 * k2)
-    z = (0.5 * dgrho / k + etak) / adotoa
-    sigma = z + 1.5 * dgq / k2
-    polter = pig / 10.0 + 9.0 / 15.0 * e2
-    monopole = -etak / k + 2.0 * phi + 0.25 * clxg
-
-    s_noisw = g * (monopole + 0.625 * polter)
-    s_j1 = g * (sigma + vb)
-    s_j2 = 1.875 * g * polter
-    return jnp.stack(
-        [s_noisw, s_j1, s_j2, phi, jnp.broadcast_to(emk, phi.shape)], axis=0
+    base = dict(row)
+    base.update(model.state_values(jnp.asarray(history), xp=jnp))
+    base.update(
+        k=jnp.asarray(k_sorted)[:, None],
+        a=jnp.asarray(a_tab)[None, :],
+        g=jnp.asarray(g_tab)[None, :],
     )
+    s_noisw, s_j1, s_j2, phi = model.evaluate(*SOURCE_QUANTITIES, math=jnp, **base)
+    emk = jnp.broadcast_to(jnp.asarray(emk_tab)[None, :], phi.shape)
+    return jnp.stack([s_noisw, s_j1, s_j2, phi, emk], axis=0)
 
 
 # =============================================================================
@@ -949,10 +963,10 @@ def _source_tables(prepared, tau_save):
     )
 
 
-def build_source_device_function(a_tab, g_tab, emk_tab):
+def build_source_device_function(model, a_tab, g_tab, emk_tab):
     """Return a device function ``sources(save_idx, y, tau, p)``.
 
-    It returns ``(S_noisw, S_j1, S_j2, phi, exp(-kappa))``: the three CAMB-form
+    It returns ``(S_noisw, S_j1, S_j2, phi, exp(-kappa))``: the three
     CAMB-form sources of the module docstring *without* the ISW term, plus the
     Weyl potential and the transmission the ISW term ``2 phi' exp(-kappa)``
     is built from. ``phi'`` is deliberately not taken here: differentiating the
@@ -960,17 +974,18 @@ def build_source_device_function(a_tab, g_tab, emk_tab):
     solver's state error, since the late-time ``phi'`` is a small residual of
     large cancelling terms (at ``rtol = 1e-4`` it moves ``D_l`` at ``l = 2`` by
     10 percent); a difference of saved potentials cancels that error, so the
-    hooks difference ``phi`` across saves exactly as the host does. ``a``, ``g``
-    and ``exp(-kappa)`` come from the tables of :func:`_source_tables`, indexed
-    by the trajectory's cosmology tag and the save index; host arrays are
-    uploaded, device arrays (a :class:`DeviceTableSlot`'s buffers, refilled per
-    batch) are read in place. Flat LambdaCDM with massless neutrinos, as the
-    host sources.
+    hooks difference ``phi`` across saves exactly as the host does. The four
+    quantities are the :func:`source_model`'s, compiled by
+    :meth:`~discoeb.component.Model.build_function` from the same equations
+    as the right-hand side, with ``a`` and ``g`` read from the tables of
+    :func:`_source_tables`, indexed by the trajectory's cosmology tag and the
+    save index; host arrays are uploaded, device arrays (a
+    :class:`DeviceTableSlot`'s buffers, refilled per batch) are read in place.
     """
 
     from numba_cuda_mlir import cuda
 
-    from .perturbations import IX_COSMOLOGY, IX_K
+    from .perturbations import IX_COSMOLOGY
 
     def on_device(table):
         if cuda.is_cuda_array(table):
@@ -980,43 +995,17 @@ def build_source_device_function(a_tab, g_tab, emk_tab):
     a_dev = on_device(a_tab)
     g_dev = on_device(g_tab)
     emk_dev = on_device(emk_tab)
+    quantities = model.build_function(
+        SOURCE_QUANTITIES, inputs=("y", "tau", "a", "g"), params=PARAM_COLUMNS, name="sources"
+    )
 
     @cuda.jit(device=True)
     def sources(save_idx, y, tau, p):
         ci = int(p[IX_COSMOLOGY])
-        k = p[IX_K]
-        a = a_dev[ci, save_idx]
-        g = g_dev[ci, save_idx]
-        emk = emk_dev[ci, save_idx]
-
-        etak = y[IX_ETAK]
-        clxc, clxb, vb = y[IX_CLXC], y[IX_CLXB], y[IX_VB]
-        clxg, qg, pig = y[IX_G], y[IX_G + 1], y[IX_G + 2]
-        e2 = y[IX_POL]
-        clxr, qr, pir = y[IX_R], y[IX_R + 1], y[IX_R + 2]
-
-        a2 = a * a
-        grhog_t = p[0] / a2
-        grhor_t = p[1] / a2
-        grhoc_t = p[2] / a
-        grhob_t = p[3] / a
-        grhov_t = p[4] * a2
-        adotoa = math.sqrt((grhog_t + grhor_t + grhoc_t + grhob_t + grhov_t) / 3.0)
-
-        dgrho = grhob_t * clxb + grhoc_t * clxc + grhog_t * clxg + grhor_t * clxr
-        dgq = grhob_t * vb + grhog_t * qg + grhor_t * qr
-        dgpi = grhog_t * pig + grhor_t * pir
-        k2 = k * k
-        phi = -(dgrho + 3.0 * dgq * adotoa / k + dgpi) / (2.0 * k2)  # Weyl potential
-        z = (0.5 * dgrho / k + etak) / adotoa
-        sigma = z + 1.5 * dgq / k2
-        polter = pig / 10.0 + 9.0 / 15.0 * e2
-        monopole = -etak / k + 2.0 * phi + 0.25 * clxg
-
-        s_noisw = g * (monopole + 0.625 * polter)
-        s_j1 = g * (sigma + vb)
-        s_j2 = 1.875 * g * polter
-        return s_noisw, s_j1, s_j2, phi, emk
+        s_noisw, s_j1, s_j2, phi = quantities(
+            y, tau, a_dev[ci, save_idx], g_dev[ci, save_idx], p
+        )
+        return s_noisw, s_j1, s_j2, phi, emk_dev[ci, save_idx]
 
     return sources
 
@@ -1150,13 +1139,17 @@ def compute_cl_power_spectrum_batch(
     # side it is compiled once per batch shape, against a slot of device
     # tables that each batch's visibility is copied into before its launch.
     n_cosmo, n_save_grid = len(cosmologies), len(tau_save)
-    hook_slot = _HOOK_SLOTS.get((n_cosmo, n_save_grid))
+    hook_slot = _HOOK_SLOTS.get((prepared.layout, n_cosmo, n_save_grid))
     if hook_slot is None:
+        from .perturbations import ThermalHistory
+
+        # The sources read the same thermodynamics buffers as the right-hand side.
+        model = source_model(prepared.layout, ThermalHistory(*prepared.slot.buffers))
         hook_slot = DeviceTableSlot(
             (((n_cosmo, n_save_grid), np.float64),) * 3,
-            lambda *buffers: build_source_hook(build_source_device_function(*buffers)),
+            lambda *buffers: build_source_hook(build_source_device_function(model, *buffers)),
         )
-        _HOOK_SLOTS[(n_cosmo, n_save_grid)] = hook_slot
+        _HOOK_SLOTS[(prepared.layout, n_cosmo, n_save_grid)] = hook_slot
     hook_key = (prepared.cosmologies, tau_save.tobytes())
     if hook_slot.loaded != hook_key:
         hook_slot.load(hook_key, *_source_tables(prepared, tau_save))
@@ -1310,7 +1303,7 @@ def cl_power_spectrum_jax(
     2.6e-4 in ``D_l``, which a derivative of the spectrum cannot afford.
     """
 
-    from .perturbations import _history_jax, _prepare_solve
+    from .perturbations import _history_jax, _pack_batch, _prepare_solve
 
     cosmology = _as_cosmology(cosmology)
     prepared = _prepare_solve((cosmology,))
@@ -1352,8 +1345,14 @@ def cl_power_spectrum_jax(
         ),
     )
     a_tab, g_tab, emk_tab = _source_tables(prepared, tau_save)
+    # The parameter row by name, its densities the traced ones.
+    params = _pack_batch(prepared, k_values, tau_save)[0]
+    row = {name: float(params[0, column]) for name, column in PARAM_COLUMNS.items()}
+    for name, column in PARAM_COLUMNS.items():
+        if column in PHYSICAL_DENSITY_COLUMNS:
+            row[name] = densities[column]
     channels = source_channels_jax(
-        history, k_sorted, a_tab[0], g_tab[0], emk_tab[0], densities
+        source_model(prepared.layout), history, k_sorted, a_tab[0], g_tab[0], emk_tab[0], row
     )
 
     interp, bessel, bessel_e, lnk_weights = projection_operator(

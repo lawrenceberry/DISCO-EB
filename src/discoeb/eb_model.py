@@ -22,7 +22,8 @@ loops over multipoles, with the free-streaming tail written once in
 and ``LMAX_POL`` on :class:`Photons`, ``LMAX_NR`` on
 :class:`MasslessNeutrinos`, ``LMAX_NU`` and ``NQMAX`` on
 :class:`MassiveNeutrinos`, each overridable by ``DISCO_<NAME>`` in the
-environment or by a constructor argument. Each state also carries its
+environment or by a constructor argument, and read by the equations as
+``self.NQMAX`` like any attribute. Each state also carries its
 adiabatic initial condition (CAMB's ``initial()`` series at ``k tau << 1``,
 with the growing-mode quantities of :class:`AdiabaticMode`) and its place in
 the Jacobian's sparsity pattern (``tail_from``), so the layout, the initial
@@ -54,10 +55,11 @@ from .component import Component, Interaction, Model, Setting, Species, State
 from .spline_interpolation import FastUniformCubicSpline1D, spline_interpolation
 from .util import generalized_gauss_laguerre_weights, integrate_trapz
 
-SUMS = ("grho", "dgrho", "dgq")
-"""The quantities summed over species: the Friedmann density, and the sources
-of the Einstein constraints ``dgrho = Sum grho_i_t delta_i`` and
-``dgq = Sum grho_i_t q_i``."""
+SUMS = ("grho", "dgrho", "dgq", "dgpi")
+"""The quantities summed over species: the Friedmann density, the sources of
+the Einstein constraints ``dgrho = Sum grho_i_t delta_i`` and
+``dgq = Sum grho_i_t q_i``, and the anisotropic stress ``dgpi = Sum grho_i_t pi_i``
+the Weyl potential of the line-of-sight sources needs."""
 
 
 def _needs_octupole(**lmax):
@@ -74,22 +76,22 @@ def _needs_octupole(**lmax):
 class Background(Component):
     """Powers of the scale factor, the Friedmann equation, ``1/tau`` and ``1/k^2``."""
 
-    def a2(a):
+    def a2(self, a):
         return a * a
 
-    def inv_a(a):
+    def inv_a(self, a):
         return 1.0 / a
 
-    def inv_a2(inv_a):
+    def inv_a2(self, inv_a):
         return inv_a * inv_a
 
-    def inv_tau(tau):
+    def inv_tau(self, tau):
         return 1.0 / tau
 
-    def inv_k2(k):
+    def inv_k2(self, k):
         return 1.0 / (k * k)
 
-    def adotoa(grho):
+    def adotoa(self, grho):
         """The conformal Hubble rate ``a'/a = sqrt(grho / 3)``."""
         return math.sqrt(grho * (1.0 / 3.0))
 
@@ -104,36 +106,36 @@ class AdiabaticMode(Component):
     state is assembled; the states' ``initial`` functions read them by name.
     """
 
-    def x(k, tau):
+    def x(self, k, tau):
         return k * tau
 
-    def Rv(grhog, grhornomass):
+    def Rv(self, grhog, grhornomass):
         return grhornomass / (grhog + grhornomass)
 
-    def Rp15(Rv):
+    def Rp15(self, Rv):
         return 4.0 * Rv + 15.0
 
-    def om(grhob, grhoc, grhog, grhornomass):
+    def om(self, grhob, grhoc, grhog, grhornomass):
         return (grhob + grhoc) / math.sqrt(3.0 * (grhog + grhornomass))
 
-    def omtau(om, tau):
+    def omtau(self, om, tau):
         return om * tau
 
 
 class Curvature(Species):
     """Spatial curvature: a density ``grhok = 8 pi G rho_K a^2`` and the metric factors."""
 
-    def grho(grhok):
+    def grho(self, grhok):
         return grhok
 
-    def s2(grhok, inv_k2):
+    def s2(self, grhok, inv_k2):
         """``s2^2 = 1 - 3K/k^2 = 1 + grhok/k^2`` (1 when flat)."""
         return 1.0 + grhok * inv_k2
 
-    def inv_s2(s2):
+    def inv_s2(self, s2):
         return 1.0 / s2
 
-    def Kcurv(grhok):
+    def Kcurv(self, grhok):
         return -grhok * (1.0 / 3.0)
 
 
@@ -147,13 +149,13 @@ class Metric(Component):
 
     etak = State(initial=lambda k, x, Rp15: -k * (1.0 - x * x / 12.0 * (-10.0 / Rp15 + 1.0)))
 
-    def z(dgrho, k, s2, etak, adotoa):
+    def z(self, dgrho, k, s2, etak, adotoa):
         return (0.5 * dgrho / k + s2 * etak) / adotoa
 
-    def sigma(z, dgq, inv_k2, inv_s2):
+    def sigma(self, z, dgq, inv_k2, inv_s2):
         return (z + 1.5 * dgq * inv_k2) * inv_s2
 
-    def d_etak(dgq, Kcurv, z, inv_s2):
+    def d_etak(self, dgq, Kcurv, z, inv_s2):
         return (0.5 * dgq + Kcurv * z) * inv_s2
 
 
@@ -166,19 +168,19 @@ class Metric(Component):
 class ColdDarkMatter(Species):
     clxc = State(initial=lambda clxg: 0.75 * clxg)  # the adiabatic mode: 3/4 of the photon density
 
-    def grhoc(grhoc_nominal, eps, dir_grhoc):
+    def grhoc(self, grhoc_nominal, eps, dir_grhoc):
         return grhoc_nominal + eps * dir_grhoc
 
-    def grhoc_t(grhoc, inv_a):
+    def grhoc_t(self, grhoc, inv_a):
         return grhoc * inv_a
 
-    def grho(grhoc_t):
+    def grho(self, grhoc_t):
         return grhoc_t
 
-    def dgrho(grhoc_t, clxc):
+    def dgrho(self, grhoc_t, clxc):
         return grhoc_t * clxc
 
-    def d_clxc(z, k):
+    def d_clxc(self, z, k):
         """CDM is pressureless and at rest in synchronous gauge: ``clxc' = -k z``."""
         return -k * z
 
@@ -189,25 +191,25 @@ class Baryons(Species):
     clxb = State(initial=lambda clxg: 0.75 * clxg)
     vb = State(initial=lambda qg: 0.75 * qg)
 
-    def grhob(grhob_nominal, eps, dir_grhob):
+    def grhob(self, grhob_nominal, eps, dir_grhob):
         return grhob_nominal + eps * dir_grhob
 
-    def grhob_t(grhob, inv_a):
+    def grhob_t(self, grhob, inv_a):
         return grhob * inv_a
 
-    def grho(grhob_t):
+    def grho(self, grhob_t):
         return grhob_t
 
-    def dgrho(grhob_t, clxb):
+    def dgrho(self, grhob_t, clxb):
         return grhob_t * clxb
 
-    def dgq(grhob_t, vb):
+    def dgq(self, grhob_t, vb):
         return grhob_t * vb
 
-    def d_clxb(z, vb, k):
+    def d_clxb(self, z, vb, k):
         return -k * (z + vb)
 
-    def d_vb(adotoa, vb, k, cs2, clxb):
+    def d_vb(self, adotoa, vb, k, cs2, clxb):
         return -adotoa * vb + k * cs2 * clxb
 
 
@@ -246,7 +248,7 @@ class Photons(Species):
     LMAX_G = Setting(15)
     LMAX_POL = Setting(15)
 
-    def _theta_initial(x, omtau, output):
+    def _theta_initial(self, x, omtau, output):
         """The monopole ``delta_gamma`` and dipole ``q_gamma`` of the growing mode."""
         output[0] = x * x / 3.0 * (1.0 - omtau / 5.0)
         output[1] = x**3 / 27.0 * (1.0 - omtau / 5.0)
@@ -258,41 +260,44 @@ class Photons(Species):
         super().__init__(**settings)
         _needs_octupole(LMAX_G=self.LMAX_G, LMAX_POL=self.LMAX_POL)
 
-    def grhog(grhog_nominal, eps, dir_grhog):
+    def grhog(self, grhog_nominal, eps, dir_grhog):
         return grhog_nominal + eps * dir_grhog
 
-    def grhog_t(grhog, inv_a2):
+    def grhog_t(self, grhog, inv_a2):
         return grhog * inv_a2
 
-    def grho(grhog_t):
+    def grho(self, grhog_t):
         return grhog_t
 
-    def clxg(theta):
+    def clxg(self, theta):
         return theta[0]
 
-    def qg(theta):
+    def qg(self, theta):
         return theta[1]
 
-    def pig(theta):
+    def pig(self, theta):
         return theta[2]
 
-    def E2(e):
+    def E2(self, e):
         """The E-mode quadrupole, ``e[0]``."""
         return e[0]
 
-    def dgrho(grhog_t, clxg):
+    def dgrho(self, grhog_t, clxg):
         return grhog_t * clxg
 
-    def dgq(grhog_t, qg):
+    def dgq(self, grhog_t, qg):
         return grhog_t * qg
 
-    def d_theta(k, z, sigma, theta, inv_tau, output):
+    def dgpi(self, grhog_t, pig):
+        return grhog_t * pig
+
+    def d_theta(self, k, z, sigma, theta, inv_tau, output):
         output[0] = -k * ((4.0 / 3.0) * z + theta[1])
         output[1] = k * theta[0] * (1.0 / 3.0) - (2.0 / 3.0) * k * theta[2]
         output[2] = (2.0 / 5.0) * k * theta[1] - (3.0 / 5.0) * k * theta[3] + (8.0 / 15.0) * k * sigma
         stream(k, theta, inv_tau, output)
 
-    def d_e(k, e, inv_tau, output):
+    def d_e(self, k, e, inv_tau, output):
         lmax = len(e) + 1
         output[0] = -k * e[1] * (1.0 / 3.0)
         for l in range(3, lmax):
@@ -313,26 +318,26 @@ class ThomsonScattering(Interaction):
     start at zero, so the monopole it does not scatter is left alone.
     """
 
-    def photbar(grhog_t, grhob_t):
+    def photbar(self, grhog_t, grhob_t):
         """The photon-to-baryon density ratio ``R^-1 = rho_gamma / rho_b``."""
         return grhog_t / grhob_t
 
-    def slip(vb, qg):
+    def slip(self, vb, qg):
         return (4.0 / 3.0) * vb - qg
 
-    def polter(pig, E2):
+    def polter(self, pig, E2):
         return pig * (1.0 / 10.0) + 9.0 * E2 * (1.0 / 15.0)
 
-    def d_vb(photbar, opacity, slip):
+    def d_vb(self, photbar, opacity, slip):
         return -photbar * opacity * slip
 
-    def d_theta(opacity, slip, polter, theta, output):
+    def d_theta(self, opacity, slip, polter, theta, output):
         output[1] = opacity * slip
         output[2] = -opacity * (theta[2] - polter)
         for l in range(3, len(theta)):
             output[l] = -opacity * theta[l]
 
-    def d_e(opacity, polter, e, output):
+    def d_e(self, opacity, polter, e, output):
         output[0] = -opacity * (e[0] - polter)
         for i in range(1, len(e)):
             output[i] = -opacity * e[i]
@@ -343,7 +348,7 @@ class MasslessNeutrinos(Species):
 
     LMAX_NR = Setting(15)
 
-    def _n_initial(x, Rv, Rp15, omtau, clxg, output):
+    def _n_initial(self, x, Rv, Rp15, omtau, clxg, output):
         """The growing mode's neutrino monopole, dipole, quadrupole and octupole."""
         output[0] = clxg
         output[1] = (4.0 * Rv + 23.0) / Rp15 * x**3 / 27.0
@@ -356,22 +361,25 @@ class MasslessNeutrinos(Species):
         super().__init__(**settings)
         _needs_octupole(LMAX_NR=self.LMAX_NR)
 
-    def grhornomass(grhornomass_nominal, eps, dir_grhornomass):
+    def grhornomass(self, grhornomass_nominal, eps, dir_grhornomass):
         return grhornomass_nominal + eps * dir_grhornomass
 
-    def grhor_t(grhornomass, inv_a2):
+    def grhor_t(self, grhornomass, inv_a2):
         return grhornomass * inv_a2
 
-    def grho(grhor_t):
+    def grho(self, grhor_t):
         return grhor_t
 
-    def dgrho(grhor_t, n):
+    def dgrho(self, grhor_t, n):
         return grhor_t * n[0]
 
-    def dgq(grhor_t, n):
+    def dgq(self, grhor_t, n):
         return grhor_t * n[1]
 
-    def d_n(k, z, sigma, n, inv_tau, output):
+    def dgpi(self, grhor_t, n):
+        return grhor_t * n[2]
+
+    def d_n(self, k, z, sigma, n, inv_tau, output):
         output[0] = -k * ((4.0 / 3.0) * z + n[1])
         output[1] = k * (n[0] - 2.0 * n[2]) / 3.0
         output[2] = (2.0 / 5.0) * k * n[1] - (3.0 / 5.0) * k * n[3] + (8.0 / 15.0) * k * sigma
@@ -390,13 +398,13 @@ class MassiveNeutrinos(Species):
         psi1' = (kv / 3) (psi0 - 2 psi2)
         psi2' = (kv / 5) (2 psi1 - 3 psi3) - (2/15) k sigma dlnf0
 
-    and the free-streaming tail above. The bins' moments ``Sum w psi0 / v``
-    and ``Sum w psi1`` enter the Einstein sources; the background density
+    and the free-streaming tail above. The bins' moments ``Sum w psi0 / v``,
+    ``Sum w psi1`` and ``Sum w v psi2`` enter the Einstein sources; the background density
     ratio ``rhonu`` comes from the tables. Deep in radiation domination the
     neutrinos are still relativistic, so each bin starts as the massless
     hierarchy, ``psi_l = -(1/4) N_l dlnf0/dlnq``. The quadrature nodes and
-    weights are constants of the instance, available to the providers by
-    name. Each bin adds ``LMAX_NU + 1`` state variables; 3 bins give the
+    weights are constants of the instance, which the providers read through
+    ``self``. Each bin adds ``LMAX_NU + 1`` state variables; 3 bins give the
     default layout ``nvar = 98``, and 5 bins compile ~4x slower for no gain
     in ``P(k)`` accuracy against CLASS.
     """
@@ -404,11 +412,11 @@ class MassiveNeutrinos(Species):
     LMAX_NU = Setting(15)
     NQMAX = Setting(3)
 
-    def _psi_initial(n, output):
+    def _psi_initial(self, n, output):
         """Still relativistic: each bin starts as the massless hierarchy scaled by dlnf0/dlnq."""
-        for i in range(NQMAX):
+        for i in range(self.NQMAX):
             for l in range(4):
-                output[i, l] = -0.25 * n[l] * dlnf0[i]
+                output[i, l] = -0.25 * n[l] * self.dlnf0[i]
 
     psi = State(lambda self: (self.NQMAX, self.LMAX_NU + 1), tail_from=3, initial=_psi_initial)
 
@@ -420,30 +428,38 @@ class MassiveNeutrinos(Species):
         self.weight = tuple(float(x) for x in w)
         self.dlnf0 = tuple(float(x) for x in dlnf0)
 
-    def nu_norm(grhor_nu, n_mnu, inv_a2):
+    def nu_norm(self, grhor_nu, n_mnu, inv_a2):
         return grhor_nu * n_mnu * inv_a2
 
-    def grho(nu_norm, rhonu):
+    def grho(self, nu_norm, rhonu):
         return nu_norm * rhonu
 
-    def dgrho(nu_norm, a, amnu, psi):
+    def dgrho(self, nu_norm, a, amnu, psi):
         total = 0.0
-        for i in range(NQMAX):
-            inv_v = math.sqrt(1.0 + (a * amnu * inv_q[i]) ** 2)
-            total += weight[i] * psi[i, 0] * inv_v
+        for i in range(self.NQMAX):
+            inv_v = math.sqrt(1.0 + (a * amnu * self.inv_q[i]) ** 2)
+            total += self.weight[i] * psi[i, 0] * inv_v
         return nu_norm * total
 
-    def dgq(nu_norm, psi):
+    def dgq(self, nu_norm, psi):
         total = 0.0
-        for i in range(NQMAX):
-            total += weight[i] * psi[i, 1]
+        for i in range(self.NQMAX):
+            total += self.weight[i] * psi[i, 1]
         return nu_norm * total
 
-    def d_psi(k, z, sigma, a, amnu, psi, inv_tau, output):
-        for i in range(NQMAX):
-            inv_v = math.sqrt(1.0 + (a * amnu * inv_q[i]) ** 2)
+    def dgpi(self, nu_norm, a, amnu, psi):
+        """The shear ``Sum w v psi2``: the pressure weighting ``q/epsilon`` of a massive bin."""
+        total = 0.0
+        for i in range(self.NQMAX):
+            inv_v = math.sqrt(1.0 + (a * amnu * self.inv_q[i]) ** 2)
+            total += self.weight[i] * psi[i, 2] / inv_v
+        return nu_norm * total
+
+    def d_psi(self, k, z, sigma, a, amnu, psi, inv_tau, output):
+        for i in range(self.NQMAX):
+            inv_v = math.sqrt(1.0 + (a * amnu * self.inv_q[i]) ** 2)
             kv = k * (1.0 / inv_v)
-            dl = dlnf0[i]
+            dl = self.dlnf0[i]
             output[i, 0] = -kv * psi[i, 1] + k * z * (1.0 / 3.0) * dl
             output[i, 1] = kv * (1.0 / 3.0) * (psi[i, 0] - 2.0 * psi[i, 2])
             output[i, 2] = kv * (1.0 / 5.0) * (2.0 * psi[i, 1] - 3.0 * psi[i, 3]) - (2.0 / 15.0) * k * sigma * dl
@@ -456,13 +472,13 @@ class MassiveNeutrinos(Species):
 class CosmologicalConstant(Species):
     """A cosmological constant: density only, no perturbations."""
 
-    def grhov(grhov_nominal, eps, dir_grhov):
+    def grhov(self, grhov_nominal, eps, dir_grhov):
         return grhov_nominal + eps * dir_grhov
 
-    def grhov_t(grhov, a2):
+    def grhov_t(self, grhov, a2):
         return grhov * a2
 
-    def grho(grhov_t):
+    def grho(self, grhov_t):
         return grhov_t
 
 
@@ -483,55 +499,56 @@ class DarkEnergy(Species):
     clxq = State(initial=lambda w_DE_0, clxc: (1.0 + w_DE_0) * clxc)  # adiabatic, at rest
     thetaq = State()
 
-    def grhov(grhov_nominal, eps, dir_grhov):
+    def grhov(self, grhov_nominal, eps, dir_grhov):
         return grhov_nominal + eps * dir_grhov
 
-    def w_Q(a, w_DE_0, w_DE_a):
+    def w_Q(self, a, w_DE_0, w_DE_a):
         return w_DE_0 + w_DE_a * (1.0 - a)
 
-    def rho_Q(a, w_DE_0, w_DE_a):
+    def rho_Q(self, a, w_DE_0, w_DE_a):
         """``rho_Q(a) / rho_Q(1)`` for the CPL equation of state."""
         return a ** (-3.0 * (1.0 + w_DE_0 + w_DE_a)) * math.exp(3.0 * (a - 1.0) * w_DE_a)
 
-    def grhov_t(grhov, rho_Q, a2):
+    def grhov_t(self, grhov, rho_Q, a2):
         return grhov * rho_Q * a2
 
-    def grho(grhov_t):
+    def grho(self, grhov_t):
         return grhov_t
 
-    def dgrho(grhov_t, clxq):
+    def dgrho(self, grhov_t, clxq):
         return grhov_t * clxq
 
-    def dgq(grhov_t, w_Q, thetaq, k):
+    def dgq(self, grhov_t, w_Q, thetaq, k):
         return grhov_t * (1.0 + w_Q) * thetaq / k
 
-    def w_Q_prime(w_DE_a, adotoa, a):
+    def w_Q_prime(self, w_DE_a, adotoa, a):
         return -w_DE_a * adotoa * a
 
-    def ca2_Q(w_Q, w_Q_prime, adotoa):
+    def ca2_Q(self, w_Q, w_Q_prime, adotoa):
         return w_Q - w_Q_prime / (3.0 * (1.0 + w_Q) * adotoa)
 
-    def d_clxq(clxq, thetaq, z, k, adotoa, w_Q, cs2_DE, ca2_Q, inv_k2):
+    def d_clxq(self, clxq, thetaq, z, k, adotoa, w_Q, cs2_DE, ca2_Q, inv_k2):
         return (
             -(1.0 + w_Q) * (thetaq + k * z)
             - 3.0 * (cs2_DE - w_Q) * adotoa * clxq
             - 9.0 * (1.0 + w_Q) * (cs2_DE - ca2_Q) * adotoa**2 * inv_k2 * thetaq
         )
 
-    def d_thetaq(clxq, thetaq, k, adotoa, w_Q, cs2_DE):
+    def d_thetaq(self, clxq, thetaq, k, adotoa, w_Q, cs2_DE):
         return -(1.0 - 3.0 * cs2_DE) * adotoa * thetaq + cs2_DE / (1.0 + w_Q) * k**2 * clxq
 
 
 # --- the model ----------------------------------------------------------------------
 
 
-def perturbation_model(layout, thermal_history: Component | None = None) -> Model:
+def perturbation_model(layout, thermal_history: Component | None = None, extra=()) -> Model:
     """The components a :class:`~discoeb.perturbations.PerturbationLayout` enables.
 
     ``thermal_history`` provides ``a``, ``opacity``, ``cs2`` and ``rhonu`` as
     functions of ``tau`` (on the device, spline tables; in a test, anything);
     without it the model still gives the state layout, the initial conditions
-    and the sparsity pattern. The layout's truncations are passed to the
+    and the sparsity pattern. ``extra`` components (the line-of-sight sources
+    of :mod:`discoeb.cmb`) are appended. The layout's truncations are passed to the
     components as their settings, so a layout built from the components' own
     (environment-loaded) settings reproduces them exactly. The state order
     reproduces the layout's indices: metric, CDM, baryons, photon temperature
@@ -558,7 +575,31 @@ def perturbation_model(layout, thermal_history: Component | None = None) -> Mode
     if layout.has_massive_neutrinos:
         components.append(MassiveNeutrinos(LMAX_NU=layout.lmaxnu, NQMAX=layout.nqmax))
     components.append(ThomsonScattering())
+    components.extend(extra)
     return Model(components, sums=SUMS)
+
+
+def perturbation_sparsity(layout) -> np.ndarray:
+    """The ``(nnz, 2)`` index array of the Jacobian's nonzeros for ``layout``.
+
+    modax's Rodas5P kernel takes a sparsity pattern and does two things with
+    it: it colours the column intersection graph, so the Jacobian costs
+    ``n_colours + 1`` Enzyme sweeps rather than ``nvar + 1``; and it hands the
+    pattern to ``modax._sparse_direct``, which orders it, factorises it
+    symbolically and compiles a sparse LU and a pair of sparse triangular
+    solves for that exact structure. Neither needs to know any physics -- only
+    the states do, through ``State(..., tail_from=l)``: everything below ``l``
+    is densely coupled core (the metric, the fluids, the lowest multipoles,
+    reaching each other through the Einstein constraints), and from ``l`` on
+    each hierarchy is a tridiagonal free-streaming tail meeting the core only
+    through the multipole it streams out of. Declaring the core dense makes
+    this a superset of the true Jacobian, which is what a colouring needs: a
+    subset would silently corrupt the entries where two columns of a colour
+    group overlap. The pattern need not include fill-in; on this structure
+    minimum degree peels each tail from its truncated end and produces none.
+    """
+
+    return perturbation_model(layout).sparsity()
 
 
 def layout_state_names(layout) -> tuple[str, ...]:
@@ -847,7 +888,7 @@ def evolve_background(*, param, thermo_module="RECFAST", num_thermo: int = 256, 
     param = setup_background_evolution(amin=amin, amax=amax, param=param)
 
     if thermo_module == "RECFAST":
-        aexp, cs2, Tm, mu, xe, dxeda = evaluate_thermo(
+        aexp, cs2, Tm, _mu, xe, _dxeda = evaluate_thermo(
             param=param, num_thermo=num_thermo, rtol=rtol, atol=atol, amin=amin, amax=amax
         )
         param["aexp"] = aexp
@@ -904,18 +945,3 @@ def evolve_background(*, param, thermo_module="RECFAST", num_thermo: int = 256, 
     param["tau_maxvis"] = param["tau"][jnp.argmax(param["gvis"])]
     param["xeprime"] = xeprime
     return param
-
-
-@jax.jit
-def compute_background_quantities(aexp, param):
-    """``rhonu``, ``rho_Q`` and ``w_Q`` at ``aexp``, from the splines and the dark-energy fluid."""
-
-    a = jnp.atleast_1d(aexp)
-    rho_Q, w_Q = background_model().evaluate(
-        "rho_Q", "w_Q", math=jnp, a=a, w_DE_0=param["w_DE_0"], w_DE_a=param["w_DE_a"]
-    )
-    return {
-        "rhonu": jnp.exp(param["logrhonu_of_loga_spline"].evaluate(jnp.log(a))),
-        "rho_Q": rho_Q,
-        "w_Q": w_Q,
-    }

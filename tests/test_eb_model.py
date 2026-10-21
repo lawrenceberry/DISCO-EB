@@ -87,28 +87,28 @@ def test_the_einstein_sources_sum_over_the_enabled_species():
     model, _ = build(LAYOUTS["flat-lcdm"])
     lines = [l.strip() for l in model.source.splitlines()]
     assert (
-        "grho = Curvature__grho(grhok) + ColdDarkMatter__grho(grhoc_t) + Baryons__grho(grhob_t)"
-        " + Photons__grho(grhog_t) + MasslessNeutrinos__grho(grhor_t) + CosmologicalConstant__grho(grhov_t)"
+        "grho = Curvature__grho(Curvature_self, grhok) + ColdDarkMatter__grho(ColdDarkMatter_self, grhoc_t) + Baryons__grho(Baryons_self, grhob_t)"
+        " + Photons__grho(Photons_self, grhog_t) + MasslessNeutrinos__grho(MasslessNeutrinos_self, grhor_t) + CosmologicalConstant__grho(CosmologicalConstant_self, grhov_t)"
     ) in lines
-    assert "dgq = Baryons__dgq(grhob_t, vb) + Photons__dgq(grhog_t, qg) + MasslessNeutrinos__dgq(grhor_t, n)" in lines
+    assert "dgq = Baryons__dgq(Baryons_self, grhob_t, vb) + Photons__dgq(Photons_self, grhog_t, qg) + MasslessNeutrinos__dgq(MasslessNeutrinos_self, grhor_t, n)" in lines
     assert "rhonu" not in model.source  # the massive-neutrino table is not read
 
     model, _ = build(LAYOUTS["ragged-blocks"])
-    assert "DarkEnergy__grho(grhov_t) + MassiveNeutrinos__grho(nu_norm, rhonu)" in model.source
-    assert "DarkEnergy__dgq(grhov_t, w_Q, thetaq, k) + MassiveNeutrinos__dgq(nu_norm, psi)" in model.source
+    assert "DarkEnergy__grho(DarkEnergy_self, grhov_t) + MassiveNeutrinos__grho(MassiveNeutrinos_self, nu_norm, rhonu)" in model.source
+    assert "DarkEnergy__dgq(DarkEnergy_self, grhov_t, w_Q, thetaq, k) + MassiveNeutrinos__dgq(MassiveNeutrinos_self, nu_norm, psi)" in model.source
     assert "psi = cuda.local.array((2, 10), float64)" in model.source
-    assert "MassiveNeutrinos__d_psi(k, z, sigma, a, amnu, psi, inv_tau, c_MassiveNeutrinos__d_psi)" in model.source
+    assert "MassiveNeutrinos__d_psi(MassiveNeutrinos_self, k, z, sigma, a, amnu, psi, inv_tau, c_MassiveNeutrinos__d_psi)" in model.source
     assert "d_psi[i, j] += c_MassiveNeutrinos__d_psi[i, j]" in model.source
 
 
 def test_thomson_scattering_writes_the_photon_and_baryon_derivatives():
     model, _ = build(LAYOUTS["flat-lcdm"])
     lines = [l.strip() for l in model.source.splitlines()]
-    assert "d_vb = Baryons__d_vb(adotoa, vb, k, cs2, clxb) + ThomsonScattering__d_vb(photbar, opacity, slip)" in lines
-    assert lines.index("Photons__d_theta(k, z, sigma, theta, inv_tau, c_Photons__d_theta)") < lines.index(
-        "ThomsonScattering__d_theta(opacity, slip, polter, theta, c_ThomsonScattering__d_theta)"
+    assert "d_vb = Baryons__d_vb(Baryons_self, adotoa, vb, k, cs2, clxb) + ThomsonScattering__d_vb(ThomsonScattering_self, photbar, opacity, slip)" in lines
+    assert lines.index("Photons__d_theta(Photons_self, k, z, sigma, theta, inv_tau, c_Photons__d_theta)") < lines.index(
+        "ThomsonScattering__d_theta(ThomsonScattering_self, opacity, slip, polter, theta, c_ThomsonScattering__d_theta)"
     )
-    assert "ThomsonScattering__d_e(opacity, polter, e, c_ThomsonScattering__d_e)" in lines
+    assert "ThomsonScattering__d_e(ThomsonScattering_self, opacity, polter, e, c_ThomsonScattering__d_e)" in lines
     # Neutrinos are collisionless: one writer.
     assert sum("__d_n(" in l for l in lines) == 1
 

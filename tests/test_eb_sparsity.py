@@ -8,12 +8,12 @@ the kernel is built. Nothing here needs a GPU.
 import numpy as np
 import pytest
 
-from discoeb.eb_sparsity import perturbation_sparsity
+from discoeb.eb_model import perturbation_sparsity
 from discoeb.perturbations import PerturbationLayout
 
-sparse_direct = pytest.importorskip("solvers._sparse_direct")
-colour_sparsity = pytest.importorskip("solvers._sparsity").colour_sparsity
-normalize_sparsity = pytest.importorskip("solvers._sparsity").normalize_sparsity
+sparse_direct = pytest.importorskip("modax._sparse_direct")
+colour_sparsity = pytest.importorskip("modax._sparsity").colour_sparsity
+normalize_sparsity = pytest.importorskip("modax._sparsity").normalize_sparsity
 
 
 LAYOUTS = {
@@ -99,15 +99,15 @@ def test_the_colouring_keeps_every_entry_apart():
 
 
 def _core(layout):
-    from discoeb.eb_sparsity import _blocks
+    from discoeb.eb_model import perturbation_model
 
-    return _blocks(layout)[0]
+    return perturbation_model(layout).blocks()[0]
 
 
 def _hierarchies(layout):
-    from discoeb.eb_sparsity import _blocks
+    from discoeb.eb_model import perturbation_model
 
-    return _blocks(layout)[1]
+    return perturbation_model(layout).blocks()[1]
 
 
 def test_the_core_and_the_tails_partition_the_state():

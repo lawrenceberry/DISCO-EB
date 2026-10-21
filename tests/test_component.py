@@ -267,7 +267,7 @@ def test_settings_are_class_attributes_loaded_from_the_environment(monkeypatch):
 
 
 def test_device_names_are_replaced_when_a_provider_is_compiled():
-    """``cuda`` and ``float64`` are placeholders until then; constants appear by name."""
+    """``cuda`` and ``float64`` are placeholders until then; a local array's size is a literal."""
     with pytest.raises(RuntimeError, match="only available inside a provider"):
         cuda.local.array(3, float64)
 
@@ -275,11 +275,11 @@ def test_device_names_are_replaced_when_a_provider_is_compiled():
         N = Setting(3)
         v = State(lambda self: self.N)
 
-        def d_v(k, v, output):
-            tmp = cuda.local.array(N, float64)  # noqa: F821  (N is the component's setting)
-            for i in range(N):  # noqa: F821
+        def d_v(self, k, v, output):
+            tmp = cuda.local.array(3, float64)  # numba needs a literal size, not self.N
+            for i in range(self.N):
                 tmp[i] = k * v[i]
-            for i in range(N):  # noqa: F821
+            for i in range(self.N):
                 output[i] = -tmp[i]
 
     seen = {}
@@ -290,7 +290,7 @@ def test_device_names_are_replaced_when_a_provider_is_compiled():
 
     rhs = Model([Scratch()]).build({"k": 0}, **{**HOST, "jit": jit})
     np.testing.assert_allclose(rhs((1.0, 2.0, 3.0), 0.0, (2.0,)), (-2.0, -4.0, -6.0))
-    assert seen["d_v"]["cuda"] is HOST["cuda"] and seen["d_v"]["N"] == 3
+    assert seen["d_v"]["cuda"] is HOST["cuda"]
     # The module's own globals are untouched.
     assert Scratch.d_v.__globals__["cuda"] is cuda
 
@@ -315,14 +315,14 @@ def test_partial_writes_of_a_vector_accumulate():
 
 
 def test_matrix_states_and_tuple_constants():
-    """A component written once for all bins; its weights are a tuple constant."""
+    """A component written once for all bins; its weights are a tuple constant read through self."""
 
     class Bins(Species):
         NQ = Setting(2)
 
-        def _psi_initial(k, output):
-            for i in range(NQ):  # noqa: F821
-                output[i, 0] = k * weight[i]  # noqa: F821
+        def _psi_initial(self, k, output):
+            for i in range(self.NQ):
+                output[i, 0] = k * self.weight[i]
 
         psi = State(lambda self: (self.NQ, 2), tail_from=1, initial=_psi_initial)
 
@@ -330,15 +330,15 @@ def test_matrix_states_and_tuple_constants():
             super().__init__(**settings)
             self.weight = tuple(weights)
 
-        def grho(a, psi):
+        def grho(self, a, psi):
             total = 0.0
-            for i in range(NQ):  # noqa: F821
-                total += weight[i] * psi[i, 0] * (a * weight[i])  # noqa: F821
+            for i in range(self.NQ):
+                total += self.weight[i] * psi[i, 0] * (a * self.weight[i])
             return total
 
-        def d_psi(k, a, psi, output):
-            for i in range(NQ):  # noqa: F821
-                kv = k * a * weight[i]  # noqa: F821
+        def d_psi(self, k, a, psi, output):
+            for i in range(self.NQ):
+                kv = k * a * self.weight[i]
                 output[i, 0] = -kv * psi[i, 1]
                 output[i, 1] = kv * psi[i, 0]
 
@@ -359,6 +359,11 @@ def test_matrix_states_and_tuple_constants():
     )
     assert "psi = cuda.local.array((2, 2), float64)" in model.source
     assert "d_psi[i, j] += c_Bins__d_psi[i, j]" in model.source
+    assert "Bins__d_psi(Bins_self, k, a, psi, c_Bins__d_psi)" in model.source
+    # On the device self is a named tuple of the constants, one field per type.
+    device_self = Bins([0.5, 0.25]).device_self()
+    assert type(device_self).__name__ == "Bins" and device_self._fields == ("NQ", "weight")
+    assert device_self.NQ == 2 and device_self.weight == (0.5, 0.25)
     # Matrix initial conditions and sparsity work row by row.
     np.testing.assert_array_equal(model.initial_state([2.0]), [[1.0, 0.0, 0.5, 0.0, 0.0]])
     entries = {tuple(r) for r in model.sparsity()}
@@ -496,17 +501,40 @@ def test_cycles_are_reported():
         Model([Chicken()]).initial_state([1.0])
 
 
-def test_methods_are_providers_without_staticmethod_and_take_no_self():
-    assert Baryons.d_clxb(2.0) == -2.0  # a plain function on the class, no self
+def test_methods_are_providers_with_or_without_self_or_staticmethod():
+    """A method reads its component through self; one that reads nothing may leave it out."""
 
-    class Bad(Species):
-        x = State()
+    class Scaled(Species):
+        SCALE = Setting(2.0)
+        x = State(initial=lambda self, k: self.SCALE * k)
 
-        def d_x(self, x):
-            return x
+        def __init__(self, shift, **settings):
+            super().__init__(**settings)
+            self.shift = float(shift)
 
-    with pytest.raises(TypeError, match="a provider has no self"):
-        Model([Bad()]).build({}, **HOST)
+        def d_x(self, x, k):
+            return self.SCALE * x + self.shift * k
+
+        def k2(k):  # no self: a plain function on the class
+            return k * k
+
+        @staticmethod
+        def half(k2):
+            return 0.5 * k2
+
+    class Reads(Species):
+        w = State()
+
+        def d_w(half):
+            return half
+
+    model = Model([Scaled(0.5, SCALE=3.0), Reads()])
+    rhs = model.build({"k": 0}, **HOST)
+    assert rhs((2.0, 0.0), 1.0, (4.0,)) == (3.0 * 2.0 + 0.5 * 4.0, 8.0)
+    assert Baryons.d_clxb(2.0) == -2.0
+    np.testing.assert_array_equal(model.initial_state([4.0]), [[12.0, 0.0]])
+    assert model.evaluate("half", k=4.0) == 8.0
+    assert model.evaluate("x", k=1.5) == 4.5  # the initial condition read self too
 
 
 def test_interactions_own_no_state():

@@ -20,9 +20,9 @@ from .eb_model import (
     layout_state_names,
     neutrino_momentum_bins,
     perturbation_model,
+    perturbation_sparsity,
     setup_background_evolution,
 )
-from .eb_sparsity import perturbation_sparsity
 from .thermodynamics_recfast import evaluate_thermo
 
 
@@ -37,7 +37,7 @@ from .thermodynamics_recfast import evaluate_thermo
 # (:func:`_layout_for`). At the defaults the flat-LambdaCDM + massless-neutrino
 # layout has NVAR == 50: an 11-variable densely coupled core bordered by three
 # 13-variable free-streaming hierarchies, which is the structure
-# :mod:`discoeb.eb_sparsity` declares and the sparse direct solver exploits.
+# :func:`discoeb.eb_model.perturbation_sparsity` declares and the sparse direct solver exploits.
 LMAX_G = Photons.LMAX_G
 """Photon temperature hierarchy truncation (``Theta_0 ... Theta_LMAX_G``)."""
 
@@ -251,7 +251,7 @@ class PerturbationLayout:
         ``ix_massive_nu + q * (lmaxnu + 1) + l`` (**bin-major, multipole-minor**),
         so that each bin's free-streaming tail ``psi_3 ... psi_lmaxnu`` is
         contiguous and is one tridiagonal block of the sparsity pattern
-        (:mod:`discoeb.eb_sparsity`).
+        (:func:`discoeb.eb_model.perturbation_sparsity`).
         """
         if self.nqmax == 0:
             raise AttributeError("massive neutrinos are not enabled in this layout")
@@ -378,42 +378,6 @@ class _ParamCosmology(NamedTuple):
             "mnu": self.mnu,
             "tau_reio": self.tau_reio,
         }
-
-
-_BACKGROUND_PARAM_FIELDS = {
-    "Omegam": "Omegam",
-    "Omegab": "Omegab",
-    "w_DE_0": "w_DE_0",
-    "w_DE_a": "w_DE_a",
-    "cs2_DE": "cs2_DE",
-    "Omegak": "Omegak",
-    "A_s": "A_s",
-    "n_s": "n_s",
-    "H0": "H0",
-    "Tcmb": "T_cmb",
-    "YHe": "Y_He",
-    "Neff": "Neff_massless",
-    "Nmnu": "num_massive_neutrinos",
-    "mnu": "mnu",
-    "tau_reio": "tau_reio",
-}
-"""Attribute behind each :meth:`_ParamCosmology.to_background_params` key.
-
-What lets :func:`_build_thermo_tables_batch` stack the same parameters over
-cosmologies. :func:`_check_background_param_fields` pins the two together so the
-map cannot drift from the method."""
-
-
-def _check_background_param_fields(cosmology) -> None:
-    """Raise if :data:`_BACKGROUND_PARAM_FIELDS` has drifted from the method."""
-
-    expected = cosmology.to_background_params()
-    got = {key: getattr(cosmology, attr) for key, attr in _BACKGROUND_PARAM_FIELDS.items()}
-    if got != expected:
-        raise AssertionError(
-            "_BACKGROUND_PARAM_FIELDS is out of sync with "
-            f"to_background_params: {got} != {expected}"
-        )
 
 
 def _as_cosmology(cosmology):
@@ -545,13 +509,6 @@ def _densities(cosmology) -> dict:
         d = density_parameters(cosmology.to_background_params(), xp=np)
         cached = _DENSITY_CACHE[cosmology] = {k: float(v) for k, v in d.items()}
     return cached
-
-
-def massive_neutrino_parameters(cosmology) -> tuple[float, float, float]:
-    """Return ``(grhor_nu, N_mnu, amnu)`` for the massive-neutrino species."""
-
-    d = _densities(cosmology)
-    return d["grhor_nu"], d["n_mnu"], d["amnu"]
 
 
 def density_coefficients(cosmology) -> tuple[float, float, float, float, float]:
@@ -789,17 +746,6 @@ def _thermo_tables_device(stacked, spline_inverse, n_grid: int):
 
 
 @partial(jax.jit, static_argnames=("n_grid",))
-def _solve_backgrounds(stacked, n_grid: int):
-    """Solve ``evolve_background`` for a stack of cosmologies, one per vmap lane."""
-
-    return jax.vmap(
-        lambda params: evolve_background(
-            param=params, thermo_module="RECFAST", num_thermo=n_grid
-        )
-    )(stacked)
-
-
-@partial(jax.jit, static_argnames=("n_grid",))
 def _solve_thermal_histories(stacked, n_grid: int):
     """The RECFAST solve of ``evolve_background`` alone, one vmap lane per cosmology."""
 
@@ -808,6 +754,13 @@ def _solve_thermal_histories(stacked, n_grid: int):
         return evaluate_thermo(param=param, num_thermo=n_grid, rtol=1e-5, atol=1e-7)
 
     return jax.vmap(one)(stacked)
+
+
+def _stack_background_params(cosmologies) -> dict:
+    """The cosmologies' background parameters stacked by name, one vmap lane each."""
+
+    rows = [c.to_background_params() for c in cosmologies]
+    return {key: jnp.asarray([row[key] for row in rows], dtype=jnp.float64) for key in rows[0]}
 
 
 def thermal_history_batch(cosmologies, n_grid: int = N_THERMO_GRID) -> dict:
@@ -822,11 +775,7 @@ def thermal_history_batch(cosmologies, n_grid: int = N_THERMO_GRID) -> dict:
     """
 
     cosmologies = tuple(_as_cosmology(cosmology) for cosmology in cosmologies)
-    _check_background_param_fields(cosmologies[0])
-    stacked = {
-        key: jnp.asarray([getattr(c, attr) for c in cosmologies], dtype=jnp.float64)
-        for key, attr in _BACKGROUND_PARAM_FIELDS.items()
-    }
+    stacked = _stack_background_params(cosmologies)
     a, cs2, Tm, mu, xe, dxeda = _solve_thermal_histories(stacked, n_grid)
     return {
         "a": np.asarray(a)[0],
@@ -844,13 +793,9 @@ def _build_thermo_tables_batch(cosmologies, n_grid: int = N_THERMO_GRID):
     last cosmology so that every chunk runs the one compiled program.
     """
 
-    _check_background_param_fields(cosmologies[0])
     n = len(cosmologies)
     padded = tuple(cosmologies) + (cosmologies[-1],) * (THERMO_BATCH_CHUNK - n)
-    stacked = {
-        key: jnp.asarray([getattr(c, attr) for c in padded], dtype=jnp.float64)
-        for key, attr in _BACKGROUND_PARAM_FIELDS.items()
-    }
+    stacked = _stack_background_params(padded)
     tau_grid, values, seconds, tau0 = (
         np.asarray(x)
         for x in _thermo_tables_device(stacked, _not_a_knot_inverse(n_grid), n_grid)
@@ -861,31 +806,37 @@ def _build_thermo_tables_batch(cosmologies, n_grid: int = N_THERMO_GRID):
 
 
 def make_params(cosmology, k_values: np.ndarray, tau_end: float) -> np.ndarray:
-    """Return per-mode packed perturbation parameters for the device rhs."""
+    """Return per-mode packed perturbation parameters for the device rhs.
 
-    densities = density_coefficients(cosmology)
-    n = len(k_values)
-    rows = np.repeat(np.asarray(densities)[None, :], n, axis=0)
-    tau_start = np.full(n, TAU_START, dtype=np.float64)
-    tau_end_col = np.full(n, tau_end, dtype=np.float64)
-    cosmology_idx = np.zeros(n, dtype=np.float64)
-    save_index = np.ones(n, dtype=np.float64)
-    w_de_0 = np.full(n, cosmology.w_DE_0, dtype=np.float64)
-    w_de_a = np.full(n, cosmology.w_DE_a, dtype=np.float64)
-    cs2_de = np.full(n, cosmology.cs2_DE, dtype=np.float64)
-    grhok_col = np.full(n, _densities(cosmology)["grhok"], dtype=np.float64)
-    grhor_nu, n_mnu, amnu = massive_neutrino_parameters(cosmology)
-    grhor_nu_col = np.full(n, grhor_nu, dtype=np.float64)
-    n_mnu_col = np.full(n, n_mnu, dtype=np.float64)
-    amnu_col = np.full(n, amnu, dtype=np.float64)
-    # No sensitivity direction: eps and dir are zero, so the densities the rhs
-    # sees are exactly the five in ``rows``.
-    direction = np.zeros((n, N_PARAM - IX_EPS), dtype=np.float64)
-    return np.column_stack(
-        (rows, tau_start, tau_end_col, np.asarray(k_values, dtype=np.float64),
-         cosmology_idx, save_index, w_de_0, w_de_a, cs2_de, grhok_col,
-         grhor_nu_col, n_mnu_col, amnu_col, direction)
-    )
+    One row per wave mode, its columns named by :data:`PARAM_COLUMNS`. The
+    cosmology tag is 0 and the sensitivity direction zero: ``eps`` and ``dir``
+    are zero, so the densities the rhs sees are exactly the nominal ones.
+    """
+
+    d = _densities(cosmology)
+    k_values = np.asarray(k_values, dtype=np.float64)
+    row = {
+        "grhog_nominal": d["grhog"],
+        "grhornomass_nominal": d["grhornomass"],
+        "grhoc_nominal": d["grhoc"],
+        "grhob_nominal": d["grhob"],
+        "grhov_nominal": d["grhov"],
+        "tau_start": TAU_START,
+        "tau_end": tau_end,
+        "save_index": 1.0,
+        "w_DE_0": cosmology.w_DE_0,
+        "w_DE_a": cosmology.w_DE_a,
+        "cs2_DE": cosmology.cs2_DE,
+        "grhok": d["grhok"],
+        "grhor_nu": d["grhor_nu"],
+        "n_mnu": d["n_mnu"],
+        "amnu": d["amnu"],
+    }
+    params = np.zeros((len(k_values), N_PARAM), dtype=np.float64)
+    for name, column in PARAM_COLUMNS.items():
+        params[:, column] = row.get(name, 0.0)
+    params[:, IX_K] = k_values
+    return params
 
 
 def make_initial_states(cosmology, k_values: np.ndarray, layout) -> np.ndarray:
@@ -990,11 +941,11 @@ class ThermalHistory(Component):
         self.a, self.opacity, self.cs2, self.rhonu = a, opacity, cs2, rhonu
 
     @staticmethod
-    def log_tau(tau):
+    def log_tau(self, tau):
         return math.log(tau)
 
     @staticmethod
-    def cosmology_idx(cosmology_tag):
+    def cosmology_idx(self, cosmology_tag):
         return int(cosmology_tag)
 
 
@@ -1293,60 +1244,13 @@ def clear_prepared_solve_cache() -> None:
     _TABLE_SLOTS.clear()
 
 
-def solve_perturbation_history(
-    k_values,
-    cosmology,
-    *,
-    tau_save=None,
-    as_jax: bool = False,
-    rtol: float = PERTURB_RTOL,
-    atol: float = PERTURB_ATOL,
-    first_step: float = PERTURB_FIRST_STEP,
-    max_steps: int = PERTURB_MAX_STEPS,
-):
-    """Solve the perturbation hierarchy and return the saved state history.
-
-    Parameters
-    ----------
-    tau_save : array_like, optional
-        Strictly increasing conformal times at which to record the state. The
-        first entry must be ``TAU_START`` and the last ``tau0``. Defaults to just
-        the two endpoints, i.e. the final state only. The line-of-sight CMB
-        integration needs a dense grid through recombination instead.
-    as_jax : bool, optional
-        Return the history as a device-resident JAX array instead of copying it
-        back to host NumPy. The solver's output already lives on the GPU (the
-        numba kernel is invoked through a JAX FFI custom call), so this keeps the
-        whole downstream pipeline -- e.g. the CMB source construction and
-        line-of-sight projection -- on device with no host round-trip.
-
-    Returns
-    -------
-    (history, layout, tables)
-        ``history`` has shape ``(n_k, len(tau_save), nvar)`` in the caller's
-        original ``k`` order; ``tables`` is the ``build_thermo_tables`` tuple.
-    """
+def _launch(prepared, params, y0, t_span, *, rtol, atol, first_step, max_steps):
+    """One modax Rodas5P launch of the prepared solve over the packed trajectories."""
 
     from modax.rodas5P import solve as rodas5P_solve
 
-    prepared = _prepare_solve((cosmology,))
-    cosmology = prepared.cosmologies[0]
-    layout = prepared.layout
-    tau0 = float(prepared.tau0[0])
-
-    k_arr = np.ascontiguousarray(np.asarray(k_values, dtype=np.float64))
-    order = np.argsort(k_arr, kind="stable")
-    k_sorted = k_arr[order]
-
-    params = np.ascontiguousarray(make_params(cosmology, k_sorted, tau0))
-    y0 = np.ascontiguousarray(make_initial_states(cosmology, k_sorted, layout))
-    if tau_save is None:
-        t_span = np.asarray((TAU_START, tau0), dtype=np.float64)
-    else:
-        t_span = np.ascontiguousarray(np.asarray(tau_save, dtype=np.float64))
-
     prepared.bind()
-    sol = rodas5P_solve(
+    return rodas5P_solve(
         prepared.ode_fn,
         y0,
         t_span,
@@ -1363,24 +1267,48 @@ def solve_perturbation_history(
         tf_index=IX_TAU_END,
         max_registers=CUDA_MAX_REGISTERS,
     )
-    # The solver returns trajectories in ascending-k order; undo the sort. The
-    # inverse permutation is a host-side constant, so the reorder is a plain
-    # gather that works equally on device (JAX) or host (NumPy).
-    inv_order = np.argsort(order)
-    if as_jax:
-        import jax.numpy as jnp
 
-        return jnp.asarray(sol)[jnp.asarray(inv_order)], layout, prepared.tables[0]
 
-    hist_sorted = np.asarray(sol)  # (n_k, n_save, nvar)
-    return hist_sorted[inv_order], layout, prepared.tables[0]
+def solve_perturbation_history(
+    k_values,
+    cosmology,
+    *,
+    tau_save=None,
+    as_jax: bool = False,
+    rtol: float = PERTURB_RTOL,
+    atol: float = PERTURB_ATOL,
+    first_step: float = PERTURB_FIRST_STEP,
+    max_steps: int = PERTURB_MAX_STEPS,
+):
+    """Solve the perturbation hierarchy of one cosmology and return the saved history.
+
+    The one-cosmology case of :func:`solve_perturbation_history_batch`, with the
+    wave modes put back in the caller's order. ``tau_save`` are strictly
+    increasing conformal times at which to record the state, from
+    ``TAU_START`` to ``tau0`` (default: just the two endpoints, i.e. the final
+    state). ``as_jax`` keeps the history on the device.
+
+    Returns ``(history, layout, tables)``: ``history`` has shape
+    ``(n_k, len(tau_save), nvar)`` and ``tables`` is the ``build_thermo_tables``
+    tuple of the cosmology.
+    """
+
+    hist, k_sorted, prepared = solve_perturbation_history_batch(
+        k_values, (cosmology,), tau_save=tau_save, rtol=rtol, atol=atol,
+        first_step=first_step, max_steps=max_steps,
+    )
+    inv_order = np.argsort(np.argsort(np.asarray(k_values, dtype=np.float64), kind="stable"))
+    history = hist[:, 0][jnp.asarray(inv_order)]
+    if not as_jax:
+        history = np.asarray(history)
+    return history, prepared.layout, prepared.tables[0]
 
 
 def solve_perturbation_history_batch(
     k_values,
     cosmologies,
     *,
-    tau_save,
+    tau_save=None,
     rtol: float = PERTURB_RTOL,
     atol: float = PERTURB_ATOL,
     first_step: float = PERTURB_FIRST_STEP,
@@ -1410,35 +1338,13 @@ def solve_perturbation_history_batch(
         anyway.
     """
 
-    import jax.numpy as jnp
-
-    from modax.rodas5P import solve as rodas5P_solve
-
     prepared = _prepare_solve(tuple(cosmologies))
     layout = prepared.layout
     n_cosmo = len(prepared.cosmologies)
 
     params, y0, t_span, order, k_sorted = _pack_batch(prepared, k_values, tau_save)
     n_k = len(k_sorted)
-
-    prepared.bind()
-    sol = rodas5P_solve(
-        prepared.ode_fn,
-        y0,
-        t_span,
-        params,
-        sparsity=prepared.sparsity,
-        lu_precision="fp32",
-        rtol=rtol,
-        atol=atol,
-        first_step=first_step,
-        max_steps=max_steps,
-        pcoeff=0.3,
-        icoeff=0.4,
-        trajectories_per_block=TRAJECTORIES_PER_BLOCK,
-        tf_index=IX_TAU_END,
-        max_registers=CUDA_MAX_REGISTERS,
-    )
+    sol = _launch(prepared, params, y0, t_span, rtol=rtol, atol=atol, first_step=first_step, max_steps=max_steps)
     # Rows are packed k-major (row = k_idx * n_cosmo + cosmology_idx), so this
     # reshape is a free view -- no copy of the (potentially multi-GB) history.
     hist = jnp.asarray(sol).reshape(n_k, n_cosmo, len(t_span), layout.nvar)
@@ -1460,28 +1366,10 @@ def solve_perturbations(k_values, cosmology, **solve_kwargs):
     return hist[:, -1, :]
 
 
-def solve_matter_power_spectrum(
-    k_values,
-    cosmology,
-    **solve_kwargs,
-) -> np.ndarray:
-    """Return the linear matter power spectrum ``P(k)`` in Mpc^3 for ``cosmology``."""
+def solve_matter_power_spectrum(k_values, cosmology, **solve_kwargs) -> np.ndarray:
+    """Return the linear matter power spectrum ``P(k)`` in Mpc^3 for one cosmology."""
 
-    cosmology = _as_cosmology(cosmology)
-    k_arr = np.ascontiguousarray(np.asarray(k_values, dtype=np.float64))
-    y_final = solve_perturbations(k_arr, cosmology, **solve_kwargs)
-    densities = density_coefficients(cosmology)
-    grhoc_val, grhob_val = densities[2], densities[3]
-
-    pk = np.empty(len(k_arr), dtype=np.float64)
-    for i, k in enumerate(k_arr):
-        delta_m = total_matter_density_contrast(
-            grhoc_val, y_final[i, IX_CLXC], grhob_val, y_final[i, IX_CLXB]
-        )
-        pk[i] = matter_power_spectrum(
-            float(k), delta_m, cosmology.A_s, cosmology.n_s, cosmology.k_pivot
-        )
-    return pk
+    return solve_matter_power_spectrum_batch(k_values, (cosmology,), **solve_kwargs)[0]
 
 
 PHYSICAL_DENSITY_COLUMNS = (0, 1, 2, 3, 4)
@@ -1741,8 +1629,6 @@ def solve_matter_power_spectrum_batch(
         original cosmology and ``k`` order.
     """
 
-    from modax.rodas5P import solve as rodas5P_solve
-
     prepared = _prepare_solve(tuple(cosmologies))
     cosmologies = prepared.cosmologies
     layout = prepared.layout
@@ -1750,25 +1636,7 @@ def solve_matter_power_spectrum_batch(
 
     params, y0, t_span, order, k_sorted = _pack_batch(prepared, k_values)
     n_k = len(k_sorted)
-
-    prepared.bind()
-    sol = rodas5P_solve(
-        prepared.ode_fn,
-        y0,
-        t_span,
-        params,
-        sparsity=prepared.sparsity,
-        lu_precision="fp32",
-        rtol=rtol,
-        atol=atol,
-        first_step=first_step,
-        max_steps=max_steps,
-        pcoeff=0.3,
-        icoeff=0.4,
-        trajectories_per_block=TRAJECTORIES_PER_BLOCK,
-        tf_index=IX_TAU_END,
-        max_registers=CUDA_MAX_REGISTERS,
-    )
+    sol = _launch(prepared, params, y0, t_span, rtol=rtol, atol=atol, first_step=first_step, max_steps=max_steps)
     y_final = np.asarray(sol)[:, -1, :].reshape(n_k, n_cosmo, layout.nvar)
 
     pk_sorted = np.empty((n_cosmo, n_k), dtype=np.float64)

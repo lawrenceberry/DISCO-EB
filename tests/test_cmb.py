@@ -490,3 +490,84 @@ def test_power_spectra_derivatives(one_column_per_trajectory, benchmark):
             f"{err[s, worst]:.3g} of the derivative's scale {scale[s, 0]:.3e}"
         )
     np.testing.assert_allclose(grad, summed, rtol=1.0e-6, err_msg="grad vs summed jvp")
+
+
+# ---------------------------------------------------------------------------
+# The line-of-sight sources derived from the component model (host, no GPU)
+# ---------------------------------------------------------------------------
+
+
+def _reference_sources(layout, y, k, a, g, emk, densities):
+    """The CAMB-form sources of flat LambdaCDM with massless neutrinos, written out."""
+
+    import jax.numpy as jnp
+
+    grhog, grhor, grhoc, grhob, grhov = densities
+    k = k[:, None]
+    a, g, emk = a[None, :], g[None, :], emk[None, :]
+    etak = y[..., layout.ix_etak]
+    clxc, clxb, vb = y[..., layout.ix_clxc], y[..., layout.ix_clxb], y[..., layout.ix_vb]
+    clxg, qg, pig = y[..., layout.ix_g], y[..., layout.ix_g + 1], y[..., layout.ix_g + 2]
+    e2 = y[..., layout.ix_pol]
+    clxr, qr, pir = y[..., layout.ix_r], y[..., layout.ix_r + 1], y[..., layout.ix_r + 2]
+    a2 = a * a
+    grhog_t, grhor_t, grhoc_t, grhob_t, grhov_t = grhog / a2, grhor / a2, grhoc / a, grhob / a, grhov * a2
+    adotoa = jnp.sqrt((grhog_t + grhor_t + grhoc_t + grhob_t + grhov_t) / 3.0)
+    dgrho = grhob_t * clxb + grhoc_t * clxc + grhog_t * clxg + grhor_t * clxr
+    dgq = grhob_t * vb + grhog_t * qg + grhor_t * qr
+    dgpi = grhog_t * pig + grhor_t * pir
+    k2 = k * k
+    phi = -(dgrho + 3.0 * dgq * adotoa / k + dgpi) / (2.0 * k2)
+    z = (0.5 * dgrho / k + etak) / adotoa
+    sigma = z + 1.5 * dgq / k2
+    polter = pig / 10.0 + 9.0 / 15.0 * e2
+    monopole = -etak / k + 2.0 * phi + 0.25 * clxg
+    return jnp.stack(
+        [g * (monopole + 0.625 * polter), g * (sigma + vb), 1.875 * g * polter, phi,
+         jnp.broadcast_to(emk, phi.shape)],
+        axis=0,
+    )
+
+
+def test_sources_come_from_the_component_model():
+    """Host path and generated device function agree with the written-out flat-LCDM sources."""
+
+    import jax.numpy as jnp
+    from types import SimpleNamespace
+
+    from discoeb.cmb import build_source_device_function, source_channels_jax, source_model
+    from discoeb.perturbations import N_PARAM, PARAM_COLUMNS, PerturbationLayout, _as_cosmology, make_params
+    from test_perturbations import REFERENCE_COSMOLOGY
+
+    layout = PerturbationLayout()
+    model = source_model(layout)
+    rng = np.random.default_rng(3)
+    n_k, n_tau = 4, 5
+    y = rng.normal(size=(n_k, n_tau, layout.nvar))
+    k = np.geomspace(1e-3, 0.3, n_k)
+    a = np.geomspace(1e-3, 1e-2, n_tau)
+    g, emk = rng.uniform(0.1, 1.0, n_tau), rng.uniform(0.1, 1.0, n_tau)
+    params = make_params(_as_cosmology(REFERENCE_COSMOLOGY), k, 14000.0)
+    row = {name: float(params[0, column]) for name, column in PARAM_COLUMNS.items()}
+    densities = params[0, :5]
+
+    reference = _reference_sources(layout, y, k, a, g, emk, densities)
+    channels = source_channels_jax(model, y, k, a, g, emk, row)
+    np.testing.assert_allclose(np.asarray(channels), np.asarray(reference), rtol=1e-12)
+
+    # The device function, run as plain Python, point by point.
+    host = dict(
+        jit=lambda f: f,
+        cuda=SimpleNamespace(local=SimpleNamespace(array=lambda shape, dtype: np.zeros(shape))),
+        float64=np.float64,
+    )
+    quantities = model.build_function(
+        ("s_noisw", "s_j1", "s_j2", "phi"), inputs=("y", "tau", "a", "g"), params=PARAM_COLUMNS, **host
+    )
+    for i in range(n_k):
+        p = params[i]
+        for j in range(n_tau):
+            np.testing.assert_allclose(
+                quantities(y[i, j], 100.0, a[j], g[j], p), np.asarray(reference[:4, i, j]), rtol=1e-12
+            )
+    assert len(np.asarray(reference)) == 5 and N_PARAM == len(params[0])
