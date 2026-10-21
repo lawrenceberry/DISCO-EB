@@ -30,16 +30,29 @@ state and the sparse solver are all read off the components. The photon
 monopole, dipole and quadrupole are ``theta[0]``, ``theta[1]``, ``theta[2]``;
 the scalar names ``clxg``, ``qg``, ``pig`` and ``E2`` are published for the
 equations that read them.
+
+The background lives here too, on the same species: the Friedmann sum ``grho``
+the perturbation kernel reads is, evaluated by :meth:`Model.evaluate` on JAX
+arrays at ``a``, the expansion rate the conformal-time quadrature and the
+thermal history integrate (:func:`expansion_rate`, :func:`dtauda`,
+:func:`setup_background_evolution`, :func:`evolve_background`), and
+:func:`density_parameters` closes the density budget at ``a = 1`` with that
+same sum. The density constants and the massive-neutrino quadrature are defined
+once, below.
 """
 
 from __future__ import annotations
 
 import math
+from functools import partial
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
-from .background import get_neutrino_momentum_bins
 from .component import Component, Interaction, Model, Setting, Species, State
+from .spline_interpolation import FastUniformCubicSpline1D, spline_interpolation
+from .util import generalized_gauss_laguerre_weights, integrate_trapz
 
 SUMS = ("grho", "dgrho", "dgq")
 """The quantities summed over species: the Friedmann density, and the sources
@@ -55,7 +68,7 @@ def _needs_octupole(**lmax):
         raise ValueError(f"a hierarchy must reach at least the octupole; got {low}")
 
 
-# --- background ---------------------------------------------------------------------
+# --- scales, the Friedmann equation and the metric ----------------------------------
 
 
 class Background(Component):
@@ -365,21 +378,6 @@ class MasslessNeutrinos(Species):
         stream(k, n, inv_tau, output)
 
 
-def neutrino_momentum_bins(nqmax: int):
-    """Return ``(q, w, dlnf0_dlnq)`` momentum bins as NumPy arrays.
-
-    ``w`` are normalized so a single massless flavour integrates to unit density,
-    and ``dlnf0/dlnq = -q/(1 + exp(-q))`` is the log-derivative of the
-    Fermi-Dirac background distribution that sources the ``psi`` hierarchy.
-    """
-
-    q, w = get_neutrino_momentum_bins(nqmax)
-    q = np.asarray(q, dtype=np.float64)
-    w = np.asarray(w, dtype=np.float64)
-    dlfdlq = -q / (1.0 + np.exp(-q))
-    return q, w, dlfdlq
-
-
 class MassiveNeutrinos(Species):
     """Massive neutrinos on ``NQMAX`` momentum bins: ``psi[i, l]`` (Ma & Bertschinger).
 
@@ -575,3 +573,349 @@ def layout_state_names(layout) -> tuple[str, ...]:
     if layout.has_massive_neutrinos:
         names += [f"psi_{i}_{l}" for i in range(layout.nqmax) for l in range(layout.lmaxnu + 1)]
     return tuple(names)
+
+
+# --- the expansion history ----------------------------------------------------------
+# Density coefficients in the convention of the rest of the code (and of CAMB):
+# ``8 pi G rho / c^2`` in 1/Mpc^2, so that ``H^2 = sum_i rho_i / 3`` is the Hubble
+# rate in 1/Mpc and ``a'/a = a H`` the conformal one. The perturbation kernel's
+# ``grho_i_t = 8 pi G rho_i a^2`` are these times ``a^2``.
+
+GRHOM_PER_H0SQ = 3.33795017e-11  # 8 pi G rho_crit / c^2 per (H0 in km/s/Mpc)^2
+GRHOG_PER_TCMB4 = 1.49594245e-13  # photons, per K^4
+GRHOR_PER_TCMB4 = 3.39739477e-14  # one massless neutrino flavour, per K^4
+C2OK = 1.62581581e4  # K / eV: amnu = m_nu c^2 / (k_B T_nu0) = mnu * C2OK / Tcmb
+
+NQ_NEUTRINO_TABLE = 100
+"""Momentum nodes of the massive-neutrino background density: the ``rho_nu`` tables
+and the budget closing both integrate the Fermi-Dirac distribution on these."""
+
+
+def get_neutrino_momentum_bins(nqmax: int) -> tuple[jax.Array, jax.Array]:
+    """The momentum nodes ``q`` (in units of ``k_B T_nu0 / c``) and weights ``w``.
+
+    ``w`` is normalised so that one massless flavour integrates to unit density.
+    ``nqmax = 3, 4, 5`` are CAMB's high-accuracy formulas; higher counts use a
+    generalised Gauss-Laguerre rule.
+    """
+
+    fermi_dirac_const = 7 * jnp.pi**4 / 120
+    if nqmax == 3:
+        q = jnp.array([0.913201, 3.37517, 7.79184])
+        dlfdlq = -q / (1 + jnp.exp(-q))
+        w = jnp.array([0.0687359, 3.31435, 2.29911]) / (-0.25 * dlfdlq)
+    elif nqmax == 4:
+        q = jnp.array([0.7, 2.62814, 5.90428, 12.0])
+        dlfdlq = -q / (1 + jnp.exp(-q))
+        w = jnp.array([0.0200251, 1.84539, 3.52736, 0.289427]) / (-0.25 * dlfdlq)
+    elif nqmax == 5:
+        q = jnp.array([0.583165, 2.0, 4.0, 7.26582, 13.0])
+        dlfdlq = -q / (1 + jnp.exp(-q))
+        w = jnp.array([0.0081201, 0.689407, 2.8063, 2.05156, 0.12681]) / (-0.25 * dlfdlq)
+    else:
+        alpha = 1
+        q, w = generalized_gauss_laguerre_weights(nqmax, alpha)
+        w *= q**3 / (1 + jnp.exp(-q)) * q**-alpha
+    return q, w / fermi_dirac_const
+
+
+def neutrino_momentum_bins(nqmax: int):
+    """Return ``(q, w, dlnf0_dlnq)`` momentum bins as NumPy arrays.
+
+    ``dlnf0/dlnq = -q/(1 + exp(-q))`` is the log-derivative of the Fermi-Dirac
+    background distribution that sources the ``psi`` hierarchy.
+    """
+
+    with jax.ensure_compile_time_eval():
+        q, w = get_neutrino_momentum_bins(nqmax)
+    q = np.asarray(q, dtype=np.float64)
+    w = np.asarray(w, dtype=np.float64)
+    dlfdlq = -q / (1.0 + np.exp(-q))
+    return q, w, dlfdlq
+
+
+# The massive-neutrino density relative to the massless flavour depends on
+# ``y = amnu * a`` alone, so it is tabulated once over ``ln y`` and shared by
+# every cosmology. Below the table the neutrinos are relativistic and the ratio
+# is 1; that limit also serves ``amnu = 0``.
+_LN_Y_MIN, _LN_Y_MAX = math.log(1.0e-6), math.log(1.0e4)
+_NEUTRINO_TABLE: dict = {}
+_NEUTRINO_NODES: dict = {}
+
+
+def _neutrino_table(n_y_grid: int = 1000):
+    """The spline of ``ln(rho_nu / rho_nu,massless)`` over ``ln y``.
+
+    Built on first use rather than at import, so it takes the ``jax_enable_x64``
+    setting in force then, and concretely even when first used inside a ``jit``.
+    """
+
+    key = (n_y_grid, bool(jax.config.jax_enable_x64))
+    table = _NEUTRINO_TABLE.get(key)
+    if table is None:
+        with jax.ensure_compile_time_eval():
+            log_y = jnp.linspace(_LN_Y_MIN, _LN_Y_MAX, n_y_grid)
+            q, w = get_neutrino_momentum_bins(NQ_NEUTRINO_TABLE)
+            ratio = jnp.sum(w[None, :] * jnp.sqrt(1.0 + (jnp.exp(log_y)[:, None] / q[None, :]) ** 2), axis=1)
+            table = FastUniformCubicSpline1D(log_y, jnp.log(ratio))
+        _NEUTRINO_TABLE[key] = table
+    return table
+
+
+def neutrino_density_ratio(a, amnu, xp=jnp):
+    """``rho_nu(a) / rho_nu,massless`` of one flavour of mass ``amnu`` (1 when massless).
+
+    With ``xp=jnp`` (the default) the shared table, so it traces under ``jit``;
+    with ``xp=np`` the same quadrature summed directly, for the host-side
+    budget closing of a cosmology given as floats.
+    """
+
+    if xp is np:
+        nodes = _NEUTRINO_NODES.get(NQ_NEUTRINO_TABLE)
+        if nodes is None:
+            q, w, _ = neutrino_momentum_bins(NQ_NEUTRINO_TABLE)
+            nodes = _NEUTRINO_NODES[NQ_NEUTRINO_TABLE] = (q, w)
+        q, w = nodes
+        y = np.asarray(a, dtype=np.float64) * float(amnu)
+        return np.sum(w * np.sqrt(1.0 + (y[..., None] / q) ** 2), axis=-1)
+    massive = amnu > 0.0
+    ln_y = jnp.log(jnp.where(massive, amnu, 1.0) * a)
+    ln_y = jnp.clip(ln_y, _LN_Y_MIN, _LN_Y_MAX)
+    ratio = jnp.exp(jnp.vectorize(_neutrino_table().evaluate)(ln_y))
+    return jnp.where(massive, ratio, 1.0)
+
+
+_BACKGROUND_MODEL: list = []
+
+
+def background_model() -> Model:
+    """The species whose ``grho`` is the Friedmann sum, with every component enabled.
+
+    The dark-energy fluid at ``w = -1`` is the cosmological constant and a
+    massive-neutrino density with ``n_mnu = 0`` vanishes, so one model serves
+    every cosmology; the hierarchy truncations are irrelevant to the background.
+    """
+
+    if not _BACKGROUND_MODEL:
+        _BACKGROUND_MODEL.append(
+            Model(
+                [Background(), Curvature(), ColdDarkMatter(), Baryons(), Photons(),
+                 MasslessNeutrinos(), DarkEnergy(), MassiveNeutrinos()],
+                sums=SUMS,
+            )
+        )
+    return _BACKGROUND_MODEL[0]
+
+
+def density_parameters(param, xp=jnp) -> dict:
+    """The background densities of a parameter dictionary, as the model names them.
+
+    ``grhom`` is the critical density, ``grhog`` the photons', ``grhor`` one
+    massless neutrino flavour's, ``grhornomass`` the ``Neff`` massless flavours',
+    ``grhoc``, ``grhob`` and ``grhok`` the cold dark matter, baryons and
+    curvature, ``grhor_nu``, ``n_mnu`` and ``amnu`` the massive neutrinos', and
+    ``grhov`` the dark energy's, fixed by closing the budget at ``a = 1`` with
+    the model's own Friedmann sum: ``grhov = grhom - grho(a=1 | grhov=0)``.
+    ``xp`` is ``jnp`` for a traced cosmology, ``np`` for one given as floats.
+    """
+
+    H0, Tcmb = param["H0"], param["Tcmb"]
+    grhom = GRHOM_PER_H0SQ * H0**2
+    grhor = GRHOR_PER_TCMB4 * Tcmb**4
+    d = {
+        "grhom": grhom,
+        "grhog": GRHOG_PER_TCMB4 * Tcmb**4,
+        "grhor": grhor,
+        "grhornomass": param["Neff"] * grhor,
+        "grhoc": grhom * (param["Omegam"] - param["Omegab"]),
+        "grhob": grhom * param["Omegab"],
+        "grhok": grhom * param["Omegak"],
+        "grhor_nu": grhor,
+        "n_mnu": param["Nmnu"],
+        "amnu": param["mnu"] * C2OK / Tcmb,
+        "w_DE_0": param["w_DE_0"],
+        "w_DE_a": param["w_DE_a"],
+        "cs2_DE": param.get("cs2_DE", 1.0),
+    }
+    rhonu_today = neutrino_density_ratio(1.0, d["amnu"], xp)
+    without_dark_energy = background_model().evaluate(
+        "grho", math=(math if xp is np else jnp), a=1.0, rhonu=rhonu_today, grhov=0.0, **d
+    )
+    d["grhov"] = grhom - without_dark_energy
+    d["OmegaDE"] = d["grhov"] / grhom
+    d["grho_mnu_today"] = grhor * d["n_mnu"] * rhonu_today
+    return d
+
+
+def expansion_rate(a, densities):
+    """The conformal Hubble rate ``a'/a = a H`` at scalar ``a``, from the model's ``adotoa``."""
+
+    rhonu = neutrino_density_ratio(a, densities["amnu"])
+    return background_model().evaluate("adotoa", math=jnp, a=a, rhonu=rhonu, **densities)
+
+
+def dtauda(a, densities):
+    """``d tau / d a = 1 / (a^2 H)`` at scalar ``a`` (``jax.vmap`` over an array)."""
+
+    return 1.0 / (a * expansion_rate(a, densities))
+
+
+def get_aprimeoa(*, densities, a):
+    """The conformal Hubble rate ``a'/a = a H`` at scalar ``a``."""
+
+    return expansion_rate(a, densities)
+
+
+def compute_angular_diameter_distance(*, aexp, param):
+    """The angular diameter distance to ``aexp``, from ``param['densities']``."""
+
+    aexpv = jnp.linspace(aexp, 1.0, 1000)
+    aH = jax.vmap(lambda a: expansion_rate(a, param["densities"]))(aexpv) * aexpv
+    return aexp * integrate_trapz(1 / aH, aexpv)
+
+
+def setup_background_evolution(*, amin, amax, param):
+    """Mean densities, the massive-neutrino spline and ``tau(a)`` of ``param``.
+
+    Sets the ``grhom`` / ``grhog`` / ``grhor`` / ``amnu`` coefficients and
+    ``OmegaDE`` the thermodynamics kernel reads, ``param['densities']`` (what
+    :func:`dtauda` takes), the ``log rho_nu`` spline, and the conformal time on
+    the ``param['a']`` grid from the model's expansion rate. One cosmology per
+    call: batch with ``jax.vmap``.
+    """
+
+    num_neutrino = 512  # points of the a grid
+
+    param["amin"] = amin
+    param["amax"] = amax
+    densities = density_parameters(param)
+    param["grhom"] = densities["grhom"]
+    param["grhog"] = densities["grhog"]
+    param["grhor"] = densities["grhor"]
+    param["amnu"] = densities["amnu"]
+    param["OmegaDE"] = densities["OmegaDE"]
+    param["Omegamnu"] = densities["grho_mnu_today"] / densities["grhom"]
+    param["densities"] = densities
+
+    a = jnp.geomspace(amin * 0.9, amax * 1.1, num_neutrino)
+    loga = jnp.log(a)
+    param["a"] = a
+    rhonu = neutrino_density_ratio(a, densities["amnu"])
+    param["logrhonu_of_loga_spline"] = spline_interpolation(loga, jnp.log(rhonu)[:, None], uniform=True)
+
+    radiation = (
+        densities["grhog"] + densities["grhornomass"]
+        + densities["grhor_nu"] * densities["n_mnu"] * neutrino_density_ratio(amin, densities["amnu"])
+    )
+    param["adotrad"] = jnp.sqrt(radiation / 3.0)
+    param["taumin"] = amin / param["adotrad"]
+    dtauda_values = jnp.reshape(jax.vmap(dtauda, in_axes=(0, None))(a, densities), a.shape)
+    integrator = FastUniformCubicSpline1D(loga, dtauda_values * a)
+    param["tau"] = param["taumin"] + jax.vmap(integrator.integral)(loga)
+    param["taumax"] = param["tau"][-1]
+    return param
+
+
+def batch_dimensions(param):
+    for x in param:
+        param[x] = jnp.atleast_1d(param[x])
+    return param
+
+
+@partial(jax.jit, static_argnames=("thermo_module", "num_thermo", "rtol", "atol", "order", "class_thermo"))
+def evolve_background(*, param, thermo_module="RECFAST", num_thermo: int = 256, rtol: float = 1e-5,
+                      atol: float = 1e-7, order: int = 5, class_thermo=None):
+    """Evolve the cosmological background and thermal history.
+
+    ``thermo_module`` is ``'RECFAST'`` (default) or ``'CLASS'`` (external CLASS
+    data in ``class_thermo``); ``num_thermo`` the number of thermal-history
+    samples (adaptive, half of them through recombination: 256 gives < 0.13
+    percent on P(k), 512 < 0.03 percent); ``rtol`` and ``atol`` the RECFAST
+    solve's tolerances. Returns the parameter dictionary with the background,
+    the thermal history and its splines, the optical depth and the visibility
+    function.
+    """
+
+    from .thermodynamics_recfast import evaluate_thermo
+
+    amin = 1e-9
+    amax = 1.01
+    if thermo_module == "CLASS":
+        amin = jnp.min(class_thermo["scale factor a"])
+        amax = jnp.max(class_thermo["scale factor a"])
+
+    param = setup_background_evolution(amin=amin, amax=amax, param=param)
+
+    if thermo_module == "RECFAST":
+        aexp, cs2, Tm, mu, xe, dxeda = evaluate_thermo(
+            param=param, num_thermo=num_thermo, rtol=rtol, atol=atol, amin=amin, amax=amax
+        )
+        param["aexp"] = aexp
+        param["xe"] = xe
+        param["cs2"] = cs2
+        param["Tm"] = Tm
+
+        tau = spline_interpolation(jnp.log(param["a"]), param["tau"]).evaluate(jnp.log(aexp))
+        param["tau_th"] = tau
+        param["tau_of_a_spline"] = spline_interpolation(aexp, tau)
+        param["a_of_tau_spline"] = spline_interpolation(tau, aexp)
+        param["xe_of_tau_spline"] = spline_interpolation(tau, xe)
+        param["cs2a_of_tau_spline"] = spline_interpolation(tau, aexp[:, None] * cs2)
+        param["tempba_of_tau_spline"] = spline_interpolation(tau, aexp[:, None] * Tm)
+        # Pre-composed splines for direct a-to-quantity lookups.
+        param["xe_of_loga_spline"] = spline_interpolation(jnp.log(aexp), xe, uniform=False)
+        param["cs2a_of_loga_spline"] = spline_interpolation(jnp.log(aexp), aexp[:, None] * cs2, uniform=False)
+    elif thermo_module == "CLASS":
+        tau_class = class_thermo["conf. time [Mpc]"][::-1]
+        aexp_class = class_thermo["scale factor a"][::-1]
+        param["cs2_of_tau_spline"] = spline_interpolation(tau_class, class_thermo["c_b^2"][::-1])
+        param["tempb_of_tau_spline"] = spline_interpolation(tau_class, class_thermo["Tb [K]"][::-1])
+        param["xe_of_tau_spline"] = spline_interpolation(tau_class, class_thermo["x_e"][::-1])
+        param["a_of_tau_spline"] = spline_interpolation(tau_class, aexp_class)
+        param["tau_of_a_spline"] = spline_interpolation(aexp_class, tau_class)
+        param["aexp"] = aexp_class
+        param["tau"] = tau_class
+        param["xe_of_loga_spline"] = spline_interpolation(jnp.log(aexp_class), class_thermo["x_e"][::-1])
+        param["cs2a_of_loga_spline"] = spline_interpolation(
+            jnp.log(aexp_class), aexp_class * class_thermo["c_b^2"][::-1]
+        )
+        aexp, tau = aexp_class, tau_class
+
+    # Optical depth and visibility functions.
+    akthom = 2.3038921003709498e-9 * (1.0 - param["YHe"]) * param["Omegab"] * param["H0"] ** 2
+    tau_pre_recomb = param["tau_of_a_spline"].evaluate(1e-4)
+    xe_full = 1 + param["YHe"] / (1 - param["YHe"])
+    xe = jnp.where(tau <= tau_pre_recomb, xe_full, param["xe_of_tau_spline"].evaluate(tau))
+    xeprime = jnp.where(tau <= tau_pre_recomb, 0.0, param["xe_of_tau_spline"].derivative(tau))
+    opac = xe * akthom / aexp[:, None] ** 2
+
+    opacspline = spline_interpolation(tau, opac, integrate_from_start=True)
+    opacprime, opacpprime = opacspline.derivative12(tau)
+    optical_depth_today = opacspline.integral(param["tau_of_a_spline"].evaluate(1.0))
+    optical_depth = optical_depth_today - opacspline.integral(tau)
+    expmmu = jnp.exp(-optical_depth)
+
+    param["optical_depth"] = optical_depth
+    param["opac"] = opac
+    param["gvis"] = opac * expmmu
+    param["gvisprime"] = (opacprime + opac**2) * expmmu
+    param["gvispprime"] = (opacpprime + 3 * opac * opacprime + opac**3) * expmmu
+    param["tau0"] = param["tau_of_a_spline"].evaluate(1.0)
+    param["tau_maxvis"] = param["tau"][jnp.argmax(param["gvis"])]
+    param["xeprime"] = xeprime
+    return param
+
+
+@jax.jit
+def compute_background_quantities(aexp, param):
+    """``rhonu``, ``rho_Q`` and ``w_Q`` at ``aexp``, from the splines and the dark-energy fluid."""
+
+    a = jnp.atleast_1d(aexp)
+    rho_Q, w_Q = background_model().evaluate(
+        "rho_Q", "w_Q", math=jnp, a=a, w_DE_0=param["w_DE_0"], w_DE_a=param["w_DE_a"]
+    )
+    return {
+        "rhonu": jnp.exp(param["logrhonu_of_loga_spline"].evaluate(jnp.log(a))),
+        "rho_Q": rho_Q,
+        "w_Q": w_Q,
+    }

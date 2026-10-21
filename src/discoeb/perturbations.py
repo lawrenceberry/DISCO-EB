@@ -9,19 +9,18 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .background import (
-    dtauda,
-    evolve_background,
-    setup_background_evolution,
-)
 from .component import Component
 from .eb_model import (
     MassiveNeutrinos,
     MasslessNeutrinos,
     Photons,
+    density_parameters,
+    dtauda,
+    evolve_background,
     layout_state_names,
     neutrino_momentum_bins,
     perturbation_model,
+    setup_background_evolution,
 )
 from .eb_sparsity import perturbation_sparsity
 from .thermodynamics_recfast import evaluate_thermo
@@ -534,65 +533,39 @@ slower for no gain in P(k) accuracy against CLASS.
 """
 
 
-def massive_neutrino_density_ratio(a, amnu: float, q, w) -> np.ndarray:
-    """Return ``rho_nu(a)/rho_nu0_massless`` on the same momentum quadrature.
+_DENSITY_CACHE: "BoundedCache"
 
-    ``rho = sum_i w_i / v_i`` with ``v_i = 1/sqrt(1 + (a amnu/q_i)^2)``, i.e.
-    ``rho = sum_i w_i sqrt(1 + (a amnu/q_i)^2)``. It tends to 1 (relativistic)
-    as ``a -> 0``. Using the *same* quadrature as the perturbation hierarchy
-    keeps ``drho_nu/rho_nu`` consistent.
-    """
 
-    a = np.atleast_1d(np.asarray(a, dtype=np.float64))[:, None]
-    return np.sum(w[None, :] * np.sqrt(1.0 + (a * amnu / q[None, :]) ** 2), axis=1)
+def _densities(cosmology) -> dict:
+    """:func:`discoeb.eb_model.density_parameters` of a cosmology, as floats, memoised."""
+
+    cosmology = _as_cosmology(cosmology)
+    cached = _DENSITY_CACHE.get(cosmology)
+    if cached is None:
+        d = density_parameters(cosmology.to_background_params(), xp=np)
+        cached = _DENSITY_CACHE[cosmology] = {k: float(v) for k, v in d.items()}
+    return cached
 
 
 def massive_neutrino_parameters(cosmology) -> tuple[float, float, float]:
     """Return ``(grhor_nu, N_mnu, amnu)`` for the massive-neutrino species."""
 
-    grhor_nu = 3.39739477e-14 * cosmology.T_cmb**4
-    n_mnu = float(cosmology.num_massive_neutrinos)
-    amnu = 1.62581581e4 * cosmology.mnu / cosmology.T_cmb if n_mnu > 0.0 else 0.0
-    return grhor_nu, n_mnu, amnu
+    d = _densities(cosmology)
+    return d["grhor_nu"], d["n_mnu"], d["amnu"]
 
 
 def density_coefficients(cosmology) -> tuple[float, float, float, float, float]:
     """Return the background ``grho`` density coefficients for ``cosmology``.
 
-    ``grhornomass`` uses the *massless* neutrino count. The dark-energy
-    coefficient is fixed by closing the density budget at ``a = 1``,
-
-    ``grhov = grhom - (grhog + grhornomass + grho_mnu(1) + grhoc + grhob + grhok)``,
-
-    which reproduces the flat massless value and automatically accounts for
-    spatial curvature and the massive-neutrino density.
+    ``(grhog, grhornomass, grhoc, grhob, grhov)`` from
+    :func:`discoeb.eb_model.density_parameters`: ``grhornomass`` uses the
+    *massless* neutrino count, and the dark-energy coefficient closes the
+    density budget at ``a = 1`` with the model's own Friedmann sum, so it
+    accounts for curvature and the massive-neutrino density.
     """
 
-    grhom = 3.33795017e-11 * cosmology.H0**2
-    grhog_value = 1.49594245e-13 * cosmology.T_cmb**4
-    grhornomass_value = 3.39739477e-14 * cosmology.T_cmb**4 * cosmology.Neff_massless
-    grhoc_value = grhom * cosmology.Omegac
-    grhob_value = grhom * cosmology.Omegab
-    grhok = grhom * cosmology.Omegak
-
-    grhor_nu, n_mnu, amnu = massive_neutrino_parameters(cosmology)
-    if n_mnu > 0.0:
-        q, w, _ = neutrino_momentum_bins()
-        grho_mnu_today = grhor_nu * n_mnu * float(
-            massive_neutrino_density_ratio(1.0, amnu, q, w)[0]
-        )
-    else:
-        grho_mnu_today = 0.0
-
-    grhov_value = grhom - (
-        grhog_value
-        + grhornomass_value
-        + grho_mnu_today
-        + grhoc_value
-        + grhob_value
-        + grhok
-    )
-    return (grhog_value, grhornomass_value, grhoc_value, grhob_value, grhov_value)
+    d = _densities(cosmology)
+    return (d["grhog"], d["grhornomass"], d["grhoc"], d["grhob"], d["grhov"])
 
 
 class BoundedCache(OrderedDict):
@@ -748,7 +721,7 @@ def _thermo_tables_device(stacked, spline_inverse, n_grid: int):
             param={k: v for k, v in params.items() if k != "tau_reio"},
             thermo_module="RECFAST", num_thermo=n_grid,
         )
-        dtauda_values = jax.vmap(dtauda, in_axes=(0, None))(a_background, background["species"])
+        dtauda_values = jax.vmap(dtauda, in_axes=(0, None))(a_background, background["densities"])
         steps = 0.5 * (dtauda_values[1:] + dtauda_values[:-1]) * jnp.diff(a_background)
         tau_background = jnp.concatenate(
             (jnp.zeros((1,)), jnp.cumsum(steps))
@@ -900,8 +873,7 @@ def make_params(cosmology, k_values: np.ndarray, tau_end: float) -> np.ndarray:
     w_de_0 = np.full(n, cosmology.w_DE_0, dtype=np.float64)
     w_de_a = np.full(n, cosmology.w_DE_a, dtype=np.float64)
     cs2_de = np.full(n, cosmology.cs2_DE, dtype=np.float64)
-    grhok = 3.33795017e-11 * cosmology.H0**2 * cosmology.Omegak
-    grhok_col = np.full(n, grhok, dtype=np.float64)
+    grhok_col = np.full(n, _densities(cosmology)["grhok"], dtype=np.float64)
     grhor_nu, n_mnu, amnu = massive_neutrino_parameters(cosmology)
     grhor_nu_col = np.full(n, grhor_nu, dtype=np.float64)
     n_mnu_col = np.full(n, n_mnu, dtype=np.float64)
@@ -1128,6 +1100,7 @@ class _PreparedSolve(NamedTuple):
 
 
 _PREPARED_SOLVE_CACHE: BoundedCache = BoundedCache(BATCH_CACHE_SIZE)
+_DENSITY_CACHE = BoundedCache(THERMO_TABLE_CACHE_SIZE)
 _PACKED_BATCH_CACHE: BoundedCache = BoundedCache(BATCH_CACHE_SIZE)
 _TABLE_SLOTS: dict = {}
 

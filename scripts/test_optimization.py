@@ -6,7 +6,7 @@ import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 jax.config.update('jax_platform_name', 'gpu')
 
-from discoeb.background import evolve_background
+from discoeb.eb_model import evolve_background
 
 # Standard cosmology parameters
 param = {

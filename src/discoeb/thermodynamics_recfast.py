@@ -151,7 +151,7 @@ N_THERMO_PARAMS = 15
 """Columns of the per-cosmology parameter row the device right-hand side reads."""
 
 NQ_NU_BACKGROUND = 8
-"""Momentum nodes of the massive-neutrino background density, as :func:`background.nu_background`."""
+"""Momentum nodes of the massive-neutrino background density in the device Hubble rate."""
 
 THERMO_SOLVER = "rodas5P"
 """Which modax kernel integrates recombination: ``"rodas5P"`` or ``"tsit5"``."""
@@ -174,7 +174,7 @@ def recfast_rhs():
 
     from numba_cuda_mlir import cuda
 
-    from .background import get_neutrino_momentum_bins
+    from .eb_model import get_neutrino_momentum_bins
 
     # Host constants even when first built inside a jit trace.
     with jax.ensure_compile_time_eval():
@@ -183,7 +183,7 @@ def recfast_rhs():
         )
 
     def neutrino_density(nodes):
-        """rho_nu / rho_nu(massless), the quadrature of ``nu_background`` folded node by node."""
+        """rho_nu / rho_nu(massless), the momentum quadrature folded node by node."""
         (q, w), rest = nodes[-1], nodes[:-1]
         q, w = float(q), float(w)
         if not rest:
@@ -206,7 +206,7 @@ def recfast_rhs():
 
     @cuda.jit(device=True)
     def hubble(a, p):
-        """H(a) in 1/s, from the same densities as :func:`background.get_aprimeoa`."""
+        """H(a) in 1/s, from the densities :func:`eb_model.setup_background_evolution` sets on the row."""
         rhonu = rhonu_of(a, p[P_AMNU])
         w0 = p[P_W_DE_0]
         wa = p[P_W_DE_A]

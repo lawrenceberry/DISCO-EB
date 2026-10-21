@@ -4,7 +4,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 jax.config.update('jax_platform_name', 'gpu')
 
-from discoeb.background import evolve_background
+from discoeb.eb_model import evolve_background
 
 
 # Check JAX backend

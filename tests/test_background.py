@@ -3,7 +3,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 
-from discoeb.background import evolve_background
+from discoeb.eb_model import evolve_background
 
 from conftest import a_RECFAST, xe_RECFAST
 

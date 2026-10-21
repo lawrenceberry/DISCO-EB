@@ -399,7 +399,7 @@ def test_every_state_needs_a_derivative():
 def test_an_unprovided_dependency_names_the_provider():
     with pytest.raises(NameError, match="Baryons.d_vb needs 'cs2b'"):
         toy_model().build({k: v for k, v in PARAMS.items() if k != "cs2b"}, **HOST)
-    with pytest.raises(NameError, match="initial conditions need 'tau'"):
+    with pytest.raises(NameError, match="'tau' is neither given nor provided"):
         toy_model().initial_state([0.1])
 
 
@@ -492,7 +492,7 @@ def test_cycles_are_reported():
         def d_c(c):
             return c
 
-    with pytest.raises(ValueError, match="circular initial conditions"):
+    with pytest.raises(ValueError, match="circular dependency on the host"):
         Model([Chicken()]).initial_state([1.0])
 
 

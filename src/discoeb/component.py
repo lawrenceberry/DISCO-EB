@@ -55,7 +55,8 @@ order, a vector ``theta`` as the elements ``theta_0, theta_1, ...``
 
 * its *initial condition*, ``State(..., initial=fn)``, a function (a lambda
   for a scalar, a ``_``-prefixed function defined just above for a vector)
-  whose parameters are injected like a provider's, from the quantities
+  whose parameters are injected like a provider's (:meth:`Model.evaluate` is
+  the same resolution for any quantity, on floats or JAX arrays), from the quantities
   :meth:`Model.initial_state` is given (``k``, ``tau``, the background
   densities), from other states' initial values, and from providers that can
   be evaluated on the host (``clxg`` for ``theta[0]``). A scalar's returns the
@@ -110,6 +111,7 @@ import graphlib
 import inspect
 import itertools
 import linecache
+import math
 import os
 import types
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -438,11 +440,12 @@ def _bound_function(fn: Callable, jit: Callable, names: Mapping[str, object],
 
     numba resolves a global at compile time, so the function is rebound to a
     copy of its globals in which the device-name placeholders are the real
-    objects (``names``), the component's constants appear by name, and the
-    plain helpers it calls are bound the same way (recursively, with the
-    device names but not the constants, since a helper belongs to no
-    component). With an identity ``jit`` this is how a function runs on the
-    host.
+    objects (``names``), ``math`` is whatever ``names["math"]`` says (``math``
+    itself on the device, ``jax.numpy`` when a quantity is evaluated on JAX
+    arrays), the component's constants appear by name, and the plain helpers
+    it calls are bound the same way (recursively, with the device names but
+    not the constants, since a helper belongs to no component). With an
+    identity ``jit`` this is how a function runs on the host.
     """
 
     key = (fn, tuple(sorted(constants)) if constants else ())
@@ -456,6 +459,8 @@ def _bound_function(fn: Callable, jit: Callable, names: Mapping[str, object],
             rebound[name] = constants[name]
         elif isinstance(value, _Ambient):
             rebound[name] = names[value.name]
+        elif value is math:
+            rebound[name] = names.get("math", math)
         elif isinstance(value, types.FunctionType) and value.__module__ != "builtins":
             rebound[name] = _bound_function(value, jit, names, {}, memo)
     fn_bound = types.FunctionType(fn.__code__, rebound, fn.__name__, fn.__defaults__, fn.__closure__)
@@ -469,36 +474,60 @@ def _bound_function(fn: Callable, jit: Callable, names: Mapping[str, object],
 _SOURCES = itertools.count(1)
 
 
-class _InitialValues:
-    """The initial value of every quantity for one wave mode, resolved on demand."""
+class _HostValues:
+    """The value of every quantity, resolved on demand on the host.
 
-    def __init__(self, model, base, providers, fillers, memo):
-        self.model, self.values = model, dict(base)
-        self.providers, self.fillers, self.memo = providers, fillers, memo
+    A name is a base value, a state (its initial value: zeros, or its
+    ``initial`` filler), or a provider evaluated from the same pool. The
+    providers run as plain Python with ``names`` standing in for the device
+    names, so the values may be floats or JAX arrays alike.
+    """
+
+    def __init__(self, model, base, names, memo=None):
+        self.model, self.values, self.names = model, dict(base), names
+        self.memo = {} if memo is None else memo
+        self.providers, self.contributions = model._host_providers()
         self.resolving: list[str] = []
+
+    def _bind(self, fn, component):
+        return _bound_function(fn, lambda f: f, self.names, component.constants(), self.memo)
 
     def __getitem__(self, name):
         if name in self.values:
             return self.values[name]
         if name in self.resolving:
-            raise ValueError("circular initial conditions: " + " -> ".join([*self.resolving, name]))
+            raise ValueError("circular dependency on the host: " + " -> ".join([*self.resolving, name]))
         self.resolving.append(name)
         if name in self.model.states:
             s = self.model.states[name]
             result = np.zeros(s.shape) if s.shape else 0.0
-            if name in self.fillers:
-                _, fn, params = self.fillers[name]
+            fn = s.declared.initial_fn
+            if fn is not None:
+                params = _positional_names(fn, f"{name}.initial")
+                if s.shape and OUTPUT not in params:
+                    raise TypeError(f"{name}.initial: a vector's initial condition takes {OUTPUT!r} and fills it")
+                if not s.shape and OUTPUT in params:
+                    raise TypeError(f"{name}.initial: a scalar's initial condition returns the value")
                 args = [result if p == OUTPUT else self[p] for p in params]
                 if s.shape:
-                    fn(*args)
+                    self._bind(fn, s.component)(*args)
                 else:
-                    result = fn(*args)
+                    result = self._bind(fn, s.component)(*args)
+        elif name in self.model.sums:
+            parts = [
+                self._bind(p.fn, p.component)(*(self[d] for d in p.params))
+                for p in self.contributions.get(name, ())
+            ]
+            if not parts:
+                raise NameError(f"nothing contributes to the sum {name!r}")
+            result = parts[0]
+            for part in parts[1:]:
+                result = result + part
         elif name in self.providers:
             p = self.providers[name]
-            fn = _bound_function(p.fn, lambda f: f, _HOST_NAMES, p.component.constants(), self.memo)
-            result = fn(*(self[d] for d in p.params))
+            result = self._bind(p.fn, p.component)(*(self[d] for d in p.params))
         else:
-            raise NameError(f"initial conditions need {name!r}, which nothing provides")
+            raise NameError(f"{name!r} is neither given nor provided by any component")
         self.resolving.pop()
         self.values[name] = result
         return result
@@ -544,6 +573,22 @@ class Model:
     def nvar(self) -> int:
         return len(self.state)
 
+    def _host_providers(self):
+        """``(providers by quantity, contributions by sum)``, read once per model."""
+
+        if not hasattr(self, "_host_provider_table"):
+            providers, contributions = {}, {s: [] for s in self.sums}
+            for c in self.components:
+                for p in _providers(c, self.states):
+                    if p.written is not None:
+                        continue
+                    if p.attr in self.sums:
+                        contributions[p.attr].append(p)
+                    else:
+                        providers.setdefault(p.attr, p)
+            self._host_provider_table = (providers, contributions)
+        return self._host_provider_table
+
     # -- what the components declare about their state ------------------------------
 
     def sparsity(self) -> np.ndarray:
@@ -577,6 +622,22 @@ class Model:
             entries.add((parent, tail[0]))
         return np.array(sorted(entries), dtype=np.int64)
 
+    def evaluate(self, *quantities, math=math, **base):
+        """Evaluate ``quantities`` on the host from the ``base`` values.
+
+        A name resolves as a base value, a state's initial value, a sum over
+        the components, or a provider, with its dependencies resolved the same
+        way. ``math`` is the module the providers' ``math.sqrt`` and friends
+        mean here: the standard library for floats, ``jax.numpy`` for JAX
+        arrays (so the background expansion rate is the model's own ``grho``
+        and ``adotoa``, traced under ``jit``). Returns one value or a tuple.
+        """
+
+        memo = self.__dict__.setdefault("_host_memo", {}).setdefault(id(math), {})
+        values = _HostValues(self, base, {**_HOST_NAMES, "math": math}, memo)
+        results = tuple(values[q] for q in quantities)
+        return results[0] if len(quantities) == 1 else results
+
     def initial_state(self, k_values, **base) -> np.ndarray:
         """The initial state, ``(n_k, nvar)``, from the states' initial conditions.
 
@@ -586,29 +647,11 @@ class Model:
         on the host from the same pool.
         """
 
-        providers = {}
-        for c in self.components:
-            for p in _providers(c, self.states):
-                if p.written is None and p.attr not in self.sums:
-                    providers.setdefault(p.attr, p)
-        memo: dict = {}
-        fillers = {
-            s.name: (s, _bound_function(
-                s.declared.initial_fn, lambda f: f, _HOST_NAMES, s.component.constants(), memo
-            ), _positional_names(s.declared.initial_fn, f"{s.name}.initial"))
-            for s in self.states.values()
-            if s.declared.initial_fn is not None
-        }
-        for name, (s, _, params) in fillers.items():
-            if s.shape and OUTPUT not in params:
-                raise TypeError(f"{name}.initial: a vector's initial condition takes {OUTPUT!r} and fills it")
-            if not s.shape and OUTPUT in params:
-                raise TypeError(f"{name}.initial: a scalar's initial condition returns the value")
-
         k_values = np.asarray(k_values, dtype=np.float64)
         y0 = np.zeros((len(k_values), self.nvar), dtype=np.float64)
+        memo = self.__dict__.setdefault("_host_memo", {}).setdefault(id(math), {})
         for i, k in enumerate(k_values):
-            values = _InitialValues(self, dict(base, k=float(k)), providers, fillers, memo)
+            values = _HostValues(self, dict(base, k=float(k)), {**_HOST_NAMES, "math": math}, memo)
             for s in self.states.values():
                 y0[i, s.offset:s.offset + s.size] = np.ravel(values[s.name])
         return y0
