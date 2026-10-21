@@ -18,7 +18,6 @@ from .eb_model import (
     dtauda,
     evolve_background,
     layout_state_names,
-    neutrino_momentum_bins,
     perturbation_model,
     perturbation_sparsity,
     setup_background_evolution,

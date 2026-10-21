@@ -94,9 +94,7 @@ from .perturbations import (
     THERMO_TABLE_CACHE_SIZE,
     BoundedCache,
     DeviceTableSlot,
-    IX_G,
     IX_K,
-    IX_POL,
     PERTURB_ATOL,
     PERTURB_FIRST_STEP,
     PERTURB_MAX_STEPS,
@@ -202,8 +200,8 @@ POLARIZATION_WEIGHT_MAX = 1000.0
 """Cap of that weight."""
 
 
-def polarization_error_weights(k, nvar):
-    """Per-trajectory solver error weights ``(n_traj, nvar)`` that resolve the polarization source at low ``k``.
+def polarization_error_weights(k, layout):
+    """Per-trajectory solver error weights ``(n_traj, nvar)`` that resolve the small sources at low ``k``.
 
     The E-mode source is ``g polter`` with ``polter = pig/10 + 3/5 E_2``. At
     ``k`` well below the acoustic scale both moments are tiny through
@@ -220,15 +218,25 @@ def polarization_error_weights(k, nvar):
     percent of ``sqrt(TT EE)``). A scalar ``atol`` of 1e-8 does the same at
     six times the cost.
 
-    ``k`` is each trajectory's wave number in launch order; the modax solves
-    take the result as ``error_weights``.
+    The massive-neutrino monopole, dipole and quadrupole of every momentum
+    bin get the same weight: they are as small at low ``k`` and enter the
+    metric shear that generates the photon quadrupole, and without the
+    weight a 0.3 eV neutrino left EE at ``l = 2`` 2 percent low (0.3 percent
+    with it; ``test_power_spectra_match_class_with_massive_neutrinos``).
+
+    ``k`` is each trajectory's wave number in launch order and ``layout`` the
+    batch's :class:`~discoeb.perturbations.PerturbationLayout`; the modax
+    solves take the result as ``error_weights``.
     """
 
     k = np.asarray(k, dtype=np.float64)
-    weights = np.ones((len(k), int(nvar)))
+    weights = np.ones((len(k), int(layout.nvar)))
     w = np.clip(POLARIZATION_WEIGHT_K / k, 1.0, POLARIZATION_WEIGHT_MAX)
-    weights[:, IX_G + 2] = w
-    weights[:, IX_POL] = w
+    weights[:, layout.ix_g + 2] = w
+    weights[:, layout.ix_pol] = w
+    for q in range(layout.nqmax):
+        for l in range(3):
+            weights[:, layout.ix_psi(l, q)] = w
     return jnp.asarray(weights)
 
 _BESSEL_CACHE: BoundedCache = BoundedCache(BATCH_CACHE_SIZE)
@@ -1045,7 +1053,7 @@ def _solve_with_hook(prepared, k_values, tau_save, hook, hook_size, solve_kwargs
     if solve_kwargs.get("error_weights") is None:
         solve_kwargs = {
             **solve_kwargs,
-            "error_weights": polarization_error_weights(params[:, IX_K], y0.shape[-1]),
+            "error_weights": polarization_error_weights(params[:, IX_K], prepared.layout),
         }
     _, out = rodas5P_solve(
         prepared.ode_fn,
@@ -1341,7 +1349,7 @@ def cl_power_spectrum_jax(
         error_weights=solve_kwargs.get("error_weights")
         if solve_kwargs.get("error_weights") is not None
         else polarization_error_weights(
-            np.sort(np.asarray(k_values, dtype=np.float64)), prepared.layout.nvar
+            np.sort(np.asarray(k_values, dtype=np.float64)), prepared.layout
         ),
     )
     a_tab, g_tab, emk_tab = _source_tables(prepared, tau_save)

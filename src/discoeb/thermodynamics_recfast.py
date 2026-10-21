@@ -154,6 +154,13 @@ NQ_NU_BACKGROUND = 8
 """Momentum nodes of the massive-neutrino background density in the device Hubble rate."""
 
 THERMO_SOLVER = "rodas5P"
+
+Z_H_SAHA_END = 1600.0
+"""Redshift below which hydrogen follows the rate equation instead of Saha equilibrium
+(CLASS's ``recfast_z_full_H_recombination``)."""
+DZ_H_SAHA_BLEND = 50.0
+"""Half-width in redshift of the blend from the Saha slope into the rate equation
+(CLASS's ``recfast_delta_z_full_H_recombination``)."""
 """Which modax kernel integrates recombination: ``"rodas5P"`` or ``"tsit5"``."""
 
 _RECFAST_RHS = None
@@ -326,17 +333,26 @@ def recfast_rhs():
         )
 
         # --- Hydrogen ------------------------------------------------------------
-        if x_H > 0.99:
-            # Saha, up to the redshift where the case-B rate equations take over
+        # RECFAST switches from the Saha slope to the rate equation where x_H
+        # drops below 0.99. Since the Saha slope does not depend on x_H and the
+        # rate equation's restoring term is stiff, that switch is a jump in the
+        # Jacobian, and the Rosenbrock step straddling it treated the stiff term
+        # explicitly: x_H overshot by 0.5 percent at rtol 1e-3, 5 percent for
+        # some cosmologies of a batch. CLASS 3 switches on redshift instead
+        # (``recfast_z_full_H_recombination`` = 1600, smoothed over 2 x 50 in
+        # z), which the step controller sees as a time dependence; the same is
+        # done here, blending the two slopes.
+        if z >= Z_H_SAHA_END:
             f0 = saha_slope(z, Tcmb, Nnow, CB1, 0.0, 1.0, 1.0)
         else:
             rate_diff = x * x_H * n * Rdown - Rup * one_minus_x_H * math.exp(-CL / Tmat)
-            if x_H > 0.985:
-                f0 = rate_diff / Hz_z_term
-            else:
-                K_Lambda_n_1_minus_x_H = K * Lambda * n * one_minus_x_H
-                denom_term = 1.0 / fu + K_Lambda_n_1_minus_x_H / fu + K * Rup * n * one_minus_x_H
-                f0 = rate_diff * (1.0 + K_Lambda_n_1_minus_x_H) / (Hz_z_term * denom_term)
+            K_Lambda_n_1_minus_x_H = K * Lambda * n * one_minus_x_H
+            denom_term = 1.0 / fu + K_Lambda_n_1_minus_x_H / fu + K * Rup * n * one_minus_x_H
+            f0 = rate_diff * (1.0 + K_Lambda_n_1_minus_x_H) / (Hz_z_term * denom_term)
+            if z > Z_H_SAHA_END - 2.0 * DZ_H_SAHA_BLEND:
+                s_blend = (Z_H_SAHA_END - z) / (2.0 * DZ_H_SAHA_BLEND)
+                w_full = s_blend * s_blend * (3.0 - 2.0 * s_blend)
+                f0 = w_full * f0 + (1.0 - w_full) * saha_slope(z, Tcmb, Nnow, CB1, 0.0, 1.0, 1.0)
 
         # --- Helium --------------------------------------------------------------
         if x_He > 0.9 or a < 3.0e-4:

@@ -9,7 +9,10 @@ implementation and no reionization.
 
 The gates are set from the measured agreement, with margin. The electron
 fraction differs from CLASS by up to ~2 percent below ``z ~ 1400`` (differences
-in the fudge factors of the two recfast versions), the temperature by less than
+in the fudge factors of the two recfast versions; hydrogen leaves Saha
+equilibrium on redshift as in CLASS 3, since RECFAST's switch on ``x_H`` made
+the stiff solver overshoot ``x_e`` by up to 5 percent for some cosmologies of
+the batch), the temperature by less than
 1 percent, and ``c_b^2`` by less than 1 percent, except in the redshift window
 where RECFAST switches off its tight Compton-coupling approximation for ``T_m``
 (``timeTh < H_frac * timeH``): there ``dT_m/dz`` jumps momentarily, which CLASS's

@@ -46,6 +46,7 @@ import pytest
 from test_perturbations import (
     BATCH_SIZE_CASES,
     DENSITY_NAMES,
+    REFERENCE_COSMOLOGY,
     _perturbed_cosmologies,
     _successive_batches,
     _wall_time,
@@ -111,6 +112,25 @@ def _cuda_available() -> bool:
         return False
 
 
+def _class_massive_neutrinos(param):
+    """CLASS's ncdm settings for a cosmology's ``Nmnu`` degenerate species of mass ``mnu``.
+
+    DISCO-EB's massive species have exactly ``T_nu = (4/11)^(1/3) T_cmb`` (its
+    ``grhor`` per flavour and ``amnu``), so CLASS gets that ``T_ncdm`` rather
+    than its default 0.71611, which folds the 3.046 correction into the
+    temperature; ``Neff`` is the massless count in both codes.
+    """
+
+    if not param.get("Nmnu", 0):
+        return {"N_ncdm": 0}
+    return {
+        "N_ncdm": 1,
+        "deg_ncdm": param["Nmnu"],
+        "m_ncdm": param["mnu"],
+        "T_ncdm": (4.0 / 11.0) ** (1.0 / 3.0),
+    }
+
+
 def _class_unlensed(param, ells):
     """Return CLASS unlensed scalar ``D_ell`` in ``muK^2`` at ``ells``, a dict over ``tt, te, ee``."""
 
@@ -132,10 +152,10 @@ def _class_unlensed(param, ells):
             "T_cmb": param["Tcmb"],
             "YHe": param["YHe"],
             "N_ur": param["Neff"],
-            "N_ncdm": 0,
             "Omega_k": 0.0,
             "recombination": "recfast",
             "reio_parametrization": "reio_none",
+            **_class_massive_neutrinos(param),
         }
     )
     try:
@@ -292,6 +312,61 @@ def test_power_spectra_match_class(n_cosmologies, benchmark):
     _assert_matches_class(
         dl_ours, [_class_unlensed(c, TT_ELLS) for c in cosmologies], TT_ELLS
     )
+
+
+MASSIVE_NEUTRINO_COSMOLOGY = {
+    **REFERENCE_COSMOLOGY,
+    "Neff": 2.046,  # massless flavours; the massive one makes up N_eff = 3.046
+    "Nmnu": 1.0,
+    "mnu": 0.3,
+}
+"""The reference cosmology with one 0.3 eV neutrino: the massive-neutrino layout (nvar 98).
+
+Heavy enough (non-relativistic at z ~ 570) to move the unlensed TT by several
+percent, so that matching CLASS within the gate is a check on the neutrino
+hierarchy; a 0.06 eV neutrino moves it by 0.8 percent at most.
+"""
+
+MASSIVE_DL_GATE = 1.0e-2
+"""TT gate with massive neutrinos: three momentum bins against CLASS's full ncdm quadrature."""
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="numba-CUDA requires a CUDA GPU")
+def test_power_spectra_match_class_with_massive_neutrinos():
+    """Unlensed TT, TE and EE with one massive neutrino against CLASS.
+
+    The massive-neutrino bins enter the sources through the model's sums
+    (``dgrho``, ``dgq`` and the shear ``dgpi``) and the thermal history's
+    ``rhonu`` reaches the hook through the shared tables, so this is the gate
+    on the general source path; the flat massless case is
+    :func:`test_power_spectra_match_class`.
+    """
+
+    import jax
+
+    from discoeb.cmb import compute_cl_power_spectrum_batch
+
+    cosmologies = [MASSIVE_NEUTRINO_COSMOLOGY]
+    _, _, dl_ours = jax.block_until_ready(
+        compute_cl_power_spectrum_batch(cosmologies, **_spectrum_kwargs(cosmologies))
+    )
+    dl_class = [_class_unlensed(c, TT_ELLS) for c in cosmologies]
+    tt, tt_c = np.asarray(dl_ours.tt), dl_class[0]["tt"][None]
+    assert np.isfinite(tt).all()
+    err = np.abs(tt / tt_c - 1.0)[0]
+    # The massive neutrino must matter: against the massless reference's CLASS
+    # spectrum the difference is well above the gate, and we follow CLASS across it.
+    tt_massless = _class_unlensed(REFERENCE_COSMOLOGY, TT_ELLS)["tt"][None]
+    shift = np.abs(tt_c / tt_massless - 1.0)
+    assert shift.max() > 3.0 * MASSIVE_DL_GATE, f"the neutrino moves TT by only {shift.max():.3g}"
+    assert err.max() < MASSIVE_DL_GATE, (
+        f"TT D_ell off by {err.max():.3g} at l={TT_ELLS[np.argmax(err)]}; "
+        f"per multipole {np.array2string(err, precision=4)}"
+    )
+    ee, ee_c = np.asarray(dl_ours.ee), dl_class[0]["ee"][None]
+    te, te_c = np.asarray(dl_ours.te), dl_class[0]["te"][None]
+    assert np.abs(ee / ee_c - 1.0).max() < POL_GATE
+    assert (np.abs(te - te_c) / np.sqrt(tt_c * ee_c)).max() < POL_GATE
 
 
 def _kernel_builds() -> int:
@@ -532,10 +607,9 @@ def _reference_sources(layout, y, k, a, g, emk, densities):
 def test_sources_come_from_the_component_model():
     """Host path and generated device function agree with the written-out flat-LCDM sources."""
 
-    import jax.numpy as jnp
     from types import SimpleNamespace
 
-    from discoeb.cmb import build_source_device_function, source_channels_jax, source_model
+    from discoeb.cmb import source_channels_jax, source_model
     from discoeb.perturbations import N_PARAM, PARAM_COLUMNS, PerturbationLayout, _as_cosmology, make_params
     from test_perturbations import REFERENCE_COSMOLOGY
 
