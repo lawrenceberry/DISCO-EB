@@ -506,11 +506,14 @@ class _HostValues:
     names, so the values may be floats or JAX arrays alike.
     """
 
-    def __init__(self, model, base, names, memo=None):
+    def __init__(self, model, base, names, memo=None, batch_shape=()):
         self.model, self.values, self.names = model, dict(base), names
         self.memo = {} if memo is None else memo
         self.providers, self.contributions = model._host_providers()
         self.resolving: list[str] = []
+        # trailing axes of every state's value (the wave modes of a vectorised
+        # initial state), so that a vector state's filler writes rows of them
+        self.batch_shape = tuple(batch_shape)
 
     def _call(self, fn, component, takes_self, args):
         bound = _bound_function(fn, lambda f: f, self.names, self.memo)
@@ -524,7 +527,10 @@ class _HostValues:
         self.resolving.append(name)
         if name in self.model.states:
             s = self.model.states[name]
-            result = np.zeros(s.shape) if s.shape else 0.0
+            if s.shape or self.batch_shape:
+                result = np.zeros(s.shape + self.batch_shape)
+            else:
+                result = 0.0
             fn = s.declared.initial_fn
             if fn is not None:
                 takes_self, params = _positional_names(fn, f"{name}.initial")
@@ -677,15 +683,24 @@ class Model:
         ``k``: the time and the background parameters. A name is resolved as a
         base quantity, a state (its own initial value), or a provider evaluated
         on the host from the same pool.
+
+        The pool is resolved once for all wave modes: ``k`` is the whole array,
+        ``numpy`` stands in for ``math`` so that the initial conditions' algebra
+        broadcasts over it, and a vector state's filler writes rows of
+        ``n_k`` values (``batch_shape`` of :class:`_HostValues`). Resolving the
+        pool once per mode instead cost 6 ms per cosmology at 144 modes (most
+        of it in the signature inspection of every initial condition at every
+        mode), 0.85 s of a batch of 128 cosmologies.
         """
 
         k_values = np.asarray(k_values, dtype=np.float64)
-        y0 = np.zeros((len(k_values), self.nvar), dtype=np.float64)
-        memo = self.__dict__.setdefault("_host_memo", {}).setdefault(id(math), {})
-        for i, k in enumerate(k_values):
-            values = _HostValues(self, dict(base, k=float(k)), {**_HOST_NAMES, "math": math}, memo)
-            for s in self.states.values():
-                y0[i, s.offset:s.offset + s.size] = np.ravel(values[s.name])
+        n_k = len(k_values)
+        memo = self.__dict__.setdefault("_host_memo", {}).setdefault(id(np), {})
+        values = _HostValues(self, dict(base, k=k_values), {**_HOST_NAMES, "math": np}, memo, batch_shape=(n_k,))
+        y0 = np.zeros((n_k, self.nvar), dtype=np.float64)
+        for s in self.states.values():
+            value = np.broadcast_to(np.asarray(values[s.name], dtype=np.float64), s.shape + (n_k,))
+            y0[:, s.offset:s.offset + s.size] = value.reshape(s.size, n_k).T
         return y0
 
     # -- compiled functions -----------------------------------------------------------

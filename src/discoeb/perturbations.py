@@ -744,13 +744,18 @@ def _thermo_tables_device(stacked, spline_inverse, n_grid: int):
     return jax.vmap(one)(stacked)
 
 
-@partial(jax.jit, static_argnames=("n_grid",))
-def _solve_thermal_histories(stacked, n_grid: int):
+THERMO_RTOL = 1e-5
+THERMO_ATOL = 1e-7
+"""Tolerances of the RECFAST solve behind the device tables (see :func:`_solve_thermal_histories`)."""
+
+
+@partial(jax.jit, static_argnames=("n_grid", "rtol", "atol"))
+def _solve_thermal_histories(stacked, n_grid: int, rtol: float = THERMO_RTOL, atol: float = THERMO_ATOL):
     """The RECFAST solve of ``evolve_background`` alone, one vmap lane per cosmology."""
 
     def one(params):
         param = setup_background_evolution(amin=1e-9, amax=1.01, param=dict(params))
-        return evaluate_thermo(param=param, num_thermo=n_grid, rtol=1e-5, atol=1e-7)
+        return evaluate_thermo(param=param, num_thermo=n_grid, rtol=rtol, atol=atol)
 
     return jax.vmap(one)(stacked)
 
@@ -775,7 +780,7 @@ def thermal_history_batch(cosmologies, n_grid: int = N_THERMO_GRID) -> dict:
 
     cosmologies = tuple(_as_cosmology(cosmology) for cosmology in cosmologies)
     stacked = _stack_background_params(cosmologies)
-    a, cs2, Tm, mu, xe, dxeda = _solve_thermal_histories(stacked, n_grid)
+    a, cs2, Tm, mu, xe, dxeda = _solve_thermal_histories(stacked, n_grid, rtol=THERMO_RTOL, atol=THERMO_ATOL)
     return {
         "a": np.asarray(a)[0],
         "xe": np.asarray(xe)[:, :, 0],
