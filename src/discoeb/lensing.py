@@ -124,6 +124,47 @@ def _lensing_kernel(chi, chi_star):
 
 
 @jax.jit
+def lensing_potential_transfer(phi, shift_idx, shift_w, chi, chi_star, operator, limber_weights, ells_limber, k_values):
+    """The primordial-spectrum-independent half of :func:`lensing_potential_cl`.
+
+    Returns ``(theta_psi, limber)``: the lensing-potential transfer function
+    ``Theta_l(k)`` at the solved modes for the multipoles projected exactly,
+    ``(n_c, n_ell_exact, n_k)``, and for the Limber multipoles the integrand
+    ``S(k_chi, chi)^2 dchi / (k_chi^3 chi^2)`` on the ``chi`` grid, ``(n_c,
+    n_ell_limber, n_chi)``, zero where ``chi <= 0``; the primordial spectrum
+    multiplies both pointwise in ``k`` (:func:`lensing_potential_cl_from_transfer`).
+    """
+
+    hi = jax.lax.Precision.HIGHEST
+    shifted = _shift(phi, shift_idx, shift_w)
+    kernel = _lensing_kernel(chi, chi_star)
+    source = -2.0 * kernel[:, None, :] * shifted  # (c, k, chi)
+    theta = jnp.einsum("ckj,lkj->clk", source.astype(operator.dtype), operator, precision=hi).astype(jnp.float64)
+    source_at = jnp.einsum("ljk,ckj->clj", limber_weights, source.astype(jnp.float32), precision=hi).astype(jnp.float64)
+    chi_safe = jnp.where(chi > 0.0, chi, 1.0)
+    k_chi = (ells_limber[:, None] + 0.5) / chi_safe[None, :]  # (l, chi)
+    dchi = jnp.zeros_like(chi).at[1:].add(0.5 * jnp.abs(jnp.diff(chi))).at[:-1].add(0.5 * jnp.abs(jnp.diff(chi)))
+    limber = jnp.where(chi > 0.0, source_at**2 / (k_chi[None] ** 3 * chi_safe[None, None] ** 2) * dchi, 0.0)
+    return theta, limber
+
+
+@jax.jit
+def lensing_potential_cl_from_transfer(theta_psi, limber, chi, ells_limber, k_values, n_s, A_s, k_pivot):
+    """``C_l^{psi psi}`` ``(n_c, n_ell_exact + n_ell_limber)`` from :func:`lensing_potential_transfer` and the primordial spectrum."""
+
+    primordial = A_s[:, None] * (k_values[None, :] / k_pivot) ** (n_s[:, None] - 1.0)
+    # Exact projection: C_l = 4 pi int dln k P_R(k) Theta_l(k)^2.
+    lnk = jnp.log(k_values)
+    w = jnp.zeros_like(lnk).at[1:].add(0.5 * jnp.diff(lnk)).at[:-1].add(0.5 * jnp.diff(lnk))
+    cl_exact = 4.0 * jnp.pi * jnp.einsum("clk,ck,k->cl", theta_psi**2, primordial, w)
+    # Limber: C_l = 2 pi^2 int dchi S(k_chi, chi)^2 P_R(k_chi) / (k_chi^3 chi^2), k_chi = (l + 1/2) / chi.
+    chi_safe = jnp.where(chi > 0.0, chi, 1.0)
+    k_chi = (ells_limber[:, None] + 0.5) / chi_safe[None, :]  # (l, chi)
+    p_r = A_s[:, None, None] * (k_chi[None] / k_pivot) ** (n_s[:, None, None] - 1.0)
+    cl_limber = 2.0 * jnp.pi**2 * jnp.sum(limber * p_r, axis=-1)
+    return jnp.concatenate([cl_exact, cl_limber], axis=1)
+
+
 def lensing_potential_cl(phi, shift_idx, shift_w, chi, chi_star, operator, limber_weights, ells_limber, k_values, n_s, A_s, k_pivot):
     """``C_l^{psi psi}`` for a batch of cosmologies, shape ``(n_c, n_ell_exact + n_ell_limber)``.
 
@@ -135,28 +176,12 @@ def lensing_potential_cl(phi, shift_idx, shift_w, chi, chi_star, operator, limbe
     :func:`lensing_potential_operator` for the multipoles projected exactly,
     ``limber_weights`` the table of :func:`limber_interpolation` and
     ``ells_limber`` the multipoles projected in the Limber approximation,
-    ``k_values`` the solved modes in ascending order.
+    ``k_values`` the solved modes in ascending order.  The composition of
+    :func:`lensing_potential_transfer` and :func:`lensing_potential_cl_from_transfer`.
     """
 
-    hi = jax.lax.Precision.HIGHEST
-    shifted = _shift(phi, shift_idx, shift_w)
-    kernel = _lensing_kernel(chi, chi_star)
-    source = -2.0 * kernel[:, None, :] * shifted  # (c, k, chi)
-    primordial = A_s[:, None] * (k_values[None, :] / k_pivot) ** (n_s[:, None] - 1.0)
-    # Exact projection: C_l = 4 pi int dln k P_R(k) Theta_l(k)^2.
-    theta = jnp.einsum("ckj,lkj->clk", source.astype(operator.dtype), operator, precision=hi).astype(jnp.float64)
-    lnk = jnp.log(k_values)
-    w = jnp.zeros_like(lnk).at[1:].add(0.5 * jnp.diff(lnk)).at[:-1].add(0.5 * jnp.diff(lnk))
-    cl_exact = 4.0 * jnp.pi * jnp.einsum("clk,ck,k->cl", theta**2, primordial, w)
-    # Limber: C_l = 2 pi^2 int dchi S(k_chi, chi)^2 P_R(k_chi) / (k_chi^3 chi^2), k_chi = (l + 1/2) / chi.
-    source_at = jnp.einsum("ljk,ckj->clj", limber_weights, source.astype(jnp.float32), precision=hi).astype(jnp.float64)
-    chi_safe = jnp.where(chi > 0.0, chi, 1.0)
-    k_chi = (ells_limber[:, None] + 0.5) / chi_safe[None, :]  # (l, chi)
-    p_r = A_s[:, None, None] * (k_chi[None] / k_pivot) ** (n_s[:, None, None] - 1.0)
-    dchi = jnp.zeros_like(chi).at[1:].add(0.5 * jnp.abs(jnp.diff(chi))).at[:-1].add(0.5 * jnp.abs(jnp.diff(chi)))
-    integrand = source_at**2 * p_r / (k_chi[None] ** 3 * chi_safe[None, None] ** 2) * dchi
-    cl_limber = 2.0 * jnp.pi**2 * jnp.sum(jnp.where(chi > 0.0, integrand, 0.0), axis=-1)
-    return jnp.concatenate([cl_exact, cl_limber], axis=1)
+    theta_psi, limber = lensing_potential_transfer(phi, shift_idx, shift_w, chi, chi_star, operator, limber_weights, ells_limber, k_values)
+    return lensing_potential_cl_from_transfer(theta_psi, limber, chi, ells_limber, k_values, n_s, A_s, k_pivot)
 
 
 # ---------------------------------------------------------------------------

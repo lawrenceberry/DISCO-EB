@@ -1075,6 +1075,84 @@ def _solve_with_hook(prepared, k_values, tau_save, hook, hook_size, solve_kwargs
 # =============================================================================
 
 
+class TransferBatch(NamedTuple):
+    """The cosmology-dependent half of a batch's spectra, from :func:`compute_transfer_batch`.
+
+    Everything the perturbation solve and the projection produce before the
+    primordial spectrum enters: the spectra are quadratic forms of these
+    tables with ``P_R(k)`` (:func:`spectra_from_transfer`), so a change of
+    ``A_s`` or ``n_s`` alone needs no new solve.
+    """
+
+    theta: jax.Array  # (n_c, n_ell, n_k_fine) temperature transfer Theta_l(k), float64, zero outside each l's k band
+    theta_e: jax.Array  # (n_c, n_ell, n_k_fine) E-mode transfer
+    theta_psi: jax.Array | None  # (n_c, n_ell_psi_exact, n_k) lensing-potential transfer at the solved modes
+    limber: jax.Array | None  # (n_c, n_ell_psi_limber, n_chi) the Limber integrand without P_R
+    T_cmb: jax.Array  # (n_c,)
+
+
+class TransferGrids(NamedTuple):
+    """The cosmology-independent arrays :func:`spectra_from_transfer` contracts a :class:`TransferBatch` with."""
+
+    ells: np.ndarray
+    k_fine: jax.Array
+    lnk_weights: jax.Array
+    k_pivot: float
+    ells_psi: np.ndarray | None  # the lensing-potential multipoles, exact ones first
+    k_values: jax.Array | None  # the solved modes, ascending
+    chi: jax.Array | None  # the shared chi grid
+    ells_limber: jax.Array | None
+
+
+def compute_transfer_batch(
+    cosmologies,
+    *,
+    grids: CMBGrids | None = None,
+    k_values: np.ndarray | None = None,
+    ells: np.ndarray | None = None,
+    n_save: int = 1000,
+    n_k_fine: int = 1500,
+    k_fine_values: np.ndarray | None = None,
+    projection_dtype=jnp.float32,
+    lensing_potential_ells: np.ndarray | None = None,
+    **solve_kwargs,
+):
+    """Return ``(TransferBatch, TransferGrids)`` for a batch of cosmologies: the spectra before the primordial spectrum.
+
+    The first half of :func:`compute_cl_power_spectrum_batch`, which is this
+    followed by :func:`spectra_from_transfer`; see it for the arguments.
+    """
+
+    transfer, tgrids = _compute_transfer_batch(
+        cosmologies, grids=grids, k_values=k_values, ells=ells, n_save=n_save, n_k_fine=n_k_fine,
+        k_fine_values=k_fine_values, projection_dtype=projection_dtype, lensing_potential_ells=lensing_potential_ells,
+        **solve_kwargs,
+    )
+    return transfer, tgrids
+
+
+@jax.jit
+def spectra_from_transfer(transfer: TransferBatch, tgrids: TransferGrids, n_s, A_s):
+    """``(C_l, D_l, C_l^{psi psi} or None)`` of a :class:`TransferBatch` for primordial spectra ``A_s (k / k_pivot)^(n_s - 1)``, ``(n_c,)`` each."""
+
+    from .lensing import lensing_potential_cl_from_transfer
+
+    args = (tgrids.lnk_weights, n_s, A_s, tgrids.k_pivot, tgrids.k_fine)
+    cl = Spectra(
+        cl_from_theta(transfer.theta, *args),
+        cl_from_theta(transfer.theta, *args, theta2=transfer.theta_e),
+        cl_from_theta(transfer.theta_e, *args),
+    )
+    ells_d = jnp.asarray(tgrids.ells, dtype=jnp.float64)
+    dl = Spectra(*(dl_power_spectrum(c, ells_d, transfer.T_cmb[:, None]) for c in cl))
+    if transfer.theta_psi is None:
+        return cl, dl, None
+    cl_pp = lensing_potential_cl_from_transfer(
+        transfer.theta_psi, transfer.limber, tgrids.chi, tgrids.ells_limber, tgrids.k_values, n_s, A_s, tgrids.k_pivot
+    )
+    return cl, dl, cl_pp
+
+
 def compute_cl_power_spectrum_batch(
     cosmologies,
     *,
@@ -1120,6 +1198,33 @@ def compute_cl_power_spectrum_batch(
     ``first_step``, ``max_steps``).
     """
 
+    cosmologies = tuple(_as_cosmology(c) for c in cosmologies)
+    transfer, tgrids = compute_transfer_batch(
+        cosmologies, grids=grids, k_values=k_values, ells=ells, n_save=n_save, n_k_fine=n_k_fine,
+        k_fine_values=k_fine_values, projection_dtype=projection_dtype, lensing_potential_ells=lensing_potential_ells,
+        **solve_kwargs,
+    )
+    n_s = jnp.asarray([float(c.n_s) for c in cosmologies])
+    A_s = jnp.asarray([float(c.A_s) for c in cosmologies])
+    cl, dl, cl_pp = spectra_from_transfer(transfer, tgrids, n_s, A_s)
+    if lensing_potential_ells is None:
+        return tgrids.ells, cl, dl
+    return tgrids.ells, cl, dl, cl_pp
+
+
+def _compute_transfer_batch(
+    cosmologies,
+    *,
+    grids,
+    k_values,
+    ells,
+    n_save,
+    n_k_fine,
+    k_fine_values,
+    projection_dtype,
+    lensing_potential_ells,
+    **solve_kwargs,
+):
     from .perturbations import _prepare_solve
 
     cosmologies = tuple(_as_cosmology(c) for c in cosmologies)
@@ -1194,20 +1299,16 @@ def compute_cl_power_spectrum_batch(
         [t0 - _visibility_peak(c) for t0, c in zip(tau0_all, cosmologies)]
     )
     bands = _k_band(ells_d, k_fine_d, chi_max, chi_star)
-    n_s = jnp.asarray([float(c.n_s) for c in cosmologies])
-    A_s = jnp.asarray([float(c.A_s) for c in cosmologies])
     T_cmb = jnp.asarray([float(c.T_cmb) for c in cosmologies])
     k_pivot = float(cosmologies[0].k_pivot)
 
-    # The projection of a group of cosmologies is one set of GEMMs; the group
-    # is sized so its fine-k source arrays fit the memory budget.
     # The projection of a group of cosmologies is one set of GEMMs; the group
     # is sized so its fine-k source arrays fit the memory budget. The groups
     # stay separate eager calls: under one ``jax.jit`` XLA merges the sliced
     # einsums back into a single whole-batch one (2.3 GB at N=128), which the
     # allocator cannot place beside the kernel's local memory and retries for
     # tens of seconds.
-    groups = []
+    thetas, thetas_e = [], []
     group = _projection_group_size(
         len(cosmologies), len(k_fine), len(tau_save), projection_dtype
     )
@@ -1223,24 +1324,27 @@ def compute_cl_power_spectrum_batch(
             bessel,
             bessel_e,
         )
-        groups.append(
-            spectra_from_theta(
-                theta, theta_e, lnk_weights, n_s[g0:g1], A_s[g0:g1], k_pivot, k_fine_d
-            )
-        )
-    cl = Spectra(*(jnp.concatenate(parts) for parts in zip(*groups)))
-    dl = Spectra(*(dl_power_spectrum(c, ells_d, T_cmb[:, None]) for c in cl))
+        thetas.append(theta)
+        thetas_e.append(theta_e)
+    theta = jnp.concatenate(thetas)
+    theta_e = jnp.concatenate(thetas_e)
     if lensing_potential_ells is None:
-        return ells, cl, dl
-    from .lensing import lensing_potential_cl
+        transfer = TransferBatch(theta, theta_e, None, None, T_cmb)
+        tgrids = TransferGrids(ells, k_fine_d, lnk_weights, k_pivot, None, None, None, None)
+        return transfer, tgrids
+    from .lensing import lensing_potential_transfer
 
     ells_pp = np.asarray(lensing_potential_ells, dtype=np.int64)
     operator, limber_weights, ells_limber = _lensing_operators(ells_pp, k_sorted, tau_save, tau0_ref, projection_dtype)
-    cl_pp = lensing_potential_cl(
-        channels[:, 3], shift_idx, shift_w, jnp.asarray(tau0_ref - tau_save), jnp.asarray(chi_star),
-        operator, limber_weights, jnp.asarray(ells_limber, dtype=jnp.float64), jnp.asarray(k_sorted), n_s, A_s, k_pivot,
+    chi = jnp.asarray(tau0_ref - tau_save)
+    ells_limber_d = jnp.asarray(ells_limber, dtype=jnp.float64)
+    k_sorted_d = jnp.asarray(k_sorted)
+    theta_psi, limber = lensing_potential_transfer(
+        channels[:, 3], shift_idx, shift_w, chi, jnp.asarray(chi_star), operator, limber_weights, ells_limber_d, k_sorted_d
     )
-    return ells, cl, dl, cl_pp
+    transfer = TransferBatch(theta, theta_e, theta_psi, limber, T_cmb)
+    tgrids = TransferGrids(ells, k_fine_d, lnk_weights, k_pivot, ells_pp, k_sorted_d, chi, ells_limber_d)
+    return transfer, tgrids
 
 
 def _lensing_operators(ells, k_sorted, tau_save, tau0_ref, dtype):
