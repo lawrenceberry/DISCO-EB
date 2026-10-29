@@ -75,13 +75,18 @@ L_He2St_ion = 3.8454693845e6        # level for 23S1-continuum in m^-1
 sigma_He_2Ps = 1.436289e-22         # H ionization x-section at HeI 21P1-11S0 freq. in m^2
 sigma_He_2Pt = 1.484872e-22         # H ionization x-section at HeI 23P1-11S0 freq. in m^2
 
-# Gaussian fits
+# Gaussian fits of the hydrogen fudge (Rubino-Martin et al. 2010), at the
+# RECFAST 1.5.2 values that CLASS (recfast_AGauss2, recfast_zGauss2) and CAMB
+# use, and with them the Planck 2018 analysis.  RECFAST 1.5.0's AGauss2 = 0.05,
+# zGauss2 = 6.75 and fudge 1.105 left x_e 1.8 percent above CLASS's after
+# recombination and the TT spectrum 0.14 percent low at l = 300-2000.
 AGauss1 = -0.14                     # amplitude of the 1st Gaussian for the H fudging
-AGauss2 = 0.05                      # amplitude of the 2nd Gaussian for the H fudging
+AGauss2 = 0.079                     # amplitude of the 2nd Gaussian for the H fudging
 zGauss1 = 7.28                      # ln(1+z) central value of the 1st Gaussian
-zGauss2 = 6.75                      # ln(1+z) central value of the 2nd Gaussian
+zGauss2 = 6.73                      # ln(1+z) central value of the 2nd Gaussian
 wGauss1 = 0.18                      # width of the 1st Gaussian
 wGauss2 = 0.33                      # width of the 2nd Gaussian
+FUDGE_H = 1.125                     # hydrogen Peebles fudge with the Gaussian corrections (RECFAST 1.5.2: 1.14 - 0.015)
 
 H_frac = 1.e-3 
 
@@ -267,7 +272,7 @@ def recfast_rhs():
         # Pre-compute derived constants
         H = p[P_H0] / 100.0
         HO = H * bigH
-        fu = 1.105
+        fu = FUDGE_H
         mu_H = 1.0 / (1.0 - YHe)
         fHe = YHe / (const_mHe_mH * (1.0 - YHe))
         Nnow = const_dens_fac * H * H * p[P_OMEGAB] / mu_H
